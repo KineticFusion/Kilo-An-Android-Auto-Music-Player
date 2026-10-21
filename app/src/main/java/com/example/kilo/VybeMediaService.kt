@@ -74,6 +74,11 @@ private const val TAB_PLAYLISTS = "tab_playlists"
 private const val TAB_LISTEN_AGAIN = "tab_listen_again"
 private const val TAB_HEARD_SHORTS = "tab_heard_shorts"
 private const val TAB_TRENDING = "tab_trending"
+private const val TAB_RADIO = "tab_radio"
+private const val TAB_RADIO_BROWSE = "tab_radio_browse"
+private const val TAB_RADIO_FAVORITES = "tab_radio_favorites"
+private const val TAB_RADIO_RECENT = "tab_radio_recent"
+private const val TAB_RADIO_CUSTOM = "tab_radio_custom"
 
 private val LIKE_COMMAND = SessionCommand("vybe_like", Bundle.EMPTY)
 private val QUEUE_NEXT_COMMAND = SessionCommand("vybe_queue_next", Bundle.EMPTY)
@@ -110,15 +115,17 @@ fun SongItemClean.toMediaItem(): MediaItem {
 
 fun MediaItem.toSong(idx: Int = 0): SongItemClean {
     val md = mediaMetadata
-    val t = md.title?.toString() ?: "Unknown"
-    val a = md.artist?.toString() ?: "Unknown"
+    val isRadio = mediaId.startsWith("radio:")
+    val title = md.title?.toString() ?: "Unknown"
+    val artist = md.artist?.toString() ?: "Unknown"
     return SongItemClean(
         id = mediaId,
-        videoId = mediaId,
-        title = t,
-        artist = a,
-        album = md.albumTitle?.toString() ?: "YouTube Music",
+        videoId = mediaId.takeUnless { isRadio }.orEmpty(),
+        title = title,
+        artist = artist,
+        album = if (isRadio) "Internet Radio" else md.albumTitle?.toString() ?: "YouTube Music",
         coverUrl = md.artworkUri?.toString().orEmpty(),
+        audioUrl = if (isRadio) localConfiguration?.uri?.toString().orEmpty() else "",
         themeColor = YtRepo.paletteColors[idx % YtRepo.paletteColors.size],
         durationMs = md.durationMs ?: 210000L
     )
@@ -228,7 +235,7 @@ object SessionStore {
     fun save(player: Player) {
         val p = prefs ?: return
         val n = player.mediaItemCount
-        if (n == 0) return
+        if (n == 0 || player.currentMediaItem?.mediaId?.startsWith("radio:") == true) return
         val idx = player.currentMediaItemIndex.coerceIn(0, n - 1)
         val start = (idx - 10).coerceAtLeast(0)
         val end = minOf(n, start + 100)
@@ -255,7 +262,7 @@ object SessionStore {
     fun record(mediaItem: MediaItem?) {
         val p = prefs ?: return
         mediaItem ?: return
-        if (mediaItem.mediaId.isBlank()) return
+        if (mediaItem.mediaId.isBlank() || mediaItem.mediaId.startsWith("radio:")) return
         val song = mediaItem.toSong()
         val saved = runCatching { JSONArray(p.getString("recent_songs", "[]")) }.getOrDefault(JSONArray())
         val recent = JSONArray().put(
@@ -427,9 +434,11 @@ object PlayerHolder {
 
             override fun onPlayerError(error: PlaybackException) {
                 val id = p.currentMediaItem?.mediaId ?: return
-                Log.e(TAG, "Playback error ${error.errorCodeName} for $id", error)
-                LosslessSource.invalidate(id)
-                FastStream.invalidate(id)
+                Log.e(TAG, "Playback error " + error.errorCodeName + " for " + id, error)
+                if (!id.startsWith("radio:")) {
+                    LosslessSource.invalidate(id)
+                    FastStream.invalidate(id)
+                }
                 val attempt = retryAttempts.merge(id, 1) { previous, increment -> previous + increment } ?: 1
                 if (attempt > MAX_PLAYBACK_RETRIES) return
                 val shouldResume = p.playWhenReady
@@ -785,6 +794,25 @@ class VybeMediaService : MediaLibraryService() {
         return register(items)
     }
 
+    private fun radioMediaItems(stations: List<RadioStation>): List<MediaItem> = register(
+        stations.map { station ->
+            val song = station.asSong()
+            val metadata = MediaMetadata.Builder()
+                .setTitle(station.name)
+                .setArtist(song.artist)
+                .setAlbumTitle("Internet Radio")
+                .setSubtitle(station.country.ifBlank { "Live radio" })
+                .setIsPlayable(true)
+                .setIsBrowsable(false)
+                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+            if (station.favicon.isNotBlank()) metadata.setArtworkUri(Uri.parse(station.favicon))
+            MediaItem.Builder()
+                .setMediaId("radio:" + station.id)
+                .setUri(station.streamUrl)
+                .setMediaMetadata(metadata.build())
+                .build()
+        }
+    )
     private fun matchingHomeShelf(vararg terms: String): HomeShelf? {
         val normalizedTerms = terms.map { it.lowercase() }
         return HomeCache.get().firstOrNull { shelf ->
@@ -844,8 +872,19 @@ class VybeMediaService : MediaLibraryService() {
             folderItem(TAB_HOME, "Home", "Quick picks and continue listening"),
             folderItem(TAB_RECENT, "Recents", "Recently played"),
             folderItem(TAB_BROWSE, "Browse", "Explore YouTube Music"),
+            folderItem(TAB_RADIO, "Radio", "Live internet radio stations"),
             folderItem(TAB_LIBRARY, "Library", "Your playlists and liked songs")
         )
+        parentId == TAB_RADIO -> listOf(
+            folderItem(TAB_RADIO_BROWSE, "Browse stations", "Live stations from Radio Browser"),
+            folderItem(TAB_RADIO_FAVORITES, "Favorites", "Your saved radio stations"),
+            folderItem(TAB_RADIO_RECENT, "Recently played", "Stations you listened to"),
+            folderItem(TAB_RADIO_CUSTOM, "My stations", "Your custom stream URLs")
+        )
+        parentId == TAB_RADIO_BROWSE -> radioMediaItems(RadioBrowser.stations())
+        parentId == TAB_RADIO_FAVORITES -> radioMediaItems(RadioStationStore.load(this, "radio_favorites"))
+        parentId == TAB_RADIO_RECENT -> radioMediaItems(RadioStationStore.load(this, "radio_recent_stations"))
+        parentId == TAB_RADIO_CUSTOM -> radioMediaItems(RadioStationStore.load(this, "radio_custom_stations"))
         parentId == TAB_HOME -> {
             val prefs = getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
             val mode = prefs.getString("auto_layout_mode", AUTO_LAYOUT_MODES.first()) ?: AUTO_LAYOUT_MODES.first()
@@ -1073,7 +1112,7 @@ class VybeMediaService : MediaLibraryService() {
             bg {
                 val all = runCatching { childrenOf(parentId) }.getOrDefault(emptyList())
                 all.asSequence()
-                    .filter { it.mediaMetadata.isPlayable == true }
+                    .filter { it.mediaMetadata.isPlayable == true && !it.mediaId.startsWith("radio:") }
                     .take(2)
                     .forEach { item -> PlayerHolder.prefetch(this@VybeMediaService, item.mediaId) }
                 val paged = if (pageSize > 0 && pageSize != Int.MAX_VALUE) {
@@ -1102,7 +1141,7 @@ class VybeMediaService : MediaLibraryService() {
         ): ListenableFuture<LibraryResult<Void>> =
             bg {
                 val items = searchItems(query)
-                items.take(2).forEach { item -> PlayerHolder.prefetch(this@VybeMediaService, item.mediaId) }
+                items.filterNot { it.mediaId.startsWith("radio:") }.take(2).forEach { item -> PlayerHolder.prefetch(this@VybeMediaService, item.mediaId) }
                 searchCache[query] = items
                 main.post { session.notifySearchResultChanged(browser, query, items.size, params) }
                 LibraryResult.ofVoid()
@@ -1146,7 +1185,7 @@ class VybeMediaService : MediaLibraryService() {
                     else -> SessionStore.recentSongs().map { it.toMediaItem() }.ifEmpty { searchItems("") }
                 }
                 if (resolved.isEmpty()) throw UnsupportedOperationException("No matching music found")
-                resolved.take(2).forEach { item -> PlayerHolder.prefetch(this@VybeMediaService, item.mediaId) }
+                resolved.filterNot { it.mediaId.startsWith("radio:") }.take(2).forEach { item -> PlayerHolder.prefetch(this@VybeMediaService, item.mediaId) }
                 val idx = if (query.isNotBlank()) 0 else startIndex.coerceIn(0, resolved.lastIndex)
                 val pos = if (query.isNotBlank()) C.TIME_UNSET else startPositionMs
                 MediaSession.MediaItemsWithStartPosition(resolved, idx, pos)

@@ -14,6 +14,7 @@ import android.content.pm.PackageManager
 import android.media.audiofx.AudioEffect
 import android.net.Uri
 import android.os.Build
+import android.os.Environment
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.provider.Settings
@@ -90,6 +91,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -103,6 +105,8 @@ import org.schabi.newpipe.extractor.downloader.Response as NPResponse
 import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
 import org.schabi.newpipe.extractor.stream.DeliveryMethod
 import org.schabi.newpipe.extractor.stream.StreamInfo as NPStreamInfo
+import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
@@ -349,11 +353,11 @@ private fun primaryPanelColor(skin: SkinTheme): Color = when (skin.layoutFamily)
 }
 
 enum class ScreenNav {
-    HOME, EXPLORE, LIBRARY, SEARCH, OFFLINE, SETTINGS, APP_APPEARANCE, ANDROID_AUTO_SETTINGS, PLAYER_STYLES
+    HOME, EXPLORE, LIBRARY, SEARCH, OFFLINE, RADIO, SETTINGS, APP_APPEARANCE, ANDROID_AUTO_SETTINGS, PLAYER_STYLES
 }
 
 enum class OverlayTab {
-    NONE, QUEUE, CODEC_INFO
+    NONE, QUEUE, LYRICS, CODEC_INFO
 }
 
 val AUTO_LAYOUT_MODES = listOf(
@@ -478,6 +482,7 @@ data class AppStateModel(
     val playlist: List<SongItemClean> = INITIAL_TRACKS,
     val downloadedSongs: List<SongItemClean> = emptyList(),
     val downloadsInProgress: Map<String, DownloadTaskState> = emptyMap(),
+    val isScanningDownloads: Boolean = false,
     val homeShelves: List<HomeShelf> = emptyList(),
     val searchQuery: String = "",
     val searchResults: List<SongItemClean> = emptyList(),
@@ -496,6 +501,12 @@ data class AppStateModel(
     val currentPosMs: Long = 0L,
     val currentDurationMs: Long = 215000L,
     val favoriteIds: Set<String> = emptySet(),
+    val radioFavorites: List<RadioStation> = emptyList(),
+    val radioRecentStations: List<RadioStation> = emptyList(),
+    val customRadioStations: List<RadioStation> = emptyList(),
+    val lastRadioStation: RadioStation? = null,
+    val radioSleepTimerMinutes: Int? = null,
+    val isRadioRecording: Boolean = false,
     val isSearching: Boolean = false,
     val currentScreen: ScreenNav = ScreenNav.HOME
 ) {
@@ -829,6 +840,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var searchJob: Job? = null
     private var playJob: Job? = null
+    private var radioSleepJob: Job? = null
+    private var radioRecordingJob: Job? = null
     private var videoJob: Job? = null
     private var mixFadeJob: Job? = null
     private var autoMixFadedSongId: String? = null
@@ -953,6 +966,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selectedPlayerStyleId = preferences.getString("player_style_id", PLAYER_STYLE_PRESETS.first().id) ?: PLAYER_STYLE_PRESETS.first().id,
             savedPlaylists = loadSavedPlaylists(),
             favoriteIds = Favorites.ids(),
+            radioFavorites = RadioStationStore.load(application, "radio_favorites"),
+            radioRecentStations = RadioStationStore.load(application, "radio_recent_stations"),
+            customRadioStations = RadioStationStore.load(application, "radio_custom_stations"),
+            lastRadioStation = RadioStationStore.loadLast(application),
             notRecommendedIds = preferences.getStringSet("not_recommended_ids", emptySet())?.toSet() ?: emptySet(),
             activeSkin = SkinTheme.values().getOrElse(preferences.getInt("active_skin", 0)) { SkinTheme.SUNSET_GLASS },
             displayName = preferences.getString("display_name", "Arnav") ?: "Arnav",
@@ -992,6 +1009,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         loadHome()
+        if (_state.value.downloadDirectoryUri != null) scanDownloadedFolder(showMessage = false)
 
         viewModelScope.launch {
             while (true) {
@@ -1218,7 +1236,8 @@ _state.value = _state.value.copy(
         } else {
             startPlaybackService()
             if (player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED || player.mediaItemCount == 0) {
-                loadTrack(_state.value.currentIndex, autoPlay = true)
+                val radio = _state.value.lastRadioStation?.takeIf { _state.value.activeSong.id == "radio:" + it.id }
+                if (radio != null) playRadioStation(radio) else loadTrack(_state.value.currentIndex, autoPlay = true)
             } else {
                 player.play()
                 _state.value = _state.value.copy(isPlaying = true)
@@ -1239,8 +1258,15 @@ _state.value = _state.value.copy(
         }
     }
 
-    fun nextTrack() = mixTransitionTo(_state.value.currentIndex + 1)
-    fun prevTrack() = mixTransitionTo(_state.value.currentIndex - 1)
+    fun nextTrack() {
+        if (_state.value.activeSong.id.startsWith("radio:")) return
+        mixTransitionTo(_state.value.currentIndex + 1)
+    }
+
+    fun prevTrack() {
+        if (_state.value.activeSong.id.startsWith("radio:")) return
+        mixTransitionTo(_state.value.currentIndex - 1)
+    }
 
     fun seekTo(frac: Float) {
         val dur = if (player.duration > 0) player.duration else _state.value.currentDurationMs
@@ -1470,9 +1496,110 @@ _state.value = _state.value.copy(
         if (persisted.isFailure) return
         preferences.edit().putString("download_directory_uri", uri.toString()).apply()
         _state.value = _state.value.copy(downloadDirectoryUri = uri.toString())
-        Toast.makeText(getApplication(), "Download folder saved.", Toast.LENGTH_SHORT).show()
+        Toast.makeText(getApplication(), "Download folder saved. Scanning for audio files…", Toast.LENGTH_SHORT).show()
+        scanDownloadedFolder(showMessage = true)
     }
 
+    fun scanDownloadedFolder(showMessage: Boolean = true) {
+        val app = getApplication<Application>()
+        val treeUri = _state.value.downloadDirectoryUri?.let(Uri::parse)
+        if (treeUri == null) {
+            if (showMessage) Toast.makeText(app, "Choose a music folder in Settings first.", Toast.LENGTH_LONG).show()
+            return
+        }
+        _state.value = _state.value.copy(isScanningDownloads = true)
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val resolver = app.contentResolver
+                    val treeId = DocumentsContract.getTreeDocumentId(treeUri)
+                    val scanned = mutableListOf<SongItemClean>()
+                    val visited = mutableSetOf<String>()
+                    val projection = arrayOf(
+                        DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                        DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                        DocumentsContract.Document.COLUMN_MIME_TYPE
+                    )
+                    suspend fun scanDirectory(parentId: String) {
+                        if (!visited.add(parentId)) return
+                        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentId)
+                        resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                            val idCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                            val nameCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                            val mimeCol = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                            while (cursor.moveToNext()) {
+                                val documentId = cursor.getString(idCol) ?: continue
+                                val name = cursor.getString(nameCol).orEmpty()
+                                val mime = cursor.getString(mimeCol).orEmpty()
+                                if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
+                                    scanDirectory(documentId)
+                                    continue
+                                }
+                                val extension = name.substringAfterLast('.', "").lowercase()
+                                if (!mime.startsWith("audio/") && extension !in setOf("mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "wma", "aiff")) continue
+                                val fileUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+                                val stableHash = MessageDigest.getInstance("SHA-256")
+                                    .digest(documentId.toByteArray())
+                                    .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+                                val id = "local:" + stableHash
+                                val retriever = android.media.MediaMetadataRetriever()
+                                val metadata = runCatching {
+                                    retriever.setDataSource(app, fileUri)
+                                    val duration = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+                                    val title = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_TITLE)
+                                        ?.takeIf { it.isNotBlank() } ?: name.substringBeforeLast('.', name)
+                                    val artist = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ARTIST)
+                                        ?.takeIf { it.isNotBlank() } ?: "Unknown artist"
+                                    val album = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ALBUM).orEmpty()
+                                    listOf(title, artist, album, duration.toString())
+                                }.getOrNull()
+                                runCatching { retriever.release() }
+                                if (metadata != null) {
+                                    scanned += SongItemClean(
+                                        id = id,
+                                        videoId = "",
+                                        title = metadata[0],
+                                        artist = metadata[1],
+                                        album = metadata[2],
+                                        coverUrl = "",
+                                        audioUrl = fileUri.toString(),
+                                        durationMs = metadata[3].toLongOrNull() ?: 0L,
+                                        codecInfo = (extension.ifBlank { mime.substringAfter('/', "audio").uppercase() }).uppercase() + " • Offline file",
+                                        isDownloaded = true
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    scanDirectory(treeId)
+                    scanned.distinctBy { it.id }
+                }
+            }
+            if (result.isFailure) {
+                Log.w("KiloDownloads", "Could not scan selected audio folder", result.exceptionOrNull())
+                _state.value = _state.value.copy(isScanningDownloads = false)
+                if (showMessage) withContext(Dispatchers.Main) {
+                    Toast.makeText(app, "Could not scan this folder. Check folder access in Settings.", Toast.LENGTH_LONG).show()
+                }
+                return@launch
+            }
+            val songs = result.getOrThrow()
+            val downloads = runCatching { JSONObject(preferences.getString("downloaded_song_uris", "{}") ?: "{}") }.getOrDefault(JSONObject())
+            val currentIds = songs.mapTo(mutableSetOf()) { it.id }
+            val staleLocalIds = downloads.keys().asSequence().filter { it.startsWith("local:") && it !in currentIds }.toList()
+            staleLocalIds.forEach(downloads::remove)
+            songs.forEach { downloads.put(it.id, it.audioUrl) }
+            preferences.edit().putString("downloaded_song_uris", downloads.toString()).apply()
+            val existingDownloads = _state.value.downloadedSongs.filterNot { it.id.startsWith("local:") }
+            persistDownloadedSongs((existingDownloads + songs).distinctBy { it.id })
+            _state.value = _state.value.copy(isScanningDownloads = false)
+            if (showMessage) {
+                val message = if (result.isSuccess) "Found " + songs.size + " audio files in your music folder."
+                    else "Couldn’t scan this folder. Check folder access in Settings."
+                Toast.makeText(app, message, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
     fun toggleAutoMenu(menu: String) {
         val current = _state.value.selectedAutoMenus.toMutableList()
         if (current.contains(menu)) {
@@ -1546,6 +1673,149 @@ _state.value = _state.value.copy(
             .onFailure { Toast.makeText(app, "No system equalizer found", Toast.LENGTH_SHORT).show() }
     }
 
+    fun playRadioStation(station: RadioStation) {
+        playJob?.cancel()
+        videoJob?.cancel()
+        val song = station.asSong()
+        _state.value = _state.value.copy(
+            playlist = listOf(song), currentIndex = 0, progress = 0f,
+            currentPosMs = 0L, currentDurationMs = 0L,
+            isLoadingStream = true, isPlaying = false, videoMode = false,
+            lastRadioStation = station
+        )
+        val app = getApplication<Application>()
+        val recent = RadioStationStore.recordPlay(app, station)
+        _state.value = _state.value.copy(radioRecentStations = recent)
+        viewModelScope.launch {
+            try {
+                startPlaybackService()
+                val dataSourceFactory = DefaultHttpDataSource.Factory()
+                    .setUserAgent("Kilo/1.5.0 (Android Internet Radio)")
+                    .setAllowCrossProtocolRedirects(true)
+                    .setConnectTimeoutMs(15_000)
+                    .setReadTimeoutMs(30_000)
+                val item = MediaItem.Builder()
+                    .setMediaId(song.id)
+                    .setUri(station.streamUrl)
+                    .setMediaMetadata(
+                        androidx.media3.common.MediaMetadata.Builder()
+                            .setTitle(station.name)
+                            .setArtist(song.artist)
+                            .setAlbumTitle("Internet Radio")
+                            .setArtworkUri(Uri.parse(station.favicon).takeIf { station.favicon.isNotBlank() })
+                            .build()
+                    )
+                    .build()
+                player.setMediaSource(ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(item))
+                player.prepare()
+                player.play()
+                _state.value = _state.value.copy(isLoadingStream = true, isPlaying = true)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.e("KiloRadio", "Could not play radio station " + station.id, error)
+                _state.value = _state.value.copy(isLoadingStream = false, isPlaying = false)
+                Toast.makeText(app, "Couldn’t play " + station.name + ". Try another station.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    fun playLastRadioStation() {
+        (_state.value.lastRadioStation ?: RadioStationStore.loadLast(getApplication()))?.let(::playRadioStation)
+    }
+
+    fun playRandomRadioStation(stations: List<RadioStation>) {
+        stations.randomOrNull()?.let(::playRadioStation)
+    }
+
+    fun toggleRadioFavorite(station: RadioStation) {
+        val current = _state.value.radioFavorites
+        val updated = if (current.any { it.id == station.id }) current.filterNot { it.id == station.id } else listOf(station) + current
+        RadioStationStore.save(getApplication(), "radio_favorites", updated)
+        _state.value = _state.value.copy(radioFavorites = updated)
+    }
+
+    fun addCustomRadioStation(name: String, url: String) {
+        val station = RadioStationStore.customStation(name, url)
+        if (station == null) {
+            Toast.makeText(getApplication(), "Enter a valid HTTPS stream URL.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val updated = listOf(station) + _state.value.customRadioStations
+        RadioStationStore.save(getApplication(), "radio_custom_stations", updated)
+        _state.value = _state.value.copy(customRadioStations = updated)
+    }
+
+    fun removeCustomRadioStation(station: RadioStation) {
+        val updated = _state.value.customRadioStations.filterNot { it.id == station.id }
+        RadioStationStore.save(getApplication(), "radio_custom_stations", updated)
+        _state.value = _state.value.copy(customRadioStations = updated)
+    }
+
+    fun setRadioSleepTimer(minutes: Int?) {
+        radioSleepJob?.cancel()
+        val safeMinutes = minutes?.takeIf { it > 0 }
+        _state.value = _state.value.copy(radioSleepTimerMinutes = safeMinutes)
+        if (safeMinutes != null) {
+            radioSleepJob = viewModelScope.launch {
+                delay(safeMinutes * 60_000L)
+                player.pause()
+                _state.value = _state.value.copy(
+                    isPlaying = false, isLoadingStream = false,
+                    radioSleepTimerMinutes = null
+                )
+            }
+        }
+    }
+
+    fun toggleRadioRecording(station: RadioStation) {
+        if (radioRecordingJob?.isActive == true) {
+            radioRecordingJob?.cancel()
+            radioRecordingJob = null
+            _state.value = _state.value.copy(isRadioRecording = false)
+            return
+        }
+        val app = getApplication<Application>()
+        val directory = File(app.getExternalFilesDir(Environment.DIRECTORY_MUSIC), "Radio")
+        radioRecordingJob = viewModelScope.launch(Dispatchers.IO) {
+            var connection: HttpURLConnection? = null
+            try {
+                if (!directory.exists() && !directory.mkdirs()) throw IOException("Could not create radio recordings folder")
+                val streamConnection = (URL(station.streamUrl).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 15_000
+                    readTimeout = 30_000
+                    setRequestProperty("User-Agent", "Kilo/1.5.0 (Android Internet Radio)")
+                    connect()
+                }
+                connection = streamConnection
+                val responseCode = streamConnection.responseCode
+                if (responseCode !in 200..299) throw IOException("Radio server returned HTTP $responseCode")
+                val suffix = station.streamUrl.substringBefore('?').substringAfterLast('.', "mp3")
+                    .lowercase().takeIf { it.matches(Regex("[a-z0-9]{2,5}")) } ?: "mp3"
+                val output = File(directory, "radio-" + System.currentTimeMillis() + "." + suffix)
+                _state.value = _state.value.copy(isRadioRecording = true)
+                streamConnection.inputStream.use { input ->
+                    FileOutputStream(output).use { stream ->
+                        val buffer = ByteArray(32 * 1024)
+                        while (isActive) {
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            stream.write(buffer, 0, count)
+                        }
+                    }
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(app, "Radio recording stopped: " + (error.localizedMessage ?: "stream error"), Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                connection?.disconnect()
+                _state.value = _state.value.copy(isRadioRecording = false)
+            }
+        }
+    }
     fun setScreen(screen: ScreenNav) { _state.value = _state.value.copy(currentScreen = screen) }
 
     fun toggleFavorite(songId: String) {
@@ -1563,12 +1833,12 @@ _state.value = _state.value.copy(
         val downloads = runCatching { JSONObject(preferences.getString("downloaded_song_uris", "{}") ?: "{}") }.getOrDefault(JSONObject())
         val existingUri = downloads.optString(song.id).takeIf { it.isNotBlank() && it != "null" }
         if (existingUri != null) {
-            runCatching { DocumentsContract.deleteDocument(getApplication<Application>().contentResolver, Uri.parse(existingUri)) }
+            if (!song.id.startsWith("local:")) runCatching { DocumentsContract.deleteDocument(getApplication<Application>().contentResolver, Uri.parse(existingUri)) }
             downloads.remove(song.id)
             preferences.edit().putString("downloaded_song_uris", downloads.toString()).apply()
             updateSongDownloadFlag(song.id, false)
             persistDownloadedSongs(_state.value.downloadedSongs.filterNot { it.id == song.id })
-            Toast.makeText(getApplication(), "Download removed.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(getApplication(), if (song.id.startsWith("local:")) "Removed from library; file kept." else "Download removed.", Toast.LENGTH_SHORT).show()
             return
         }
         val folder = _state.value.downloadDirectoryUri?.let(Uri::parse)
@@ -1850,6 +2120,8 @@ _state.value = _state.value.copy(
 
     override fun onCleared() {
         Favorites.removeListener(favoriteListener)
+        radioSleepJob?.cancel()
+        radioRecordingJob?.cancel()
         player.removeListener(playbackListener)
         updateAudioEffectSession(false)
     }
@@ -1995,6 +2267,7 @@ fun VybeMainScaffold(vm: MainViewModel) {
                     ScreenNav.LIBRARY -> LibraryScreen(vm)
                     ScreenNav.SEARCH -> SearchScreen(vm)
                     ScreenNav.OFFLINE -> OfflineMusicScreen(vm)
+                    ScreenNav.RADIO -> RadioScreen(vm)
                     ScreenNav.SETTINGS -> BitChordSettingsScreen(vm)
                     ScreenNav.APP_APPEARANCE -> AppAppearanceScreen(vm)
                     ScreenNav.ANDROID_AUTO_SETTINGS -> AndroidAutoSettingsScreen(vm)
@@ -2864,6 +3137,7 @@ fun SongOverflowMenuButton(song: SongItemClean, vm: MainViewModel) {
                         when {
                             progress != null -> "Downloading ${(progress * 100).toInt()}%"
                             downloadTask != null -> "Preparing download…"
+                            song.isDownloaded && song.id.startsWith("local:") -> "Remove from library"
                             song.isDownloaded -> "Remove download"
                             else -> "Download"
                         }
@@ -3178,6 +3452,14 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                     contentAlignment = Alignment.Center
                 ) {
                     when (state.playerOverlayTab) {
+                        OverlayTab.LYRICS -> SyncedLyricsOverlay(
+                            song = song,
+                            positionMs = state.currentPosMs,
+                            onSeek = { timeMs ->
+                                if (state.currentDurationMs > 0L) vm.seekTo((timeMs.toFloat() / state.currentDurationMs).coerceIn(0f, 1f))
+                            },
+                            accent = playerAccent
+                        )
                         OverlayTab.QUEUE -> {
                             Column(modifier = Modifier.fillMaxSize()) {
                                 Text("Up Next Queue", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
@@ -3365,6 +3647,17 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                 tint = if (state.videoMode) playerAccent else Color.White.copy(0.6f)
                             )
                         }
+                        IconButton(
+                            onClick = { vm.togglePlayerOverlayTab(OverlayTab.LYRICS) },
+                            enabled = !song.id.startsWith("radio:"),
+                            modifier = Modifier.size(42.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Subtitles,
+                                contentDescription = "Lyrics",
+                                tint = if (state.playerOverlayTab == OverlayTab.LYRICS) playerAccent else Color.White.copy(0.6f)
+                            )
+                        }
                         if (custom["showQueueIndicator"] != false) {
                             IconButton(onClick = { vm.togglePlayerOverlayTab(OverlayTab.QUEUE) }) {
                                 Icon(
@@ -3392,6 +3685,7 @@ fun BitChordBottomNavPill(state: AppStateModel, vm: MainViewModel) {
         Triple(ScreenNav.LIBRARY, "Library", Icons.Outlined.LibraryMusic),
         Triple(ScreenNav.SEARCH, "Search", Icons.Outlined.Search),
         Triple(ScreenNav.OFFLINE, "Vault", Icons.Default.Download),
+        Triple(ScreenNav.RADIO, "Radio", Icons.Default.Radio),
         Triple(ScreenNav.SETTINGS, "Studio", Icons.Outlined.Tune)
     )
 
@@ -4267,7 +4561,16 @@ fun OfflineMusicScreen(vm: MainViewModel) {
     val downloadedTracks = state.downloadedSongs
 
     Column(modifier = Modifier.fillMaxSize().padding(top = 16.dp)) {
-        Text("Offline Vault", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 20.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("Offline Vault", color = Color.White, fontSize = 28.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.weight(1f))
+            IconButton(onClick = { vm.scanDownloadedFolder() }, enabled = !state.isScanningDownloads) {
+                if (state.isScanningDownloads) CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                else Icon(Icons.Default.Refresh, contentDescription = "Scan music folder", tint = state.activeSkin.highlight)
+            }
+        }
         Spacer(modifier = Modifier.height(12.dp))
         LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
             if (state.downloadsInProgress.isNotEmpty()) {
