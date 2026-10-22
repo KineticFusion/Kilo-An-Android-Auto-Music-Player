@@ -1,69 +1,60 @@
+<div align="center">
+
 # KILO
 
-### A modern music player for Android
+### Your music. Your vibe.
 
-KILO is an Android music player focused on modern design, music discovery, and a clean listening experience. Inspired by the interfaces of Spotify, Apple Music, and YouTube Music, KILO aims to combine an intuitive user experience with a distinctive visual identity.
+**An Android music player project exploring modern playback, discovery and personalization.**
 
-> **Development status:** KILO is a work in progress. Features, performance, and the overall experience may improve as development continues.
+[![Latest release](https://img.shields.io/github/v/release/KineticFusion/Kilo-An-Android-Auto-Music-Player?label=release&color=9b6cff)](https://github.com/KineticFusion/Kilo-An-Android-Auto-Music-Player/releases/latest)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-9b6cff.svg)](LICENSE)
+[![Platform: Android](https://img.shields.io/badge/platform-Android-3ddc84.svg)](#)
+![Educational project](https://img.shields.io/badge/project-educational-9b6cff)
 
-## Features
+<img src="docs/images/kilo-github-showcase.png" alt="Kilo Android music player screens: Home, Explore and Search" width="900" />
 
-- **Modern interface** — A sleek, contemporary design focused on usability and visual appeal.
-- **Music playback** — Listen to music using the playback capabilities available in the current version.
-- **Music discovery** — Explore music through the discovery features and sources supported by the app.
-- **Android experience** — Designed specifically for Android devices.
-- **Ongoing development** — Continued refinements, fixes, and potential new features.
+</div>
 
-*Available features may vary between builds.*
+## About
 
-## Current Limitations
+Kilo is an **educational project** built to explore how a feature-rich Android music player can be designed and developed. It brings together a glass-inspired interface, music browsing and search, mood and genre personalization, playback controls, an offline vault, radio and Android Auto support.
 
-KILO is still evolving, and some areas need further improvement:
+The project is intended for learning, experimentation and community feedback. It is independent and is not affiliated with or endorsed by Yuma, BitChord, YouTube, YouTube Music or any other music service. The interface takes inspiration from contemporary music-player design while Kilo develops its own visual identity and feature set.
 
-- **Performance:** The player is not yet highly optimized, and some operations may take longer than expected.
-- **Lyrics:** Lyrics support is not currently available, but it may be introduced in a future update.
-- **Feature availability:** Some functionality may be incomplete or subject to change as development progresses.
+## What you can explore
 
-## Roadmap
+- **Personalized home** — Mood and genre choices, quick picks and discovery groupings.
+- **Music discovery** — Browse and search tracks, artists and community playlists.
+- **Listening controls** — A persistent player, queue controls, playback options and equalizer integration.
+- **Offline vault** — Manage available downloaded music in one place.
+- **Radio** — Browse stations, save favorites and tune in to streams.
+- **Android Auto** — Explore a car-friendly listening experience.
+- **Glass-inspired appearance** — Dark surfaces, soft color accents and artwork-led visuals.
 
-Potential future improvements include:
+Feature availability depends on the build and the configured sources. Kilo does not include music rights; users are responsible for ensuring they have permission to access or play any content and streams they configure.
 
-- [ ] Improve performance and loading times
-- [ ] Explore lyrics integration
-- [ ] Refine the interface and animations
-- [ ] Expand music discovery features
-- [ ] Improve playback functionality and stability
-- [ ] Address bugs and user feedback
+## Get Kilo
 
-*The roadmap represents possible future improvements and does not guarantee specific release dates.*
+Download the current release from [GitHub Releases](https://github.com/KineticFusion/Kilo-An-Android-Auto-Music-Player/releases/latest). Check each release page for its APK and version-specific notes.
 
-## Installation:
+## Learning and contributing
 
-1. Open the **Releases** section of this repository.
-2. Download the APK for the desired version.
-3. Install it on your Android device, following any prompts shown by Android.
-4. Launch KILO and explore the available features.
+Kilo is shared as a way to learn from and experiment with an Android music-player project. You can browse the Kotlin and Gradle code, try the app, report reproducible bugs or propose improvements through GitHub issues and pull requests.
 
-If no release is available yet, check back for future builds.
+When reporting a problem, include the Kilo version, Android version and device model, plus steps to reproduce it. Avoid posting private account details, access tokens or copyrighted media.
 
-## Bug Reports and Feedback
+## Project notes
 
-Feedback is welcome and can help guide future improvements. When reporting an issue, please include:
-
-- Your Android version and device model
-- The KILO version you are using
-- Steps to reproduce the issue
-- Screenshots or logs, where relevant
-
-## Privacy
-
-KILO's data handling and permissions depend on the functionality included in each build. Review the permissions requested by the app and any available privacy documentation before use.
+- This is an independent educational project; names and marks belonging to other services remain the property of their respective owners.
+- Kilo is not a music hosting service and does not grant rights to third-party content.
+- Review the permissions requested by the app and the terms of any source you choose to use.
 
 ## License
 
-KILO is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
+Kilo is released under the [GNU General Public License v3.0](LICENSE).
 
-You may use, study, modify, and redistribute the software under the terms and conditions of this license. Distribution of modified versions must comply with the applicable GPL-3.0 requirements.
----
+<div align="center">
 
 **KILO — Your music, your vibe.**
+
+</div>
