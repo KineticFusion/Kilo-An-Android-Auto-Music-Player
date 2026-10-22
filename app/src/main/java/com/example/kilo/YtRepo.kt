@@ -19,6 +19,8 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 
+data class HomeCatalogFetch(val shelves: List<HomeShelf>, val complete: Boolean)
+
 object YtRepo {
     private const val TAG = "YtRepo"
     private const val ORIGIN = "https://music.youtube.com"
@@ -332,20 +334,27 @@ object YtRepo {
     }
 
     fun fetchHome(): List<HomeShelf> {
+        return fetchHomeCatalog().shelves
+    }
+
+    /** Loads every continuation page exposed by the signed-in or public Music Home feed. */
+    fun fetchHomeCatalog(maxPages: Int = 5): HomeCatalogFetch {
         val shelves = mutableListOf<HomeShelf>()
         var json = ytMusicPost("browse", JSONObject().put("browseId", "FEmusic_home"))
+        if (json == null) return HomeCatalogFetch(emptyList(), false)
         var pages = 0
-        while (json != null && pages < 3) {
+        var complete = false
+        while (json != null && pages < maxPages.coerceIn(1, 30)) {
             shelves += parseShelves(json)
             val tokens = mutableListOf<JSONObject>()
             collect(json, "nextContinuationData", tokens)
             val token = tokens.firstOrNull()?.optString("continuation").orEmpty()
-            if (token.isEmpty()) break
+            if (token.isEmpty()) { complete = true; break }
             val enc = URLEncoder.encode(token, "UTF-8")
             json = ytMusicPost("browse", JSONObject(), "&ctoken=$enc&continuation=$enc&type=next")
             pages++
         }
-        return shelves
+        return HomeCatalogFetch(shelves.distinctBy { it.title to it.songs.map(SongItemClean::id) }, complete)
     }
 
     fun fetchPlaylistTracks(playlistId: String): List<SongItemClean> {

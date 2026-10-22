@@ -46,6 +46,7 @@ class EqualizerController(private val preferences: SharedPreferences) {
             } else {
                 val preset = preferences.getInt("eq_preset", -1)
                 if (preset in 0 until created.numberOfPresets.toInt()) created.usePreset(preset.toShort())
+                else applyPreferredProfile(created, preferences.getString("preferred_audio_profile", "Balanced").orEmpty())
             }
             created.enabled = preferences.getBoolean("eq_enabled", false)
             snapshot()
@@ -121,9 +122,63 @@ class EqualizerController(private val preferences: SharedPreferences) {
     }
 
     @Synchronized
+    fun setPreferredProfile(name: String): EqualizerSnapshot {
+        val edit = preferences.edit().putString("preferred_audio_profile", name)
+        if (name != "Custom") edit.remove("eq_preset").remove("eq_band_levels").putBoolean("eq_enabled", true)
+        edit.apply()
+        val current = effect ?: return EqualizerSnapshot()
+        return runCatching {
+            if (name != "Custom") {
+                applyPreferredProfile(current, name)
+                current.enabled = true
+            }
+            snapshot()
+        }.getOrElse { snapshot().copy(message = it.localizedMessage ?: "Could not apply the audio profile.") }
+    }
+
+    @Synchronized
     fun release() = releaseEffect()
 
     private fun levelRange(equalizer: Equalizer): IntArray = equalizer.bandLevelRange.map { it.toInt() }.toIntArray()
+
+    private fun applyPreferredProfile(equalizer: Equalizer, profile: String) {
+        val range = levelRange(equalizer)
+        val bandCount = equalizer.numberOfBands.toInt()
+        val levels = (0 until bandCount).map { index ->
+            val hz = equalizer.getCenterFreq(index.toShort()) / 1000
+            val db = when (profile) {
+                "Bass Lover" -> when {
+                    hz <= 100 -> 700
+                    hz <= 250 -> 500
+                    hz <= 500 -> 200
+                    hz >= 6000 -> -150
+                    else -> 0
+                }
+                "Vocal Focus" -> when {
+                    hz < 100 -> -250
+                    hz < 350 -> -100
+                    hz in 700..5000 -> 400
+                    hz > 8000 -> 100
+                    else -> 0
+                }
+                "Podcast" -> when {
+                    hz < 100 -> -450
+                    hz < 250 -> -100
+                    hz in 250..500 -> 200
+                    hz in 501..3500 -> 450
+                    hz > 6000 -> -100
+                    else -> 0
+                }
+                else -> 0 // Balanced and Audiophile start from a neutral curve.
+            }
+            db.coerceIn(range[0], range[1]).toShort()
+        }
+        levels.forEachIndexed { index, level -> equalizer.setBandLevel(index.toShort(), level) }
+        preferences.edit()
+            .putString("eq_band_levels", levels.joinToString(",") { it.toString() })
+            .remove("eq_preset")
+            .apply()
+    }
 
     private fun releaseEffect() {
         runCatching { effect?.release() }

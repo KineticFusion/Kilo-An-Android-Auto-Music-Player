@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 9
-        versionName = "1.6.0"
+        versionCode = 10
+        versionName = "2.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -50,6 +50,7 @@ android {
         implementation(libs.androidx.compose.ui.tooling.preview)
         implementation(libs.androidx.core.ktx)
         implementation(project(":core-streaming"))
+        implementation(project(":core-profile"))
         implementation(libs.androidx.lifecycle.runtime.ktx)
         implementation(libs.androidx.room.runtime)
         ksp(libs.androidx.room.compiler)

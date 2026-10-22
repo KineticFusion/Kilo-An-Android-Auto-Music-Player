@@ -97,6 +97,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import com.example.kilo.streaming.*
+import com.example.kilo.profile.*
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -118,19 +119,22 @@ import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.Calendar
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 
-private class PlayedSongHistoryDb(context: Context) : SQLiteOpenHelper(context, "kilo_played_history.db", null, 3) {
+private class PlayedSongHistoryDb(context: Context) : SQLiteOpenHelper(context, "kilo_played_history.db", null, 4) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE played_songs (song_id TEXT PRIMARY KEY NOT NULL, played_at INTEGER NOT NULL)")
         createInteractionsTable(db)
         createDiscoveryTable(db)
+        createCatalogStateTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createInteractionsTable(db)
         if (oldVersion < 3) createDiscoveryTable(db)
+        if (oldVersion < 4) createCatalogStateTable(db)
     }
 
     private fun createInteractionsTable(db: SQLiteDatabase) {
@@ -142,12 +146,15 @@ private class PlayedSongHistoryDb(context: Context) : SQLiteOpenHelper(context, 
         db.execSQL("CREATE TABLE IF NOT EXISTS discovery_catalog (song_id TEXT PRIMARY KEY NOT NULL, video_id TEXT NOT NULL, title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT NOT NULL, cover_url TEXT NOT NULL, duration_ms INTEGER NOT NULL, is_explicit INTEGER NOT NULL, first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, source TEXT NOT NULL)")
         db.execSQL("CREATE INDEX IF NOT EXISTS discovery_catalog_seen_idx ON discovery_catalog(last_seen_at)")
     }
+
+    private fun createCatalogStateTable(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS catalog_state (state_key TEXT PRIMARY KEY NOT NULL, state_value TEXT NOT NULL)")
+    }
 }
 
 private data class DiscoveryProfile(val artistWeights: Map<String, Float>, val recentSearches: List<String>)
 
 internal object PlayedSongHistory {
-    private const val DISCOVERY_COOLDOWN_MS = 7L * 24L * 60L * 60L * 1000L
     @Volatile private var database: PlayedSongHistoryDb? = null
     @Volatile private var cache: MutableSet<String>? = null
 
@@ -191,16 +198,27 @@ internal object PlayedSongHistory {
         return ids
     }
 
-    /** Songs previously shown to the listener, left unseen for a week, and still not meaningfully played. */
     @Synchronized
-    fun discoveredButUnplayed(nowMs: Long = System.currentTimeMillis()): List<SongItemClean> {
-        val cutoff = (nowMs - DISCOVERY_COOLDOWN_MS).toString()
+    fun isHomeCatalogComplete(): Boolean = database?.readableDatabase?.rawQuery(
+        "SELECT state_value FROM catalog_state WHERE state_key = 'home_complete'", null
+    )?.use { it.moveToFirst() && it.getString(0) == "true" } ?: false
+
+    @Synchronized
+    fun markHomeCatalogComplete() {
+        database?.writableDatabase?.execSQL(
+            "INSERT OR REPLACE INTO catalog_state(state_key, state_value) VALUES('home_complete', 'true')"
+        )
+    }
+
+    /** Songs already found in the user's catalog and not meaningfully played yet. */
+    @Synchronized
+    fun discoveredButUnplayed(): List<SongItemClean> {
         val songs = mutableListOf<SongItemClean>()
         database?.readableDatabase?.rawQuery(
             "SELECT d.song_id, d.video_id, d.title, d.artist, d.album, d.cover_url, d.duration_ms, d.is_explicit " +
                 "FROM discovery_catalog d LEFT JOIN played_songs p ON p.song_id = d.song_id " +
-                "WHERE p.song_id IS NULL AND d.last_seen_at <= ? ORDER BY d.last_seen_at ASC LIMIT 300",
-            arrayOf(cutoff)
+                "WHERE p.song_id IS NULL ORDER BY d.last_seen_at DESC LIMIT 1000",
+            null
         )?.use { cursor ->
             while (cursor.moveToNext()) {
                 songs += SongItemClean(
@@ -282,12 +300,23 @@ internal object PlayedSongHistory {
         return DiscoveryProfile(weights, searches.distinct())
     }
 
+    fun recommendationArtists(): List<String> = profile().artistWeights.entries
+        .filter { it.value > 0f }.sortedByDescending { it.value }.map { it.key }
+
     @Synchronized
     fun clear() {
         database?.writableDatabase?.delete("played_songs", null, null)
         database?.writableDatabase?.delete("discovery_interactions", null, null)
         database?.writableDatabase?.delete("discovery_catalog", null, null)
+        database?.writableDatabase?.delete("catalog_state", null, null)
         cache = mutableSetOf()
+    }
+
+    @Synchronized
+    fun resetRecommendationSignals() {
+        database?.writableDatabase?.delete("discovery_interactions", null, null)
+        database?.writableDatabase?.delete("discovery_catalog", null, null)
+        database?.writableDatabase?.delete("catalog_state", null, null)
     }
 }
 // ───────────────────────── SHARED DATA MODELS ─────────────────────────
@@ -311,6 +340,97 @@ data class SongItemClean(
 
 data class HomeShelf(val title: String, val songs: List<SongItemClean>, val isList: Boolean)
 data class ArtistItem(val id: String, val name: String, val subtitle: String, val coverUrl: String)
+
+private data class RegionalArtistPicks(val label: String, val artists: List<String>)
+
+private val GLOBAL_ARTIST_PICKS = listOf(
+    "Taylor Swift", "The Weeknd", "Beyoncé", "Drake", "Ed Sheeran", "Billie Eilish",
+    "Bad Bunny", "BTS", "Shakira", "Adele", "Bruno Mars", "Coldplay"
+)
+
+private fun regionalArtistPicks(countryCode: String): RegionalArtistPicks = when (countryCode.uppercase(Locale.ROOT)) {
+    "IN", "BD", "NP", "LK", "PK" -> RegionalArtistPicks("South Asia", listOf(
+        "Arijit Singh", "A. R. Rahman", "Shreya Ghoshal", "Diljit Dosanjh", "Anirudh Ravichander",
+        "Sid Sriram", "Atif Aslam", "Ritviz", "Jasleen Royal", "Sanam Puri", "Pritam", "Karan Aujla"
+    ))
+    "US", "CA" -> RegionalArtistPicks("North America", listOf(
+        "SZA", "Kendrick Lamar", "Post Malone", "Ariana Grande", "Justin Bieber", "Tyler, The Creator",
+        "Olivia Rodrigo", "Travis Scott", "Morgan Wallen", "The Marías", "Peso Pluma", "Tate McRae"
+    ))
+    "GB", "IE" -> RegionalArtistPicks("United Kingdom & Ireland", listOf(
+        "Harry Styles", "Dua Lipa", "RAYE", "Sam Fender", "Central Cee", "Little Simz",
+        "Lewis Capaldi", "Stormzy", "The 1975", "Fontaines D.C.", "Hozier", "Fred again.."
+    ))
+    "BR", "PT" -> RegionalArtistPicks("Brazil & Portugal", listOf(
+        "Anitta", "Ludmilla", "Jorge & Mateus", "Luísa Sonza", "Marília Mendonça", "IZA",
+        "Pedro Sampaio", "Caetano Veloso", "Baco Exu do Blues", "Pabllo Vittar", "Dilsinho", "Veigh"
+    ))
+    "MX", "AR", "CL", "CO", "PE", "ES" -> RegionalArtistPicks("Latin America & Spain", listOf(
+        "Karol G", "Feid", "Rauw Alejandro", "J Balvin", "Peso Pluma", "Natalia Lafourcade",
+        "Rosalía", "Bizarrap", "Shakira", "Manuel Turizo", "Morat", "Mon Laferte"
+    ))
+    "NG", "GH", "ZA", "KE", "TZ", "UG" -> RegionalArtistPicks("Africa", listOf(
+        "Burna Boy", "Wizkid", "Tems", "Davido", "Ayra Starr", "Rema",
+        "Asake", "Black Coffee", "Tyla", "Sauti Sol", "Diamond Platnumz", "Sarkodie"
+    ))
+    "KR" -> RegionalArtistPicks("South Korea", listOf(
+        "BLACKPINK", "NewJeans", "Stray Kids", "SEVENTEEN", "aespa", "IU",
+        "LE SSERAFIM", "TWICE", "BTS", "Jung Kook", "IVE", "ENHYPEN"
+    ))
+    "JP" -> RegionalArtistPicks("Japan", listOf(
+        "YOASOBI", "Ado", "Fujii Kaze", "Kenshi Yonezu", "Official HIGE DANdism", "King Gnu",
+        "Mrs. GREEN APPLE", "Hikaru Utada", "Vaundy", "LiSA", "Creepy Nuts", "Aimer"
+    ))
+    "AU", "NZ" -> RegionalArtistPicks("Australia & New Zealand", listOf(
+        "Tame Impala", "Sia", "The Kid LAROI", "Troye Sivan", "Kylie Minogue", "Lorde",
+        "Dean Lewis", "Kita Alexander", "G Flip", "Dom Dolla", "RÜFÜS DU SOL", "BENEE"
+    ))
+    else -> RegionalArtistPicks("Popular across Asia", listOf(
+        "Arijit Singh", "A. R. Rahman", "BTS", "BLACKPINK", "YOASOBI", "Anirudh Ravichander",
+        "Atif Aslam", "Ritviz", "NewJeans", "Jasleen Royal", "Ado", "Diljit Dosanjh"
+    ))
+}
+
+private fun discoveryLabelKey(value: String): String = value.lowercase(Locale.ROOT)
+    .replace(Regex("[^a-z0-9]+"), " ").trim().replace(Regex("\\s+"), " ")
+
+fun moodDiscoveryQuery(mood: String, genre: String? = null): String {
+    val moodTerms = when (mood.trim().lowercase(Locale.ROOT)) {
+        "focus" -> "instrumental focus music background mix"
+        "study" -> "study piano instrumental playlist music"
+        "coding" -> "coding electronic instrumental music mix"
+        "workout" -> "workout high energy music mix"
+        "night drive" -> "night driving synthwave electronic soundtrack mix"
+        "road trip" -> "road trip driving pop rock playlist mix"
+        "commute" -> "upbeat commute pop music mix"
+        "gaming" -> "gaming electronic phonk instrumental mix"
+        "relax" -> "relaxing ambient acoustic chill music mix"
+        "sleep" -> "sleep ambient piano calming instrumental mix"
+        "party" -> "party dance pop playlist mix"
+        "high energy" -> "high energy dance edm workout mix"
+        "happy" -> "happy upbeat feel good pop songs mix"
+        "sad" -> "melancholic acoustic emotional songs mix"
+        "romantic" -> "romantic r&b soul love songs mix"
+        "nostalgic" -> "nostalgic classic 80s 90s pop hits mix"
+        else -> "${mood.trim()} music playlist mix"
+    }
+    val cleanGenre = genre?.trim().orEmpty()
+    return listOf(moodTerms, cleanGenre.takeIf(String::isNotBlank)).filterNotNull().joinToString(" ")
+}
+
+fun genreDiscoveryQuery(genre: String): String = "${genre.trim()} songs playlist mix"
+
+fun filterMoodTitleMatches(songs: List<SongItemClean>, mood: String): List<SongItemClean> {
+    val moodKey = discoveryLabelKey(mood)
+    if (moodKey.isBlank()) return songs
+    return songs.filterNot { discoveryLabelKey(it.title) == moodKey }
+}
+
+fun filterGenreTitleMatches(songs: List<SongItemClean>, genre: String): List<SongItemClean> {
+    val genreKey = discoveryLabelKey(genre)
+    if (genreKey.isBlank()) return songs
+    return songs.filterNot { discoveryLabelKey(it.title) == genreKey }
+}
 data class VideoStreamInfo(
     val videoUrl: String,
     val audioUrl: String?,
@@ -543,6 +663,10 @@ data class AppStateModel(
         UserProfileAccount("1", "Main Profile", "https://picsum.photos/seed/user1/200", "", "Hi-Fi & Pop")
     ),
     val activeAccountId: String = "1",
+    val selectedMood: String = "Discover",
+    val listenerProfile: ListenerProfile = ListenerProfile(),
+    val showPersonalizationWizard: Boolean = false,
+    val profileArtistSuggestions: List<ArtistItem> = emptyList(),
     val isFullScreenPlayerOpen: Boolean = false,
     val playerOverlayTab: OverlayTab = OverlayTab.NONE,
     val downloadDirectoryUri: String? = null,
@@ -964,8 +1088,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingSeekDiscontinuity = false
     private val earlyEndRetries = mutableSetOf<String>()
     private var advertisedAudioEffectSessionId = C.AUDIO_SESSION_ID_UNSET
+    private val signaledListenIds = mutableSetOf<String>()
 
     private val player: ExoPlayer = PlayerHolder.get(application)
+
+    /** Clears KILO's pre-v2 local state exactly once for existing users, then shows setup again. */
+    private fun runFirstUpdateResetIfNeeded(application: Application): Boolean {
+        val completedSettings = application.getSharedPreferences("vybe_app_settings", Application.MODE_PRIVATE)
+        val marker = "kilo_v2_first_update_reset_done"
+        val wasSetupComplete = completedSettings.getBoolean(
+            "setup_complete",
+            completedSettings.getInt("setup_step", -1) >= 7
+        )
+        if (!wasSetupComplete || completedSettings.getBoolean(marker, false)) return false
+
+        // Keep downloaded files where the user stored them; clear only KILO-managed state.
+        application.getSharedPreferences("vybe_prefs", Application.MODE_PRIVATE).edit().clear().commit()
+        completedSettings.edit().clear().commit()
+        application.deleteDatabase("kilo_android_auto_browse.db")
+        runCatching { File(application.cacheDir, "vybe_audio").deleteRecursively() }
+        Favorites.clearForFirstUpdate()
+        PlayedSongHistory.clear()
+        HomeCache.set(emptyList())
+        YtRepo.userAuthCookie = ""
+        runCatching {
+            CookieManager.getInstance().removeAllCookies(null)
+            CookieManager.getInstance().flush()
+        }
+        completedSettings.edit()
+            .putBoolean(marker, true)
+            .putBoolean("setup_complete", false)
+            .putInt("setup_step", 0)
+            .putBoolean("personalization_pending", true)
+            .commit()
+        return true
+    }
 
     private val playbackListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -982,6 +1139,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isLoadingStream = playbackState == Player.STATE_BUFFERING && player.playWhenReady,
                 isPlaying = player.isPlaying
             )
+            if (playbackState == Player.STATE_ENDED) {
+                val ended = _state.value.activeSong
+                PlayedSongHistory.recordSignal(ended, "complete")
+                PlayedSongHistory.record(ended.id)
+            }
             if (playbackState == Player.STATE_READY && player.playWhenReady && player.volume < 0.99f) {
                 // Auto Mix fades can be interrupted by a track change. Recover the
                 // shared player volume as soon as the new item is ready.
@@ -1075,6 +1237,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     currentIndex = idx
                 )
             }
+            SessionStore.record(mediaItem)
             val activeSong = _state.value.activeSong
             if (_state.value.autoMixEnabled && player.playWhenReady && player.volume < 0.99f) {
                 fadePlayerVolume(1f, 700L, activeSong.id)
@@ -1132,6 +1295,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         LyricsRepository.loadProviderOrder(application)
         PlayedSongHistory.init(application)
         Favorites.init(application)
+        val firstUpdateReset = runFirstUpdateResetIfNeeded(application)
         Favorites.addListener(favoriteListener)
         SessionStore.init(application)
         FastStream.warmUp()
@@ -1143,13 +1307,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(
             isSetupComplete = preferences.getBoolean(
                 "setup_complete",
-                preferences.contains("download_directory_uri") || preferences.getInt("setup_step", -1) >= 6
+                preferences.getInt("setup_step", -1) >= 7
             ),
             setupStep = preferences.getInt("setup_step", 0),
             downloadDirectoryUri = preferences.getString("download_directory_uri", null),
             downloadedSongs = loadDownloadedSongs(),
             uiCustomizations = savedCustomizations,
             selectedPlayerStyleId = preferences.getString("player_style_id", PLAYER_STYLE_PRESETS.first().id) ?: PLAYER_STYLE_PRESETS.first().id,
+            selectedMood = preferences.getString("discovery_mood", "Discover") ?: "Discover",
+            listenerProfile = ProfileEngine.load(preferences),
+            showPersonalizationWizard = preferences.getBoolean("personalization_pending", false),
+            accountsList = loadAccounts(),
+            activeAccountId = preferences.getString("active_account_id", "1") ?: "1",
             savedPlaylists = loadSavedPlaylists(),
             favoriteIds = Favorites.ids(),
             radioFavorites = RadioStationStore.load(application, "radio_favorites"),
@@ -1193,8 +1362,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) {
             ""
         }
-        if (existingCookies.contains("SAPISID")) {
+        if (!firstUpdateReset && existingCookies.contains("SAPISID")) {
             YtRepo.userAuthCookie = existingCookies
+            val activeAccount = _state.value.accountsList.firstOrNull { it.id == _state.value.activeAccountId }
+            if (activeAccount != null && activeAccount.cookie != existingCookies) {
+                val updatedAccounts = _state.value.accountsList.map {
+                    if (it.id == activeAccount.id) it.copy(cookie = existingCookies) else it
+                }
+                persistAccounts(updatedAccounts, activeAccount.id)
+                _state.value = _state.value.copy(accountsList = updatedAccounts)
+            }
             _state.value = _state.value.copy(isLoggedIn = true, userAuthCookie = existingCookies)
         }
 
@@ -1214,6 +1391,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     val remaining = realDur - pos
                     val songId = _state.value.activeSong.id
+                    if (pos >= 30_000L && signaledListenIds.add(songId)) {
+                        val song = _state.value.activeSong
+                        PlayedSongHistory.record(song.id)
+                        PlayedSongHistory.recordSignal(song, "listen", pos.toFloat())
+                    }
                     if (_state.value.autoMixEnabled && remaining in 1L..1_500L && autoMixFadedSongId != songId) {
                         autoMixFadedSongId = songId
                         fadePlayerVolume(to = 0f, durationMs = remaining.coerceAtLeast(250L), songId = songId)
@@ -1250,9 +1432,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (cleanQuery.isBlank()) return
         viewModelScope.launch {
             val state = _state.value
-            val matches = if (state.isLoggedIn) {
-                withContext(Dispatchers.IO) { YtRepo.searchSongs(cleanQuery) }
-            } else {
+            val matches = withContext(Dispatchers.IO) { YtRepo.searchSongs(cleanQuery) }.ifEmpty {
                 state.downloadedSongs.filter { song ->
                     song.title.contains(cleanQuery, ignoreCase = true) ||
                         song.artist.contains(cleanQuery, ignoreCase = true) ||
@@ -1271,25 +1451,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun loadHome() {
         viewModelScope.launch {
-            if (!_state.value.isLoggedIn) {
-                HomeCache.set(emptyList())
-                _state.value = _state.value.copy(
-                    homeShelves = emptyList(), quickPicks = emptyList(), playlist = emptyList(),
-                    currentIndex = 0, isSearching = false
-                )
-                return@launch
-            }
             _state.value = _state.value.copy(isSearching = true)
             val launchNumber = preferences.getInt("home_launch_number", 0) + 1
             preferences.edit().putInt("home_launch_number", launchNumber).apply()
-            val baseInterests = (Favorites.songs() + SessionStore.recentSongs())
+            val profile = _state.value.listenerProfile
+            val baseInterests = (Favorites.songs() + PlayedSongHistory.recommendationArtists().map { artist ->
+                SongItemClean(id = "artist:$artist", title = "", artist = artist, album = "", coverUrl = "")
+            } + profile.followedArtists.map { artist ->
+                SongItemClean(id = "followed:$artist", title = "", artist = artist, album = "", coverUrl = "")
+            })
                 .filter { it.artist.isNotBlank() }
                 .groupingBy { it.artist.trim() }
                 .eachCount()
                 .entries.sortedByDescending { it.value }.map { it.key }.distinct()
             val discoveryThemes = listOf("new indie artists", "fresh alternative songs", "new electronic music", "rising pop songs", "underground R&B discoveries")
+            val selectedMood = _state.value.selectedMood.takeUnless { it.equals("Discover", ignoreCase = true) }
+            val activeMood = selectedMood ?: profile.favoriteMoods.firstOrNull()
+            val activeGenre = profile.favoriteGenres.firstOrNull()
             val recommendationQuery = if (baseInterests.isNotEmpty()) {
                 "songs like ${baseInterests[(launchNumber - 1) % baseInterests.size]}"
+            } else if (activeMood != null) {
+                moodDiscoveryQuery(activeMood, activeGenre)
+            } else if (activeGenre != null) {
+                genreDiscoveryQuery(activeGenre)
             } else {
                 discoveryThemes[(launchNumber - 1) % discoveryThemes.size]
             }
@@ -1303,52 +1487,92 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 "new regional music",
                 "emerging artists"
             )
-            val freshQuery = freshThemes[(launchNumber - 1) % freshThemes.size]
-            val (fetched, playedBefore, discoveryState) = withContext(Dispatchers.IO) {
-                    val home = YtRepo.fetchHome()
-                    val played = PlayedSongHistory.ids()
-                    val discovered = PlayedSongHistory.discoveredIds()
-                    val unplayedDiscovered = PlayedSongHistory.discoveredButUnplayed()
-                    val similar = if (baseInterests.isNotEmpty()) YtRepo.searchSongs(recommendationQuery) else emptyList()
-                    val fresh = YtRepo.searchSongs(freshQuery)
-                    Triple(home, played, Triple(discovered, unplayedDiscovered, Pair(similar, fresh)))
+            val freshQuery = when {
+                activeMood != null -> moodDiscoveryQuery(activeMood, activeGenre)
+                activeGenre != null -> genreDiscoveryQuery(activeGenre)
+                else -> freshThemes[(launchNumber - 1) % freshThemes.size]
+            }
+            val hasPersonalizedInterest = baseInterests.isNotEmpty() || selectedMood != null ||
+                profile.favoriteMoods.isNotEmpty() || profile.favoriteGenres.isNotEmpty()
+            val loadResult = coroutineScope {
+                val homeTask = async(Dispatchers.IO) { YtRepo.fetchHomeCatalog() }
+                val historyTask = async(Dispatchers.IO) {
+                    Triple(PlayedSongHistory.ids(), PlayedSongHistory.discoveredIds(), PlayedSongHistory.discoveredButUnplayed())
                 }
-            val (discoveredBefore, dormantDiscovered, queryResults) = discoveryState
-            val (similarResults, freshResults) = queryResults
+                val completeTask = async(Dispatchers.IO) { PlayedSongHistory.isHomeCatalogComplete() }
+                val similarTask = async(Dispatchers.IO) {
+                    if (!hasPersonalizedInterest) emptyList() else {
+                        YtRepo.searchSongs(recommendationQuery).let { results ->
+                            val moodFiltered = activeMood?.let { filterMoodTitleMatches(results, it) } ?: results
+                            activeGenre?.let { filterGenreTitleMatches(moodFiltered, it) } ?: moodFiltered
+                        }
+                    }
+                }
+                val freshTask = async(Dispatchers.IO) {
+                    YtRepo.searchSongs(freshQuery).let { results ->
+                        val moodFiltered = activeMood?.let { filterMoodTitleMatches(results, it) } ?: results
+                        activeGenre?.let { filterGenreTitleMatches(moodFiltered, it) } ?: moodFiltered
+                    }
+                }
+                Triple(
+                    homeTask.await(),
+                    historyTask.await() to completeTask.await(),
+                    similarTask.await() to freshTask.await()
+                )
+            }
+            val fetched = loadResult.first
+            val historyState = loadResult.second.first
+            val playedBefore = historyState.first
+            val discoveredBefore = historyState.second
+            val dormantDiscovered = historyState.third
+            val alreadyComplete = loadResult.second.second
+            val similarResults = loadResult.third.first
+            val freshResults = loadResult.third.second
             val blockedIds = playedBefore + _state.value.notRecommendedIds
             fun acceptable(song: SongItemClean) = song.videoId.isNotBlank() && song.id !in blockedIds &&
                 (!_state.value.filterMatureContent || !song.isExplicit)
 
+            val shelfLimit = when (profile.discoveryLevel) {
+                "Conservative" -> 10
+                "Explorer" -> 24
+                "Adventurer" -> 30
+                else -> 20
+            }
             val similarSongs = similarResults.asSequence()
                 .filter(::acceptable)
-                .filter { it.id !in discoveredBefore }
                 .distinctBy { it.id }
-                .take(20).toList()
+                .take(shelfLimit).toList()
             val similarIds = similarSongs.mapTo(mutableSetOf()) { it.id }
             val discoveredSongs = dormantDiscovered.asSequence()
                 .filter(::acceptable)
                 .filter { it.id !in similarIds }
                 .distinctBy { it.id }
-                .shuffled()
-                .take(20).toList()
+                .sortedBy { it.title.lowercase() }
+                .take(shelfLimit).toList()
             val discoveredIds = (discoveredBefore + discoveredSongs.map { it.id }).toSet()
-            val homeSongs = fetched.flatMap { it.songs }
+            val homeSongs = fetched.shelves.flatMap { it.songs }
             val freshSongs = (freshResults + homeSongs).asSequence()
                 .filter(::acceptable)
                 .filter { it.id !in discoveredIds && it.id !in similarIds }
                 .distinctBy { it.id }
                 .shuffled()
-                .take(24).toList()
+                .take(shelfLimit + 4).toList()
 
             val shelves = buildList {
-                if (similarSongs.isNotEmpty()) add(HomeShelf("Similar to your favorites", similarSongs, false))
+                if (similarSongs.isNotEmpty()) add(HomeShelf(
+                    if (baseInterests.isEmpty() && activeMood != null) "For your $activeMood mood" else "Similar to your favorites",
+                    similarSongs,
+                    false
+                ))
                 if (discoveredSongs.isNotEmpty()) add(HomeShelf("Discovered, not played", discoveredSongs, false))
                 if (freshSongs.isNotEmpty()) add(HomeShelf("Fresh discoveries", freshSongs, false))
-                if (isEmpty()) {
-                    // Last-resort rotation intentionally brings familiar tracks back only after
-                    // similar, waiting, and genuinely new recommendations are exhausted.
+                if (isEmpty() && alreadyComplete) {
+                    // Familiar tracks are a failsafe only after a complete Home catalog scan.
                     val familiar = (SessionStore.recentSongs() + Favorites.songs())
-                        .asSequence().filter(::acceptable).distinctBy { it.id }.shuffled().take(20).toList()
+                        .asSequence()
+                        .filter { song -> song.videoId.isNotBlank() && song.id !in _state.value.notRecommendedIds &&
+                            (!_state.value.filterMatureContent || !song.isExplicit) }
+                        .distinctBy { it.id }.shuffled().take(20).toList()
                     if (familiar.isNotEmpty()) add(HomeShelf("Familiar favorites", familiar, false))
                 }
             }
@@ -1356,6 +1580,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val discoveredShelfSongs = shelves.firstOrNull { it.title == "Discovered, not played" }?.songs.orEmpty()
             val freshShelfSongs = shelves.firstOrNull { it.title == "Fresh discoveries" }?.songs.orEmpty()
             withContext(Dispatchers.IO) {
+                if (fetched.complete) PlayedSongHistory.markHomeCatalogComplete()
+                PlayedSongHistory.markDiscovered(homeSongs, "home_catalog")
                 PlayedSongHistory.markDiscovered(similarShelfSongs, "similar")
                 PlayedSongHistory.markDiscovered(discoveredShelfSongs, "discovered")
                 PlayedSongHistory.markDiscovered(freshShelfSongs, "fresh")
@@ -1652,11 +1878,13 @@ _state.value = _state.value.copy(
             name = accountName,
             profileImage = "https://picsum.photos/seed/$accountName/200",
             cookie = cookie,
-            favoriteGenre = "Custom"
+            favoriteGenre = _state.value.selectedMood
         )
         YtRepo.userAuthCookie = cookie
+        val accounts = _state.value.accountsList + newAcc
+        persistAccounts(accounts, newAcc.id)
         _state.value = _state.value.copy(
-            accountsList = _state.value.accountsList + newAcc,
+            accountsList = accounts,
             activeAccountId = newAcc.id,
             userAuthCookie = cookie,
             isLoggedIn = cookie.contains("SAPISID"),
@@ -1669,12 +1897,15 @@ _state.value = _state.value.copy(
     fun switchAccount(accountId: String) {
         val acc = _state.value.accountsList.find { it.id == accountId } ?: return
         YtRepo.userAuthCookie = acc.cookie
+        persistAccounts(_state.value.accountsList, acc.id)
         _state.value = _state.value.copy(
             activeAccountId = acc.id,
             userAuthCookie = acc.cookie,
             isLoggedIn = acc.cookie.contains("SAPISID"),
+            selectedMood = acc.favoriteGenre,
             showAccountManagerDialog = false
         )
+        preferences.edit().putString("discovery_mood", acc.favoriteGenre).apply()
         loadHome()
     }
 
@@ -1695,6 +1926,135 @@ _state.value = _state.value.copy(
         val name = value.take(32)
         preferences.edit().putString("display_name", name).apply()
         _state.value = _state.value.copy(displayName = name)
+    }
+
+    fun setDiscoveryMood(value: String) {
+        val mood = value.trim().take(48).ifBlank { "Discover" }
+        preferences.edit().putString("discovery_mood", mood).apply()
+        val accounts = _state.value.accountsList.map { account ->
+            if (account.id == _state.value.activeAccountId) account.copy(favoriteGenre = mood) else account
+        }
+        persistAccounts(accounts, _state.value.activeAccountId)
+        _state.value = _state.value.copy(selectedMood = mood, accountsList = accounts)
+        loadHome()
+    }
+
+    fun openPersonalizationWizard() {
+        _state.value = _state.value.copy(showPersonalizationWizard = true)
+    }
+
+    fun skipPersonalizationWizard() {
+        preferences.edit().putBoolean("personalization_pending", false).apply()
+        _state.value = _state.value.copy(showPersonalizationWizard = false)
+    }
+
+    fun saveListenerProfile(profile: ListenerProfile, finishSetup: Boolean = false) {
+        val cleaned = profile.copy(
+            favoriteGenres = profile.favoriteGenres.intersect(PERSONALIZATION_GENRES.toSet()),
+            followedArtists = profile.followedArtists.map(String::trim).filter(String::isNotBlank).distinct().take(50),
+            favoriteMoods = profile.favoriteMoods.intersect(PERSONALIZATION_MOODS.toSet())
+        )
+        ProfileEngine.save(preferences, cleaned)
+        val audioSnapshot = equalizerController.setPreferredProfile(cleaned.audioPreference)
+        preferences.edit().apply {
+            putBoolean("personalization_pending", false)
+            if (finishSetup) {
+                putBoolean("setup_complete", true)
+                putInt("setup_step", 11)
+            }
+        }.apply()
+        val activeMood = cleaned.favoriteMoods.firstOrNull() ?: cleaned.favoriteGenres.firstOrNull() ?: "Discover"
+        preferences.edit().putString("discovery_mood", activeMood).apply()
+        val accounts = _state.value.accountsList.map { account ->
+            if (account.id == _state.value.activeAccountId) account.copy(favoriteGenre = activeMood) else account
+        }
+        persistAccounts(accounts, _state.value.activeAccountId)
+        _state.value = _state.value.copy(
+            isSetupComplete = finishSetup || _state.value.isSetupComplete,
+            setupStep = if (finishSetup) 11 else _state.value.setupStep,
+            currentScreen = if (finishSetup) ScreenNav.HOME else _state.value.currentScreen,
+            listenerProfile = cleaned,
+            equalizerSnapshot = audioSnapshot,
+            selectedMood = activeMood,
+            accountsList = accounts,
+            showPersonalizationWizard = false,
+            profileArtistSuggestions = emptyList()
+        )
+        loadHome()
+    }
+
+    fun toggleProfileGenre(genre: String) {
+        val current = _state.value.listenerProfile
+        val genres = current.favoriteGenres.toMutableSet().apply { if (!add(genre)) remove(genre) }
+        val profile = current.copy(favoriteGenres = genres)
+        ProfileEngine.save(preferences, profile)
+        _state.value = _state.value.copy(listenerProfile = profile)
+    }
+
+    fun toggleProfileMood(mood: String) {
+        val current = _state.value.listenerProfile
+        val moods = current.favoriteMoods.toMutableSet().apply { if (!add(mood)) remove(mood) }
+        val profile = current.copy(favoriteMoods = moods)
+        ProfileEngine.save(preferences, profile)
+        _state.value = _state.value.copy(listenerProfile = profile)
+    }
+
+    fun searchProfileArtists(query: String) {
+        if (query.isBlank()) {
+            _state.value = _state.value.copy(profileArtistSuggestions = emptyList())
+            return
+        }
+        viewModelScope.launch {
+            val artists = withContext(Dispatchers.IO) { YtRepo.searchArtists(query) }
+            _state.value = _state.value.copy(profileArtistSuggestions = artists)
+        }
+    }
+
+    fun toggleFollowedArtist(name: String) {
+        val current = _state.value.listenerProfile
+        val artists = current.followedArtists.toMutableList()
+        if (!artists.remove(name)) artists.add(name)
+        val profile = current.copy(followedArtists = artists.take(50))
+        ProfileEngine.save(preferences, profile)
+        _state.value = _state.value.copy(listenerProfile = profile)
+    }
+
+    fun setProfileChoices(discovery: String? = null, audio: String? = null, androidAuto: String? = null) {
+        val current = _state.value.listenerProfile
+        val profile = current.copy(
+            discoveryLevel = discovery ?: current.discoveryLevel,
+            audioPreference = audio ?: current.audioPreference,
+            androidAutoUsage = androidAuto ?: current.androidAutoUsage
+        )
+        ProfileEngine.save(preferences, profile)
+        _state.value = _state.value.copy(listenerProfile = profile)
+    }
+
+    fun resetRecommendations() {
+        PlayedSongHistory.resetRecommendationSignals()
+        preferences.edit().remove("not_recommended_ids").apply()
+        _state.value = _state.value.copy(notRecommendedIds = emptySet())
+        HomeCache.set(emptyList())
+        loadHome()
+    }
+
+    fun rebuildProfile() {
+        val profile = _state.value.listenerProfile
+        val artists = (profile.followedArtists + Favorites.songs().map { it.artist } + PlayedSongHistory.recommendationArtists())
+            .filter(String::isNotBlank).distinct().take(50)
+        saveListenerProfile(profile.copy(followedArtists = artists))
+    }
+
+    fun exportProfile() {
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = "application/json"
+            putExtra(Intent.EXTRA_TEXT, ProfileEngine.export(_state.value.listenerProfile))
+        }
+        runCatching {
+            getApplication<Application>().startActivity(
+                Intent.createChooser(send, "Export KILO profile").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
     }
 
     fun setAutoMixEnabled(enabled: Boolean) {
@@ -1814,6 +2174,9 @@ _state.value = _state.value.copy(
                 }
                 player.setMediaSource(source)
                 player.prepare()
+                // Video mode reuses the same ExoPlayer session; attach the saved
+                // equalizer profile to its audio output as soon as the source changes.
+                updateAudioEffectSession(true)
                 if (positionMs > 0L) player.seekTo(positionMs)
                 if (shouldPlay) player.play() else player.pause()
                 _state.value = _state.value.copy(isLoadingStream = false)
@@ -1829,9 +2192,8 @@ _state.value = _state.value.copy(
     }
 
     fun completeSetupStep(nextStep: Int) {
-        if (nextStep > 6) {
-            preferences.edit().putBoolean("setup_complete", true).putInt("setup_step", 7).apply()
-            _state.value = _state.value.copy(isSetupComplete = true, currentScreen = ScreenNav.HOME)
+        if (nextStep >= 11) {
+            saveListenerProfile(_state.value.listenerProfile, finishSetup = true)
         } else if (nextStep >= 0) {
             preferences.edit().putInt("setup_step", nextStep).apply()
             _state.value = _state.value.copy(setupStep = nextStep)
@@ -2087,14 +2449,22 @@ _state.value = _state.value.copy(
     fun openSystemEqualizer() {
         val app = getApplication<Application>()
         val sessionId = player.audioSessionId
+        if (sessionId <= 0) {
+            openEqualizer()
+            Toast.makeText(app, "Start playback to attach the equalizer. KILO's equalizer is open.", Toast.LENGTH_LONG).show()
+            return
+        }
         val intent = Intent(AudioEffect.ACTION_DISPLAY_AUDIO_EFFECT_CONTROL_PANEL).apply {
-            putExtra(AudioEffect.EXTRA_AUDIO_SESSION, if (sessionId > 0) sessionId else 0)
+            putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
             putExtra(AudioEffect.EXTRA_PACKAGE_NAME, app.packageName)
             putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         runCatching { app.startActivity(intent) }
-            .onFailure { Toast.makeText(app, "No system equalizer found", Toast.LENGTH_SHORT).show() }
+            .onFailure {
+                openEqualizer()
+                Toast.makeText(app, "No system equalizer panel is available. KILO's equalizer is open instead.", Toast.LENGTH_LONG).show()
+            }
     }
 
     fun playRadioStation(station: RadioStation) {
@@ -2283,6 +2653,7 @@ _state.value = _state.value.copy(
             .flatten().firstOrNull { it.id == songId }
             ?: current.homeShelves.asSequence().flatMap { it.songs.asSequence() }.firstOrNull { it.id == songId }
             ?: return
+        PlayedSongHistory.recordSignal(song, if (Favorites.isLiked(songId)) "unlike" else "like")
         Favorites.toggle(song)
     }
 
@@ -2519,6 +2890,38 @@ _state.value = _state.value.copy(
         _state.value = _state.value.copy(selectedPlayerStyleId = styleId)
     }
 
+    private fun loadAccounts(): List<UserProfileAccount> = runCatching {
+        val json = JSONArray(preferences.getString("profile_accounts", "[]"))
+        (0 until json.length()).mapNotNull { index ->
+            val item = json.optJSONObject(index) ?: return@mapNotNull null
+            val id = item.optString("id")
+            if (id.isBlank()) return@mapNotNull null
+            UserProfileAccount(
+                id = id,
+                name = item.optString("name", "Music Profile"),
+                profileImage = item.optString("profileImage"),
+                cookie = item.optString("cookie"),
+                favoriteGenre = item.optString("favoriteGenre", "Discover")
+            )
+        }.ifEmpty { listOf(UserProfileAccount("1", "Main Profile", "", "", "Discover")) }
+    }.getOrDefault(listOf(UserProfileAccount("1", "Main Profile", "", "", "Discover")))
+
+    private fun persistAccounts(accounts: List<UserProfileAccount>, activeId: String) {
+        val json = JSONArray()
+        accounts.forEach { account ->
+            json.put(JSONObject()
+                .put("id", account.id)
+                .put("name", account.name)
+                .put("profileImage", account.profileImage)
+                .put("cookie", account.cookie)
+                .put("favoriteGenre", account.favoriteGenre))
+        }
+        preferences.edit()
+            .putString("profile_accounts", json.toString())
+            .putString("active_account_id", activeId)
+            .apply()
+    }
+
     private fun loadSavedPlaylists(): List<SavedPlaylist> = runCatching {
         val array = JSONArray(preferences.getString("saved_playlists", "[]"))
         (0 until array.length()).mapNotNull playlistLoop@ { index ->
@@ -2645,6 +3048,10 @@ fun VybeRootApp(vm: MainViewModel) {
         )
     }
 
+    if (state.isSetupComplete && state.showPersonalizationWizard) {
+        PersonalizationWizardDialog(vm)
+    }
+
     if (!state.isSetupComplete) {
         BitChordSetupWizard(vm)
     } else {
@@ -2694,6 +3101,143 @@ fun VybeRootApp(vm: MainViewModel) {
                 titleContentColor = Color.White,
                 textContentColor = Color.White.copy(0.8f)
             )
+        }
+    }
+}
+
+@Composable
+private fun PersonalizationWizardDialog(vm: MainViewModel) {
+    val state by vm.state.collectAsState()
+    val profile = state.listenerProfile
+    var step by remember { mutableIntStateOf(0) }
+    var artistQuery by remember { mutableStateOf("") }
+    val regionalPicks = remember { regionalArtistPicks(Locale.getDefault().country) }
+    LaunchedEffect(artistQuery) {
+        delay(350)
+        vm.searchProfileArtists(artistQuery)
+    }
+
+    Dialog(onDismissRequest = vm::skipPersonalizationWizard) {
+        Surface(
+            modifier = Modifier.fillMaxWidth().heightIn(max = 700.dp),
+            shape = RoundedCornerShape(28.dp),
+            color = Color(0xFF15131D)
+        ) {
+            Column(Modifier.fillMaxWidth().padding(22.dp)) {
+                Text("Let's personalize KILO", color = Color.White, fontSize = 23.sp, fontWeight = FontWeight.ExtraBold)
+                Text("Optional · Step ${step + 1} of 4", color = state.activeSkin.highlight, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp, bottom = 12.dp))
+                Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+                    when (step) {
+                        0 -> {
+                            Text("Choose genres you enjoy", color = Color.White, fontWeight = FontWeight.Bold)
+                            ProfileChoiceGrid(PERSONALIZATION_GENRES, profile.favoriteGenres, vm::toggleProfileGenre)
+                        }
+                        1 -> {
+                            ProfileArtistPicker(vm, state, artistQuery) { artistQuery = it }
+                        }
+                        2 -> {
+                            Text("Pick moods for different moments", color = Color.White, fontWeight = FontWeight.Bold)
+                            ProfileChoiceGrid(PERSONALIZATION_MOODS, profile.favoriteMoods, vm::toggleProfileMood)
+                        }
+                        else -> {
+                            Text("Tune your recommendations", color = Color.White, fontWeight = FontWeight.Bold)
+                            ProfileSingleChoice("Discovery", listOf("Conservative", "Balanced", "Explorer", "Adventurer"), profile.discoveryLevel) { vm.setProfileChoices(discovery = it) }
+                            ProfileSingleChoice("Audio preference", listOf("Balanced", "Bass Lover", "Audiophile", "Vocal Focus", "Podcast", "Custom"), profile.audioPreference) { vm.setProfileChoices(audio = it) }
+                            ProfileSingleChoice("Android Auto", listOf("Often", "Sometimes", "Never"), profile.androidAutoUsage) { vm.setProfileChoices(androidAuto = it) }
+                            Text("KILO keeps this profile on your device. It shapes Home, recommendations, radio and Android Auto.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(top = 8.dp))
+                        }
+                    }
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    TextButton(onClick = vm::skipPersonalizationWizard) { Text("Skip", color = Color.White.copy(alpha = 0.7f)) }
+                    Spacer(Modifier.weight(1f))
+                    if (step > 0) OutlinedButton(onClick = { step-- }) { Text("Back") }
+                    Button(
+                        onClick = { if (step < 3) step++ else vm.saveListenerProfile(profile) },
+                        colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight)
+                    ) { Text(if (step < 3) "Continue" else "Finish", color = Color.Black, fontWeight = FontWeight.Bold) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileArtistPicker(vm: MainViewModel, state: AppStateModel, artistQuery: String, onQueryChange: (String) -> Unit) {
+    val profile = state.listenerProfile
+    val region = remember(state.musicRegionCode) {
+        regionalArtistPicks(if (state.musicRegionCode == "AUTO") Locale.getDefault().country else state.musicRegionCode)
+    }
+    LaunchedEffect(artistQuery) {
+        delay(350)
+        vm.searchProfileArtists(artistQuery)
+    }
+    Column {
+        Text("Follow artists", color = Color.White, fontWeight = FontWeight.Bold)
+        Text("Pick artists from popular lists or search YouTube Music. Your picks shape recommendations.", color = Color.White.copy(alpha = 0.65f), fontSize = 12.sp, modifier = Modifier.padding(top = 5.dp))
+        OutlinedTextField(
+            value = artistQuery,
+            onValueChange = onQueryChange,
+            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+            singleLine = true,
+            label = { Text("Search artists") }
+        )
+        if (artistQuery.isBlank()) {
+            Text("Popular worldwide", color = state.activeSkin.highlight, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 10.dp))
+            GLOBAL_ARTIST_PICKS.forEach { name -> ProfileArtistPick(name, name in profile.followedArtists, state.activeSkin.highlight, vm::toggleFollowedArtist) }
+            Text("Popular in ${region.label}", color = state.activeSkin.highlight, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 8.dp))
+            region.artists.forEach { name -> ProfileArtistPick(name, name in profile.followedArtists, state.activeSkin.highlight, vm::toggleFollowedArtist) }
+        } else {
+            val curatedMatches = (GLOBAL_ARTIST_PICKS + region.artists)
+                .filter { it.contains(artistQuery.trim(), ignoreCase = true) }
+            val searchMatches = state.profileArtistSuggestions.map { it.name }
+            (curatedMatches + searchMatches).distinctBy { it.lowercase(Locale.ROOT) }.take(24).forEach { name ->
+                ProfileArtistPick(name, name in profile.followedArtists, state.activeSkin.highlight, vm::toggleFollowedArtist)
+            }
+        }
+        if (profile.followedArtists.isNotEmpty()) {
+            Text("Following: ${profile.followedArtists.joinToString()}", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+private fun ProfileArtistPick(name: String, selected: Boolean, accent: Color, onToggle: (String) -> Unit) {
+    TextButton(onClick = { onToggle(name) }, modifier = Modifier.fillMaxWidth()) {
+        Text(if (selected) "✓ $name" else "+ $name", color = if (selected) accent else Color.White)
+    }
+}
+
+@Composable
+private fun ProfileChoiceGrid(options: List<String>, selected: Set<String>, onToggle: (String) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(top = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        options.chunked(3).forEach { row ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                row.forEach { value ->
+                    FilterChip(
+                        selected = value in selected,
+                        onClick = { onToggle(value) },
+                        label = { Text(value, fontSize = 11.sp) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileSingleChoice(title: String, options: List<String>, selected: String, onSelect: (String) -> Unit) {
+    Text(title, color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp))
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        options.chunked(3).forEach { row ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                row.forEach { value ->
+                    FilterChip(selected = selected == value, onClick = { onSelect(value) }, label = { Text(value, fontSize = 10.sp) }, modifier = Modifier.weight(1f))
+                }
+                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
+            }
         }
     }
 }
@@ -2828,11 +3372,6 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
     val featured = if (state.isPlaying) state.activeSong else songs.firstOrNull()
     val family = skin.layoutFamily
 
-    if (!state.isLoggedIn) {
-        SignInRequiredContent(vm, skin)
-        return
-    }
-
     LazyColumn(
         modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)),
         contentPadding = PaddingValues(bottom = 32.dp)
@@ -2871,6 +3410,33 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                         .background(if (family == 0) Color.White.copy(alpha = 0.10f) else primaryPanelColor(skin))
                         .then(if (family == 0) Modifier.border(1.dp, Color.White.copy(alpha = 0.14f), CircleShape) else Modifier)
                 ) { Icon(Icons.Default.Search, contentDescription = "Search", tint = Color.White) }
+            }
+        }
+
+        item(key = "personalization_shortcuts") {
+            Column(Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 6.dp)) {
+                Text("MOODS", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.2.sp, modifier = Modifier.padding(start = 20.dp, bottom = 3.dp))
+                LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(PERSONALIZATION_MOODS) { mood ->
+                        val selected = mood in state.listenerProfile.favoriteMoods || state.selectedMood == mood
+                        FilterChip(
+                            selected = selected,
+                            onClick = { vm.toggleProfileMood(mood); vm.setDiscoveryMood(mood) },
+                            label = { Text(mood, fontSize = 11.sp) }
+                        )
+                    }
+                }
+                Text("GENRES", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.2.sp, modifier = Modifier.padding(start = 20.dp, top = 7.dp, bottom = 3.dp))
+                LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(PERSONALIZATION_GENRES) { genre ->
+                        val selected = genre in state.listenerProfile.favoriteGenres || state.selectedMood == genre
+                        FilterChip(
+                            selected = selected,
+                            onClick = { vm.toggleProfileGenre(genre); vm.setDiscoveryMood(genre) },
+                            label = { Text(genre, fontSize = 11.sp) }
+                        )
+                    }
+                }
             }
         }
 
@@ -4306,6 +4872,35 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
 
         SettingsGroupCard {
             SettingsRowItem(
+                icon = Icons.Default.Tune,
+                title = "Personalization",
+                subtitle = "Edit genres, followed artists, moods and discovery settings",
+                trailingValue = "Edit",
+                onClick = vm::openPersonalizationWizard
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
+                icon = Icons.Default.Refresh,
+                title = "Reset Recommendations",
+                subtitle = "Clear learned discovery signals and start fresh",
+                onClick = vm::resetRecommendations
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
+                icon = Icons.Default.AutoAwesome,
+                title = "Rebuild Profile",
+                subtitle = "Use followed artists and liked songs to refresh your profile",
+                onClick = vm::rebuildProfile
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
+                icon = Icons.Default.Share,
+                title = "Export Profile",
+                subtitle = "Share a copy of your local personalization data",
+                onClick = vm::exportProfile
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
                 icon = Icons.Default.Palette,
                 title = "App Appearance",
                 subtitle = "15 complete layouts for home, library and player",
@@ -5165,25 +5760,27 @@ fun ExploreScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val skin = state.activeSkin
     val accent = skin.highlight
-    if (!state.isLoggedIn) {
-        SignInRequiredContent(vm, skin)
-        return
-    }
     Column(modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)).padding(top = 16.dp)) {
         Text(when (skin.layoutFamily) { 0 -> "Explore, in glass"; 1 -> "Browse everything"; 2 -> "Explore & Vibe Reels"; 3 -> "Browse new sounds"; else -> "The sound stream" }, color = Color.White, fontSize = if (skin.layoutFamily == 3) 30.sp else 26.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 20.dp))
         Spacer(modifier = Modifier.height(14.dp))
         LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            val genres = listOf("Global Top 50", "Trending Shorts", "80s & 90s Classics", "Synthwave", "Indie Chill")
+            val genres = listOf("Discover", "Global Top 50", "80s & 90s Classics", "Synthwave", "Indie Chill", "Alternative", "Electronic", "R&B")
             itemsIndexed(genres) { _, mood ->
                 Box(
                     modifier = Modifier
                         .clip(primaryCardShape(skin))
-                        .background(primaryPanelColor(skin))
+                        .background(if (state.selectedMood == mood) accent else primaryPanelColor(skin))
                         .then(if (skin.layoutFamily == 0) Modifier.border(1.dp, Color.White.copy(alpha = 0.12f), primaryCardShape(skin)) else Modifier)
-                        .clickable { vm.onSearchQueryChanged(mood); vm.setScreen(ScreenNav.SEARCH) }
+                        .clickable {
+                            vm.setDiscoveryMood(mood)
+                            if (mood != "Discover") {
+                                vm.onSearchQueryChanged(mood)
+                                vm.setScreen(ScreenNav.SEARCH)
+                            }
+                        }
                         .padding(horizontal = 16.dp, vertical = 10.dp)
                 ) {
-                    Text(mood, color = Color.White, fontWeight = FontWeight.Bold, fontSize = if (skin.layoutFamily == 3) 14.sp else 13.sp)
+                    Text(mood, color = if (state.selectedMood == mood) Color.Black else Color.White, fontWeight = FontWeight.Bold, fontSize = if (skin.layoutFamily == 3) 14.sp else 13.sp)
                 }
             }
         }
@@ -5633,6 +6230,7 @@ private fun musicRegionOptions(): List<Pair<String, String>> =
 fun BitChordSetupWizard(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
+    var setupArtistQuery by remember { mutableStateOf("") }
     val audioPermission = remember {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             Manifest.permission.READ_MEDIA_AUDIO
@@ -5700,7 +6298,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                     BitchordWaveLogo(modifier = Modifier.size(28.dp))
                     Text("VYBE SETUP", color = Color.White, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
                 }
-                Text("Step ${state.setupStep + 1}/7", color = state.activeSkin.highlight, fontWeight = FontWeight.Bold)
+                Text("Step ${state.setupStep + 1}/11", color = state.activeSkin.highlight, fontWeight = FontWeight.Bold)
             }
 
             Box(
@@ -5748,7 +6346,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                             Text(selectedFolder, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp, textAlign = TextAlign.Center)
                         }
                     }
-                    1 -> WizardStepContent("2. Connect YouTube Music", "Sign in to load discovery tiles, regional recommendations and online playlists. You can continue without signing in and use songs saved in your Offline Vault.") {
+                    1 -> WizardStepContent("2. Connect YouTube Music", "Browse public music without signing in. Connect an account for your personal mixes, library and playlists.") {
                         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Button(
                                 onClick = { vm.openWebLogin() },
@@ -5823,8 +6421,26 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                     5 -> WizardStepContent("6. Local-First Privacy", "All cached streams, favorites, and offline songs stay strictly on your phone.") {
                         Text("Zero telemetry • Direct InnerTube streams.", color = Color.White.copy(0.7f))
                     }
-                    6 -> WizardStepContent("7. Ready to Launch VYBE", "Enjoy instant playback and car-ready controls, ${state.displayName.ifBlank { "Listener" }}.") {
+                    6 -> WizardStepContent("7. Personalize your listening", "Choose genres, artists and moods next. You can change these later in Settings.") {
                         Icon(Icons.Default.CheckCircle, contentDescription = null, tint = state.activeSkin.highlight, modifier = Modifier.size(64.dp))
+                    }
+                    7 -> WizardStepContent("8. Choose your genres", "Pick the styles you want KILO to use for your Home shelves and recommendations.") {
+                        ProfileChoiceGrid(PERSONALIZATION_GENRES, state.listenerProfile.favoriteGenres, vm::toggleProfileGenre)
+                    }
+                    8 -> WizardStepContent("9. Follow artists", "Browse popular worldwide and regional artists, or search YouTube Music.") {
+                        Column(Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                            ProfileArtistPicker(vm, state, setupArtistQuery) { setupArtistQuery = it }
+                        }
+                    }
+                    9 -> WizardStepContent("10. Pick your moods", "Choose moods for Home, mixes and Android Auto.") {
+                        ProfileChoiceGrid(PERSONALIZATION_MOODS, state.listenerProfile.favoriteMoods, vm::toggleProfileMood)
+                    }
+                    10 -> WizardStepContent("11. Tune your listening", "These preferences shape recommendations and sound on this device.") {
+                        Column(Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
+                            ProfileSingleChoice("Discovery", listOf("Conservative", "Balanced", "Explorer", "Adventurer"), state.listenerProfile.discoveryLevel) { vm.setProfileChoices(discovery = it) }
+                            ProfileSingleChoice("Audio preference", listOf("Balanced", "Bass Lover", "Audiophile", "Vocal Focus", "Podcast", "Custom"), state.listenerProfile.audioPreference) { vm.setProfileChoices(audio = it) }
+                            ProfileSingleChoice("Android Auto", listOf("Often", "Sometimes", "Never"), state.listenerProfile.androidAutoUsage) { vm.setProfileChoices(androidAuto = it) }
+                        }
                     }
                 }
             }
@@ -5848,7 +6464,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                     modifier = Modifier.weight(if (state.setupStep > 0) 1f else 2f),
                     colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight)
                 ) {
-                    Text(if (state.setupStep == 6) "Launch VYBE" else "Continue", color = Color.Black, fontWeight = FontWeight.ExtraBold)
+                    Text(if (state.setupStep == 10) "Launch KILO" else "Continue", color = Color.Black, fontWeight = FontWeight.ExtraBold)
                 }
             }
         }

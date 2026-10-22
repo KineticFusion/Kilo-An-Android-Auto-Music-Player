@@ -24,4 +24,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Kilo"
-include(":app", ":core-streaming")
+include(":app", ":core-streaming", ":core-profile")
