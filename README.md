@@ -11,7 +11,7 @@
 [![Platform: Android](https://img.shields.io/badge/platform-Android-3ddc84.svg)](#)
 ![Educational project](https://img.shields.io/badge/project-educational-9b6cff)
 
-<img src="docs/images/kilo-github-showcase.png" alt="Kilo Android music player screens: Home, Explore and Search" width="900" />
+<img src="docs/images/kilo-github-showcase.png" alt="Kilo Android music player screens: Home, Explore, Search and Radio" width="900" />
 
 </div>
 
