@@ -2,6 +2,8 @@
 
 ## What's new
 
+- Major KILO V2 architectural overhaul, with dedicated `core-profile` and `core-streaming` modules and refreshed playback, discovery, and Android Auto flows.
+- Added a listener profile and mood system: save favorite genres, follow artists, choose moods, and personalize discovery, audio, and Android Auto behavior.
 - Added setup-time personalization for genres, global and regional artists, moods, discovery level, audio preference, and Android Auto.
 - Added a Settings editor for changing the listener profile later.
 - Updated Home and Android Auto discovery to use listening-context searches for moods and genres, with exact mood/genre title matches filtered out.
