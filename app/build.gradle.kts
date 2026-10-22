@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.ksp)
 }
 
 android {
@@ -13,14 +14,17 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 4
-        versionName = "1.5.5"
+        versionCode = 9
+        versionName = "1.6.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
         release {
+            // Keep the signing identity used by the published 1.5.5 APK so
+            // local release builds can update existing KILO installations.
+            signingConfig = signingConfigs.getByName("debug")
             optimization {
                 enable = true
                 packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
@@ -47,6 +51,8 @@ android {
         implementation(libs.androidx.core.ktx)
         implementation(project(":core-streaming"))
         implementation(libs.androidx.lifecycle.runtime.ktx)
+        implementation(libs.androidx.room.runtime)
+        ksp(libs.androidx.room.compiler)
         testImplementation(libs.junit)
         androidTestImplementation(platform(libs.androidx.compose.bom))
         androidTestImplementation(libs.androidx.compose.ui.test.junit4)

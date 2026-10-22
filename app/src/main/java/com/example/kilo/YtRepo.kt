@@ -430,9 +430,16 @@ object YtRepo {
         return fetchStreamLegacy(videoId)
     }
 
-    private fun userAgentFor(url: String = ""): String =
-        if (url.isEmpty()) "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
-        else "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
+    private fun userAgentFor(url: String): String {
+        val client = Regex("[?&]c=([A-Z_0-9]+)").find(url)?.groupValues?.get(1).orEmpty()
+        return when (client) {
+            "IOS" -> "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+            "ANDROID_VR" -> "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            "ANDROID" -> "com.google.android.youtube/19.28.35 (Linux; U; Android 14; GB) gzip"
+            "TVHTML5" -> "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.142 Safari/537.36; YouTube; target/smart_tv"
+            else -> "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
+        }
+    }
 
     private fun fetchStreamNewPipe(videoId: String): StreamInfo? {
         return try {
@@ -444,7 +451,7 @@ object YtRepo {
                 }
             if (audioStreams.isEmpty()) return null
             val best = audioStreams
-                .filter { it.format?.name?.contains("opus", ignoreCase = true) == true || it.format?.name?.contains("m4a", ignoreCase = true) == true }
+                .filter { it.format?.name?.contains("m4a", ignoreCase = true) == true }
                 .maxByOrNull { it.averageBitrate }
                 ?: audioStreams.maxByOrNull { it.averageBitrate }
                 ?: return null

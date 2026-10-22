@@ -1,4 +1,4 @@
-@file:OptIn(androidx.media3.common.util.UnstableApi::class)
+@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 
 package com.example.kilo
 
@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -26,7 +27,6 @@ import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
-import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
@@ -63,13 +63,19 @@ import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
 private const val TAG = "VybeAuto"
 private const val ROOT = "root"
+private const val AUTO_STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED"
+private const val AUTO_BROWSABLE_HINT = "android.media.browse.CONTENT_STYLE_BROWSABLE_HINT"
+private const val AUTO_PLAYABLE_HINT = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT"
+private const val AUTO_STYLE_LIST = 1
 private const val TAB_HOME = "tab_home"
 private const val TAB_BROWSE = "tab_browse"
 private const val TAB_LIBRARY = "tab_library"
+private const val TAB_OFFLINE = "tab_offline"
 private const val TAB_PICKS = "tab_picks"
 private const val TAB_SHELVES = "tab_shelves"
 private const val TAB_LIKED = "tab_liked"
@@ -108,6 +114,7 @@ fun SongItemClean.toMediaItem(): MediaItem {
         .setIsPlayable(true)
         .setIsBrowsable(false)
         .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+        .setExtras(autoBrowseStyleExtras(isBrowsable = false))
     if (coverUrl.isNotEmpty()) {
         runCatching { Uri.parse(coverUrl) }.getOrNull()?.let { meta.setArtworkUri(it) }
     }
@@ -142,17 +149,48 @@ private fun folderItem(
     subtitle: String? = null,
     art: String? = null
 ): MediaItem {
+    val artwork = art?.takeIf { it.isNotBlank() }
+        ?.let { runCatching { Uri.parse(it) }.getOrNull() }
+        ?.takeIf { it.scheme?.lowercase() in setOf("http", "https", "content", "android.resource") }
     val m = MediaMetadata.Builder()
         .setTitle(title)
         .setIsBrowsable(true)
         .setIsPlayable(false)
-        .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_MIXED)
+        .setMediaType(MediaMetadata.MEDIA_TYPE_MIXED)
+        .setFolderType(MediaMetadata.FOLDER_TYPE_MIXED)
+        .setExtras(autoBrowseStyleExtras(isBrowsable = true))
     subtitle?.let { m.setSubtitle(it) }
-    if (!art.isNullOrEmpty()) m.setArtworkUri(Uri.parse(art))
+    artwork?.let(m::setArtworkUri)
     return MediaItem.Builder()
         .setMediaId(id)
         .setMediaMetadata(m.build())
         .build()
+}
+
+private fun autoBrowseStyleExtras(isBrowsable: Boolean): Bundle = Bundle().apply {
+    putBoolean(AUTO_STYLE_SUPPORTED, true)
+    putInt(AUTO_BROWSABLE_HINT, AUTO_STYLE_LIST)
+    putInt(AUTO_PLAYABLE_HINT, AUTO_STYLE_LIST)
+}
+
+private fun listStyleLibraryParams(params: LibraryParams?): LibraryParams =
+    LibraryParams.Builder()
+        .setOffline(params?.isOffline ?: false)
+        .setRecent(params?.isRecent ?: false)
+        .setSuggested(params?.isSuggested ?: false)
+        .setExtras(Bundle(params?.extras ?: Bundle()).apply {
+            putBoolean(AUTO_STYLE_SUPPORTED, true)
+            putInt(AUTO_BROWSABLE_HINT, AUTO_STYLE_LIST)
+            putInt(AUTO_PLAYABLE_HINT, AUTO_STYLE_LIST)
+        })
+        .build()
+
+private fun <T> List<T>.pageSafely(page: Int, pageSize: Int): List<T> {
+    if (page < 0 || pageSize <= 0) return this
+    val from = page.toLong() * pageSize.toLong()
+    if (from >= size) return emptyList()
+    val to = minOf(from + pageSize.toLong(), size.toLong()).toInt()
+    return subList(from.toInt(), to)
 }
 
 object Favorites {
@@ -367,14 +405,18 @@ object HomeCache {
 }
 
 object PlayerHolder {
+    private const val MAX_PLAYBACK_RETRIES = 2
     private var player: ExoPlayer? = null
     private var bandwidthMeter: DefaultBandwidthMeter? = null
     private val retryAttempts = ConcurrentHashMap<String, Int>()
+    private val unavailableTrackIds = ConcurrentHashMap.newKeySet<String>()
+    private val lastKnownPositionMs = ConcurrentHashMap<String, Long>()
+    private val qualifiedHistoryIds = ConcurrentHashMap.newKeySet<String>()
     private val bgPool = Executors.newCachedThreadPool()
     @Volatile private var handleCallAudioFocus = true
 
     fun isRetrying(videoId: String): Boolean =
-        (retryAttempts[videoId] ?: 0) in 1..RetryManager.maxAttempts
+        (retryAttempts[videoId] ?: 0) in 1..MAX_PLAYBACK_RETRIES
 
     fun estimatedBandwidthKbps(): Long {
         val estimate = bandwidthMeter?.bitrateEstimate ?: -1L
@@ -389,6 +431,7 @@ object PlayerHolder {
             .getBoolean("pause_for_calls", true)
         Favorites.init(app)
         SessionStore.init(app)
+        PlayedSongHistory.init(app)
 
         val meter = DefaultBandwidthMeter.Builder(app).build()
         bandwidthMeter = meter
@@ -425,17 +468,11 @@ object PlayerHolder {
             resolve(app, spec)
         }
 
-        val bufferProfile = BufferController.profile(app)
         val p = ExoPlayer.Builder(app)
             .setBandwidthMeter(meter)
             .setLoadControl(
                 DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(
-                        bufferProfile.minBufferMs,
-                        bufferProfile.maxBufferMs,
-                        bufferProfile.startBufferMs,
-                        bufferProfile.rebufferMs
-                    )
+                    .setBufferDurationsMs(30_000, 90_000, 2_500, 5_000)
                     .build()
             )
             .setMediaSourceFactory(
@@ -454,40 +491,161 @@ object PlayerHolder {
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
         p.repeatMode = Player.REPEAT_MODE_ALL
-        // A gentle tempo lift while preserving the original pitch.
-        p.playbackParameters = PlaybackParameters(1.03f, 1f)
+
+        val positionHandler = Handler(Looper.getMainLooper())
+        val positionSampler = object : Runnable {
+            override fun run() {
+                p.currentMediaItem?.mediaId?.takeIf { p.isPlaying }?.let { id ->
+                    val position = p.currentPosition.coerceAtLeast(0L)
+                    lastKnownPositionMs[id] = position
+                    if (position >= 30_000L && qualifiedHistoryIds.add(id)) {
+                        val playedItem = p.currentMediaItem
+                        bgPool.execute {
+                            PlayedSongHistory.record(id)
+                            SessionStore.record(playedItem)
+                        }
+                    }
+                }
+                positionHandler.postDelayed(this, 250L)
+            }
+        }
+        positionHandler.post(positionSampler)
+
+        fun logPlaybackSnapshot(event: String) {
+            val item = p.currentMediaItem
+            val duration = p.duration.takeIf { it != C.TIME_UNSET } ?: -1L
+            Log.i(
+                "KiloPlayback",
+                "$event id=${item?.mediaId.orEmpty()} title=${item?.mediaMetadata?.title?.toString().orEmpty()} " +
+                    "state=${when (p.playbackState) { Player.STATE_IDLE -> "IDLE"; Player.STATE_BUFFERING -> "BUFFERING"; Player.STATE_READY -> "READY"; Player.STATE_ENDED -> "ENDED"; else -> p.playbackState.toString() }} " +
+                    "playWhenReady=${p.playWhenReady} isPlaying=${p.isPlaying} positionMs=${p.currentPosition} " +
+                    "bufferedMs=${p.bufferedPosition} durationMs=$duration bufferPercent=${p.bufferedPercentage} " +
+                    "bandwidthKbps=${(meter.bitrateEstimate / 1_000L).takeIf { it > 0L } ?: -1L} " +
+                    "queue=${p.currentMediaItemIndex + 1}/${p.mediaItemCount}"
+            )
+        }
 
         p.addListener(object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                logPlaybackSnapshot("stateChanged")
+            }
+
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int
+            ) {
+                if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                    p.currentMediaItem?.mediaId?.let { lastKnownPositionMs[it] = newPosition.positionMs.coerceAtLeast(0L) }
+                }
+                Log.i(
+                    "KiloPlayback",
+                    "positionDiscontinuity reason=$reason old=${oldPosition.positionMs}ms " +
+                        "new=${newPosition.positionMs}ms item=${newPosition.mediaItemIndex}"
+                )
+            }
+
+            override fun onTrackSelectionParametersChanged(parameters: androidx.media3.common.TrackSelectionParameters) {
+                Log.i("KiloPlayback", "trackSelectionParametersChanged $parameters")
+            }
+
+            override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) {
+                Log.i("KiloPlayback", "timelineChanged reason=$reason windows=${timeline.windowCount} periods=${timeline.periodCount}")
+            }
+
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-                mediaItem?.mediaId?.let { retryAttempts.remove(it) }
+                Log.i(
+                    "KiloPlayback",
+                    "mediaItemTransition reason=$reason id=${mediaItem?.mediaId.orEmpty()} " +
+                        "title=${mediaItem?.mediaMetadata?.title?.toString().orEmpty()} uri=${mediaItem?.localConfiguration?.uri?.scheme}"
+                )
+                // Error recovery replaces the current item in the playlist. Keep its
+                // failure count across that synthetic transition so repeated 403s
+                // cannot restart the same retry forever.
+                if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) {
+                    mediaItem?.mediaId?.let { retryAttempts.remove(it) }
+                }
                 SessionStore.save(p)
-                SessionStore.record(mediaItem)
                 ensureServiceRunning(app)
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (isPlaying) {
-                    p.currentMediaItem?.mediaId?.let { retryAttempts.remove(it) }
+                    val playingId = p.currentMediaItem?.mediaId
+                    if (playingId != null) {
+                        Handler(Looper.getMainLooper()).postDelayed({
+                            if (p.currentMediaItem?.mediaId == playingId && p.isPlaying && p.currentPosition >= 10_000L) {
+                                retryAttempts.remove(playingId)
+                                unavailableTrackIds.remove(playingId)
+                            }
+                        }, 20_000L)
+                    }
                     ensureServiceRunning(app)
                 } else {
+                    p.currentMediaItem?.mediaId?.let { id ->
+                        lastKnownPositionMs[id] = maxOf(
+                            lastKnownPositionMs[id] ?: 0L,
+                            p.currentPosition.coerceAtLeast(0L)
+                        )
+                    }
                     SessionStore.save(p)
                 }
             }
 
             override fun onPlayerError(error: PlaybackException) {
                 val id = p.currentMediaItem?.mediaId ?: return
-                Log.e(TAG, "Playback error " + error.errorCodeName + " for " + id, error)
+                Log.e("KiloPlayback", "Playback error ${error.errorCodeName} for $id", error)
+                logPlaybackSnapshot("playerError")
                 if (!id.startsWith("radio:")) {
                     LosslessSource.invalidate(id)
                     FastStream.invalidate(id)
                 }
                 val attempt = retryAttempts.merge(id, 1) { previous, increment -> previous + increment } ?: 1
-                val retryDelay = RetryManager.delayBeforeAttempt(attempt) ?: return
+                val retryDelay = (400L * attempt).takeIf { attempt <= MAX_PLAYBACK_RETRIES }
+                val failureText = generateSequence<Throwable>(error) { it.cause }
+                    .mapNotNull { it.message }
+                    .joinToString(" ")
+                val streamUnavailable = failureText.contains("No playable stream", ignoreCase = true) ||
+                    failureText.contains("video is unavailable", ignoreCase = true)
                 val shouldResume = p.playWhenReady
-                Handler(Looper.getMainLooper()).postDelayed({
-                    if (p.currentMediaItem?.mediaId == id) {
+                val retryPositionMs = maxOf(
+                    lastKnownPositionMs[id] ?: 0L,
+                    p.currentPosition.coerceAtLeast(0L)
+                )
+                val currentIndex = p.currentMediaItemIndex
+                if (streamUnavailable || retryDelay == null) {
+                    unavailableTrackIds.add(id)
+                    retryAttempts.remove(id)
+                    val nextIndex = (1 until p.mediaItemCount)
+                        .map { offset -> (currentIndex + offset) % p.mediaItemCount }
+                        .firstOrNull { index ->
+                            val nextId = p.getMediaItemAt(index).mediaId
+                            nextId != id && nextId !in unavailableTrackIds
+                        }
+                    if (nextIndex != null) {
+                        Log.w("KiloPlayback", "Skipping unavailable stream id=$id; continuing at queue index=$nextIndex")
+                        p.seekTo(nextIndex, 0L)
                         p.prepare()
                         if (shouldResume) p.play()
+                    } else {
+                        Log.e("KiloPlayback", "No other playable queue item after stream failure id=$id")
+                        p.pause()
+                    }
+                    return
+                }
+                Handler(Looper.getMainLooper()).postDelayed({
+                    if (p.currentMediaItem?.mediaId == id) {
+                        // prepare() after a source error can return the player to
+                        // the item's default position. Retain the latest requested
+                        // or confirmed position so a range failure does not restart
+                        // a long track from zero.
+                        val resumePositionMs = maxOf(
+                            retryPositionMs,
+                            lastKnownPositionMs[id] ?: 0L
+                        )
+                        p.seekTo(resumePositionMs)
+                        p.prepare()
+                        if (shouldResume && p.playWhenReady) p.play()
                     }
                 }, retryDelay)
             }
@@ -538,16 +696,28 @@ object PlayerHolder {
             .filterNotNull().distinct().mapNotNull { downloads?.optString(it)?.takeIf { value -> value.isNotBlank() && value != "null" } }
             .firstOrNull()
         if (localUriStr != null) {
+            Log.i("KiloPlayback", "streamResolved id=$videoId source=download uriScheme=${Uri.parse(localUriStr).scheme}")
             return spec.buildUpon().setUri(Uri.parse(localUriStr)).build()
         }
+        val resolveStartedAt = SystemClock.elapsedRealtime()
             val info = StreamResolver(listOf(
             StreamSource { id -> LosslessSource.peek(id) ?: LosslessSource.resolve(ctx, id) },
             StreamSource { id -> FastStream.get(id, { YtRepo.fetchStream(it) }, ctx) }
         )).resolve(videoId)
             ?: throw IOException("No playable stream for $videoId")
         val streamHost = Uri.parse(info.url).host.orEmpty()
+        Log.i(
+            "KiloPlayback",
+            "streamResolved id=$videoId host=$streamHost codec=${info.codec} bitrateKbps=${info.bitrateKbps} " +
+                "expiresAtMs=${info.expiresAtEpochMs} ttlMs=${(info.expiresAtEpochMs - System.currentTimeMillis()).takeIf { info.expiresAtEpochMs > 0L } ?: -1L} " +
+                "resolveMs=${SystemClock.elapsedRealtime() - resolveStartedAt} rangeStart=${spec.position}"
+        )
         val refererHeaders = if (streamHost.endsWith("youtube.com") || streamHost.endsWith("googlevideo.com")) {
-            mapOf("Referer" to "https://www.youtube.com/")
+            mapOf(
+                "Referer" to "https://www.youtube.com/",
+                "Origin" to "https://www.youtube.com",
+                "Accept-Encoding" to "identity"
+            )
         } else emptyMap()
         return spec.buildUpon()
             .setUri(Uri.parse(info.url))
@@ -565,10 +735,14 @@ class VybeMediaService : MediaLibraryService() {
     @Volatile private var notificationArtworkId: String? = null
     @Volatile private var notificationArtwork: Bitmap? = null
     @Volatile private var artworkLoadInProgress = false
+    private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
 
     private val index = ConcurrentHashMap<String, MediaItem>()
     private val siblings = ConcurrentHashMap<String, List<MediaItem>>()
     private val searchCache = ConcurrentHashMap<String, List<MediaItem>>()
+    private val homeRefreshInProgress = AtomicBoolean(false)
+    private val pendingCatalogRefreshes = ConcurrentHashMap.newKeySet<String>()
+    private val lastCatalogRefreshAt = ConcurrentHashMap<String, Long>()
 
     private val favListener: () -> Unit = { main.post { updateLayout(); postPlaybackNotification() } }
     private val layoutListener = object : Player.Listener {
@@ -578,9 +752,14 @@ class VybeMediaService : MediaLibraryService() {
         }
         override fun onPlaybackStateChanged(playbackState: Int) {
             postPlaybackNotification()
+            val isPlaying = session?.player?.isPlaying == true
+            if (isPlaying && wifiLock?.isHeld == false) wifiLock?.acquire()
+            else if (!isPlaying && wifiLock?.isHeld == true) wifiLock?.release()
         }
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             postPlaybackNotification()
+            if (isPlaying && wifiLock?.isHeld == false) wifiLock?.acquire()
+            else if (!isPlaying && wifiLock?.isHeld == true) wifiLock?.release()
         }
     }
 
@@ -615,11 +794,7 @@ class VybeMediaService : MediaLibraryService() {
             addAction(ACTION_PREV_TRACK)
             addAction(ACTION_CLOSE_APP)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(notifReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(notifReceiver, filter)
-        }
+        ContextCompat.registerReceiver(this, notifReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
         val player = PlayerHolder.get(this)
         val open = PendingIntent.getActivity(
@@ -631,6 +806,12 @@ class VybeMediaService : MediaLibraryService() {
         session = MediaLibrarySession.Builder(this, player, AutoCallback())
             .setSessionActivity(open)
             .build()
+        Log.i(TAG, "MediaLibrarySession created sessionAvailable=${session != null} playerItems=${player.mediaItemCount}")
+        
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+        @Suppress("DEPRECATION")
+        wifiLock = wifiManager.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KiloPlaybackWifiLock")
+        
         player.addListener(layoutListener)
         Favorites.addListener(favListener)
         updateLayout()
@@ -757,6 +938,7 @@ class VybeMediaService : MediaLibraryService() {
 
     private fun closeAppCompletely() {
         runCatching {
+            wifiLock?.let { if (it.isHeld) it.release() }
             session?.player?.let {
                 SessionStore.save(it)
                 it.stop()
@@ -767,15 +949,29 @@ class VybeMediaService : MediaLibraryService() {
         exitProcess(0)
     }
 
-    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? = session
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? {
+        val active = session
+        Log.i(TAG, "onGetSession controller=${controllerInfo.packageName} available=${active != null}")
+        return active
+    }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        val p = session?.player
-        if (p == null || !p.playWhenReady || p.mediaItemCount == 0) stopSelf()
+        super.onTaskRemoved(rootIntent)
+        val activeSession = session
+        val player = activeSession?.player
+        val browserConnected = activeSession?.connectedControllers?.isNotEmpty() == true
+        val keepForPlaybackOrBrowser = player?.playWhenReady == true ||
+            player?.isPlaying == true ||
+            (player?.mediaItemCount ?: 0) > 0 ||
+            browserConnected
+        Log.i(TAG, "onTaskRemoved keepService=$keepForPlaybackOrBrowser browserConnected=$browserConnected queue=${player?.mediaItemCount ?: 0}")
+        if (!keepForPlaybackOrBrowser) stopSelf()
     }
 
     override fun onDestroy() {
+        Log.i(TAG, "MediaLibraryService destroyed sessionAvailable=${session != null}")
         runCatching { unregisterReceiver(notifReceiver) }
+        wifiLock?.let { if (it.isHeld) it.release() }
         session?.player?.let {
             SessionStore.save(it)
             it.removeListener(layoutListener)
@@ -809,19 +1005,33 @@ class VybeMediaService : MediaLibraryService() {
         s.setCustomLayout(ImmutableList.of(likeBtn, queueBtn, closeBtn))
     }
 
-    private fun <T> bg(block: () -> T): ListenableFuture<T> {
-        val f = SettableFuture.create<T>()
+    private fun <T> bg(callbackName: String, block: () -> T): ListenableFuture<T> {
+        val future = SettableFuture.create<T>()
         io.execute {
+            val startedAt = SystemClock.elapsedRealtime()
             try {
-                f.set(block())
-            } catch (e: Throwable) {
-                Log.e(TAG, "background task failed", e)
-                f.setException(e)
+                future.set(block())
+            } catch (error: Throwable) {
+                Log.e(TAG, "$callbackName failed", error)
+                future.setException(error)
+            } finally {
+                Log.d(TAG, "$callbackName durationMs=${SystemClock.elapsedRealtime() - startedAt}")
             }
         }
-        return f
+        return future
     }
 
+    private inline fun <T> traceCallback(callbackName: String, block: () -> T): T {
+        val startedAt = SystemClock.elapsedRealtime()
+        try {
+            return block()
+        } catch (error: Throwable) {
+            Log.e(TAG, "$callbackName failed", error)
+            throw error
+        } finally {
+            Log.d(TAG, "$callbackName durationMs=${SystemClock.elapsedRealtime() - startedAt}")
+        }
+    }
     private fun register(items: List<MediaItem>): List<MediaItem> {
         val playable = items.filter { it.mediaMetadata.isPlayable == true }
         playable.forEach {
@@ -863,16 +1073,260 @@ class VybeMediaService : MediaLibraryService() {
                 .build()
         }
     )
+    private fun carHomeShelves(): List<HomeShelf> {
+        val cached = HomeCache.shelves
+        if (cached.isEmpty()) refreshHomeCatalogAsync()
+        return cached
+    }
+
+    private fun refreshHomeCatalogAsync() {
+        if (!YtRepo.userAuthCookie.contains("SAPISID") || !homeRefreshInProgress.compareAndSet(false, true)) return
+        if (!allowCatalogRefresh("home", 30_000L)) {
+            homeRefreshInProgress.set(false)
+            return
+        }
+        io.execute {
+            try {
+                val loaded = runCatching { YtRepo.fetchHome() }
+                    .onFailure { Log.e(TAG, "Android Auto home catalog refresh failed", it) }
+                    .getOrDefault(emptyList())
+                if (loaded.isNotEmpty()) {
+                    HomeCache.set(loaded)
+                    val refreshedParents = (
+                        listOf(TAB_HOME, TAB_BROWSE, TAB_PICKS, TAB_TRENDING, TAB_HEARD_SHORTS, TAB_LISTEN_AGAIN, TAB_SHELVES, TAB_PLAYLISTS) +
+                            loaded.indices.map { "shelf:$it" }
+                        ).distinct()
+                    val refreshedCounts = refreshedParents
+                        .mapNotNull { parentId ->
+                            val safe = cacheChildren(parentId, childrenOf(parentId))
+                            safe.size.takeIf { it > 0 }?.let { parentId to it }
+                        }
+                    main.post {
+                        val activeSession = session ?: return@post
+                        refreshedCounts.forEach { (parentId, count) ->
+                            activeSession.notifyChildrenChanged(parentId, count, null)
+                        }
+                    }
+                }
+            } finally {
+                homeRefreshInProgress.set(false)
+            }
+        }
+    }
+    private fun allowCatalogRefresh(key: String, minimumIntervalMs: Long = 60_000L): Boolean = synchronized(lastCatalogRefreshAt) {
+        val now = System.currentTimeMillis()
+        val previous = lastCatalogRefreshAt[key] ?: 0L
+        if (now - previous < minimumIntervalMs) false else {
+            lastCatalogRefreshAt[key] = now
+            true
+        }
+    }
+
+    private fun validMediaItems(parentId: String, items: List<MediaItem>): List<MediaItem> {
+        val seenIds = HashSet<String>()
+        return items.mapIndexedNotNull { position, item ->
+        val id = item.mediaId.trim()
+        if (id.isBlank()) {
+            Log.w(TAG, "Dropping Android Auto item with empty mediaId parent=$parentId position=$position")
+            return@mapIndexedNotNull null
+        }
+        if (!seenIds.add(id)) {
+            Log.w(TAG, "Dropping duplicate Android Auto mediaId parent=$parentId position=$position mediaId=$id")
+            return@mapIndexedNotNull null
+        }
+        val playable = item.mediaMetadata.isPlayable == true
+        val browsable = item.mediaMetadata.isBrowsable == true
+        if (!playable && !browsable) {
+            Log.w(TAG, "Dropping non-playable, non-browsable Android Auto item parent=$parentId mediaId=$id")
+            return@mapIndexedNotNull null
+        }
+        val title = item.mediaMetadata.title?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: if (playable) "Untitled track" else "Untitled section"
+        val artworkUri = item.mediaMetadata.artworkUri?.takeIf {
+            it.scheme?.lowercase() in setOf("http", "https", "content", "android.resource")
+        }
+        val extras = Bundle(item.mediaMetadata.extras ?: Bundle()).apply {
+            putBoolean(AUTO_STYLE_SUPPORTED, true)
+            putInt(AUTO_BROWSABLE_HINT, AUTO_STYLE_LIST)
+            putInt(AUTO_PLAYABLE_HINT, AUTO_STYLE_LIST)
+        }
+        val metadata = MediaMetadata.Builder()
+            .setTitle(title)
+            .setSubtitle(item.mediaMetadata.subtitle)
+            .setArtist(item.mediaMetadata.artist)
+            .setAlbumTitle(item.mediaMetadata.albumTitle)
+            .setIsPlayable(playable)
+            .setIsBrowsable(browsable)
+            .setMediaType(if (browsable) MediaMetadata.MEDIA_TYPE_MIXED else MediaMetadata.MEDIA_TYPE_MUSIC)
+            .setExtras(extras)
+        if (browsable) metadata.setFolderType(item.mediaMetadata.folderType ?: MediaMetadata.FOLDER_TYPE_MIXED)
+        artworkUri?.let(metadata::setArtworkUri)
+        item.buildUpon().setMediaId(id).setMediaMetadata(metadata.build()).build()
+        }
+    }
+
+    private fun fallbackChildren(parentId: String): List<MediaItem> {
+        if (!isSignedIn()) {
+            val onlyOffline = when (parentId) {
+                ROOT -> listOf(folderItem(TAB_OFFLINE, "Offline Vault", "Downloaded music available without sign-in"))
+                TAB_OFFLINE -> downloadedMediaItems()
+                else -> emptyList()
+            }
+            return validMediaItems(parentId, onlyOffline)
+        }
+        val localSongs = (SessionStore.recentSongs() + Favorites.songs())
+            .distinctBy { it.videoId.ifBlank { it.id } }
+        val fallbackSongs = localSongs.map { it.toMediaItem() }
+        val result = when (parentId) {
+            ROOT, TAB_HOME, TAB_BROWSE, TAB_RADIO, TAB_LIBRARY -> childrenOf(parentId)
+            TAB_PICKS, TAB_RECENT, TAB_CONTINUE, TAB_LISTEN_AGAIN, TAB_TRENDING, TAB_HEARD_SHORTS, TAB_LIKED ->
+                fallbackSongs
+            TAB_PLAYLISTS -> savedPlaylists().map { playlist ->
+                folderItem("savedpl:${playlist.id}", playlist.name, "${playlist.songs.size} songs", playlist.songs.firstOrNull()?.coverUrl)
+            }
+            TAB_RADIO_BROWSE -> radioMediaItems(
+                (RadioStationStore.load(this, "radio_favorites") +
+                    RadioStationStore.load(this, "radio_recent_stations") +
+                    RadioStationStore.load(this, "radio_custom_stations")).distinctBy { it.id }
+            )
+            else -> when {
+                parentId.startsWith("savedpl:") -> savedPlaylists()
+                    .firstOrNull { it.id == parentId.removePrefix("savedpl:") }?.songs?.map { it.toMediaItem() }.orEmpty()
+                parentId.startsWith("shelf:") -> fallbackSongs
+                parentId.startsWith("pl:") -> emptyList()
+                else -> emptyList()
+            }
+        }
+        return validMediaItems(parentId, result)
+    }
+
+    private fun cacheChildren(parentId: String, items: List<MediaItem>): List<MediaItem> {
+        val safe = validMediaItems(parentId, items)
+        if (!isVolatileBrowseParent(parentId)) runCatching {
+            // Empty-state rows must stay transient so new content can replace them later.
+            AutoBrowseCache.write(this, parentId, safe.filterNot { it.mediaId.startsWith("info:") })
+        }
+            .onFailure { Log.e(TAG, "Could not cache Android Auto section $parentId", it) }
+        return safe
+    }
+
+    private fun isVolatileBrowseParent(parentId: String): Boolean =
+        parentId in setOf(
+            TAB_RECENT,
+            TAB_CONTINUE,
+            TAB_LIKED,
+            TAB_PLAYLISTS,
+            TAB_OFFLINE,
+            TAB_RADIO_FAVORITES,
+            TAB_RADIO_RECENT,
+            TAB_RADIO_CUSTOM
+        ) || parentId.startsWith("savedpl:")
+
+    private fun childrenFromCache(parentId: String): List<MediaItem> {
+        if (!isSignedIn()) {
+            val allowed = when (parentId) {
+                ROOT -> listOf(folderItem(TAB_OFFLINE, "Offline Vault", "Downloaded music available without sign-in"))
+                TAB_OFFLINE -> downloadedMediaItems()
+                else -> emptyList()
+            }
+            val safe = validMediaItems(parentId, allowed)
+            return register(safe)
+        }
+        val cached = if (isVolatileBrowseParent(parentId)) emptyList() else runCatching {
+            AutoBrowseCache.read(this, parentId)
+        }.onFailure { Log.e(TAG, "Could not read cached Android Auto section $parentId", it) }
+            .getOrDefault(emptyList())
+            .filterNot { it.mediaId.startsWith("info:") }
+        if (cached.isNotEmpty()) {
+            val validCached = validMediaItems(parentId, cached)
+            if (validCached.isNotEmpty()) {
+                requestRemoteRefresh(parentId)
+                return register(validCached)
+            }
+        }
+        val generated = runCatching { childrenOf(parentId) }
+            .onFailure { Log.e(TAG, "Could not build Android Auto section $parentId", it) }
+            .getOrDefault(emptyList())
+        val safe = cacheChildren(parentId, generated).ifEmpty { fallbackChildren(parentId) }
+        if (safe.isNotEmpty()) cacheChildren(parentId, safe)
+        requestRemoteRefresh(parentId)
+        // Android Auto can report a nonrecoverable browse error for an empty
+        // initial section while its remote refresh is still in flight. Give it
+        // a valid route back into the library; do not persist this temporary row.
+        return register(safe.ifEmpty {
+            listOf(folderItem(TAB_HOME, "Home", "Browse KILO music"))
+        })
+    }
+
+    private fun isSignedIn(): Boolean = YtRepo.userAuthCookie.contains("SAPISID")
+
+    private fun downloadedMediaItems(): List<MediaItem> = runCatching {
+        val prefs = getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
+        val downloads = JSONObject(prefs.getString("downloaded_song_uris", "{}") ?: "{}")
+        val songs = JSONArray(prefs.getString("downloaded_songs", "[]") ?: "[]")
+        (0 until songs.length()).mapNotNull { index ->
+            val song = songs.optJSONObject(index) ?: return@mapNotNull null
+            val id = song.optString("id").ifBlank { song.optString("videoId") }
+            val uri = downloads.optString(id).takeIf { it.isNotBlank() && it != "null" } ?: return@mapNotNull null
+            val videoId = song.optString("videoId", id).ifBlank { id }
+            val metadata = MediaMetadata.Builder()
+                .setTitle(song.optString("title", "Downloaded track"))
+                .setArtist(song.optString("artist", "Unknown artist"))
+                .setAlbumTitle(song.optString("album", ""))
+                .setIsPlayable(true)
+                .setIsBrowsable(false)
+                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+            song.optString("coverUrl").takeIf { it.isNotBlank() }?.let { metadata.setArtworkUri(Uri.parse(it)) }
+            MediaItem.Builder().setMediaId(videoId).setUri(Uri.parse(uri)).setMediaMetadata(metadata.build()).build()
+        }
+    }.onFailure { Log.e(TAG, "Could not load downloaded Android Auto songs", it) }.getOrDefault(emptyList())
+
+    private fun requestRemoteRefresh(parentId: String) {
+        val key = when {
+            parentId == TAB_HOME || parentId == TAB_PICKS || parentId == TAB_TRENDING ||
+                parentId == TAB_HEARD_SHORTS || parentId == TAB_SHELVES || parentId == TAB_PLAYLISTS ||
+                parentId == TAB_BROWSE || parentId == TAB_LISTEN_AGAIN -> "home"
+            parentId == TAB_RADIO_BROWSE -> "radio"
+            parentId.startsWith("pl:") -> parentId
+            else -> return
+        }
+        if (key == "home") {
+            refreshHomeCatalogAsync()
+            return
+        }
+        if (!pendingCatalogRefreshes.add(key)) return
+        if (!allowCatalogRefresh(key)) {
+            pendingCatalogRefreshes.remove(key)
+            return
+        }
+        io.execute {
+            try {
+                val loaded = when {
+                    key == "radio" -> radioMediaItems(RadioBrowser.stations())
+                    key.startsWith("pl:") -> YtRepo.fetchPlaylistTracks(key.removePrefix("pl:")).map { it.toMediaItem() }
+                    else -> emptyList()
+                }
+                val safe = cacheChildren(parentId, loaded)
+                if (safe.isNotEmpty()) main.post {
+                    session?.notifyChildrenChanged(parentId, safe.size, null)
+                }
+            } catch (error: Throwable) {
+                Log.e(TAG, "Android Auto catalog refresh failed for $parentId", error)
+            } finally {
+                pendingCatalogRefreshes.remove(key)
+            }
+        }
+    }
     private fun matchingHomeShelf(vararg terms: String): HomeShelf? {
         val normalizedTerms = terms.map { it.lowercase() }
-        return HomeCache.get().firstOrNull { shelf ->
+        return carHomeShelves().firstOrNull { shelf ->
             val title = shelf.title.lowercase()
             normalizedTerms.any { term -> title.contains(term) }
         }
     }
 
     private fun browseCategories(): List<MediaItem> {
-        val shelves = HomeCache.get()
+        val shelves = carHomeShelves()
         val quickIndex = shelves.indexOfFirst { it.title.contains("quick pick", ignoreCase = true) }.takeIf { it >= 0 } ?: 0
         val listenIndex = shelves.indexOfFirst { it.title.contains("listen again", ignoreCase = true) }
         val shortsIndex = shelves.indexOfFirst { it.title.contains("short", ignoreCase = true) }
@@ -918,12 +1372,16 @@ class VybeMediaService : MediaLibraryService() {
     }.getOrDefault(emptyList())
 
     private fun childrenOf(parentId: String): List<MediaItem> = when {
+        parentId == ROOT && !isSignedIn() -> listOf(
+            folderItem(TAB_OFFLINE, "Offline Vault", "Downloaded music available without sign-in")
+        )
         parentId == ROOT -> listOf(
             folderItem(TAB_HOME, "Home", "Quick picks and continue listening"),
             folderItem(TAB_RECENT, "Recents", "Recently played"),
             folderItem(TAB_BROWSE, "Browse", "Explore YouTube Music"),
             folderItem(TAB_RADIO, "Radio", "Live internet radio stations"),
-            folderItem(TAB_LIBRARY, "Library", "Your playlists and liked songs")
+            folderItem(TAB_LIBRARY, "Library", "Your playlists and liked songs"),
+            folderItem(TAB_OFFLINE, "Offline Vault", "Downloaded music")
         )
         parentId == TAB_RADIO -> listOf(
             folderItem(TAB_RADIO_BROWSE, "Browse stations", "Live stations from Radio Browser"),
@@ -931,20 +1389,31 @@ class VybeMediaService : MediaLibraryService() {
             folderItem(TAB_RADIO_RECENT, "Recently played", "Stations you listened to"),
             folderItem(TAB_RADIO_CUSTOM, "My stations", "Your custom stream URLs")
         )
-        parentId == TAB_RADIO_BROWSE -> radioMediaItems(RadioBrowser.stations())
+        parentId == TAB_RADIO_BROWSE -> emptyList()
         parentId == TAB_RADIO_FAVORITES -> radioMediaItems(RadioStationStore.load(this, "radio_favorites"))
         parentId == TAB_RADIO_RECENT -> radioMediaItems(RadioStationStore.load(this, "radio_recent_stations"))
         parentId == TAB_RADIO_CUSTOM -> radioMediaItems(RadioStationStore.load(this, "radio_custom_stations"))
+        parentId == TAB_OFFLINE -> downloadedMediaItems()
         parentId == TAB_HOME -> {
             val prefs = getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
             val mode = prefs.getString("auto_layout_mode", AUTO_LAYOUT_MODES.first()) ?: AUTO_LAYOUT_MODES.first()
             val layoutIndex = AUTO_LAYOUT_MODES.indexOf(mode).coerceAtLeast(0)
             val orderIndex = layoutIndex / 5
             val shelfLimit = layoutIndex % 5 + 2
-            val continueShelf = folderItem(TAB_CONTINUE, "Continue listening", "Pick up where you left off")
-            val picksShelf = folderItem(TAB_PICKS, "Quick picks", "Songs selected for you")
-            val recentShelf = folderItem(TAB_RECENT, "Recently played", "Your latest listening")
-            val homeShelves = HomeCache.get()
+            val homeShelves = carHomeShelves()
+            val continueShelf = folderItem(
+                TAB_CONTINUE, "Continue listening", "Pick up where you left off",
+                SessionStore.recentSongs().firstOrNull()?.coverUrl
+            )
+            val picksShelf = folderItem(
+                TAB_PICKS, "Quick picks", "Songs selected for you",
+                matchingHomeShelf("quick pick")?.songs?.firstOrNull()?.coverUrl
+                    ?: homeShelves.firstOrNull()?.songs?.firstOrNull()?.coverUrl
+            )
+            val recentShelf = folderItem(
+                TAB_RECENT, "Recently played", "Your latest listening",
+                SessionStore.recentSongs().firstOrNull()?.coverUrl
+            )
             val shelves = homeShelves.mapIndexed { i, shelf ->
                 folderItem("shelf:$i", shelf.title, art = shelf.songs.firstOrNull()?.coverUrl)
             }.take(shelfLimit)
@@ -959,35 +1428,47 @@ class VybeMediaService : MediaLibraryService() {
                 "continue" to listOf(continueShelf),
                 "picks" to listOf(picksShelf),
                 "recent" to listOf(recentShelf),
-                "listen" to listOf(folderItem(TAB_LISTEN_AGAIN, "Listen Again", "Recently played favorites")),
-                "trending" to listOf(folderItem(TAB_TRENDING, "Trending", "Popular music right now")),
-                "shorts" to listOf(folderItem(TAB_HEARD_SHORTS, "Heard in Shorts", "Songs heard in YouTube Shorts")),
-                "liked" to listOf(folderItem(TAB_LIKED, "Liked songs", "Your saved tracks")),
-                "playlists" to listOf(folderItem(TAB_PLAYLISTS, "Playlists", "Your playlists")),
+                "listen" to listOf(folderItem(
+                    TAB_LISTEN_AGAIN, "Listen Again", "Recently played favorites",
+                    matchingHomeShelf("listen again")?.songs?.firstOrNull()?.coverUrl
+                        ?: SessionStore.recentSongs().firstOrNull()?.coverUrl
+                )),
+                "trending" to listOf(folderItem(
+                    TAB_TRENDING, "Trending", "Popular music right now",
+                    matchingHomeShelf("trend", "viral", "top hits", "popular")?.songs?.firstOrNull()?.coverUrl
+                )),
+                "shorts" to listOf(folderItem(
+                    TAB_HEARD_SHORTS, "Heard in Shorts", "Songs heard in YouTube Shorts",
+                    matchingHomeShelf("short")?.songs?.firstOrNull()?.coverUrl
+                )),
+                "liked" to listOf(folderItem(
+                    TAB_LIKED, "Liked songs", "Your saved tracks", Favorites.songs().firstOrNull()?.coverUrl
+                )),
+                "playlists" to listOf(folderItem(
+                    TAB_PLAYLISTS, "Playlists", "Your playlists",
+                    savedPlaylists().firstOrNull()?.songs?.firstOrNull()?.coverUrl
+                        ?: homeShelves.asSequence().flatMap { it.songs.asSequence() }
+                            .firstOrNull { it.playlistId.isNotBlank() }?.coverUrl
+                )),
                 "shelves" to shelves
             )
             layoutOrder.flatMap { sections[it].orEmpty() }
         }
         parentId == TAB_PICKS -> songItems(
-            matchingHomeShelf("quick pick")?.songs ?: HomeCache.get().firstOrNull()?.songs.orEmpty()
+            matchingHomeShelf("quick pick")?.songs ?: carHomeShelves().firstOrNull()?.songs.orEmpty()
         )
         parentId == TAB_BROWSE -> browseCategories()
         parentId == TAB_LISTEN_AGAIN -> songItems(
             matchingHomeShelf("listen again")?.songs?.takeIf { it.isNotEmpty() } ?: SessionStore.recentSongs()
         )
-        parentId == TAB_HEARD_SHORTS -> songItems(
-            matchingHomeShelf("short")?.songs?.takeIf { it.isNotEmpty() }
-                ?: if (YtRepo.userAuthCookie.contains("SAPISID")) YtRepo.searchSongs("songs trending on YouTube Shorts") else emptyList()
-        )
-        parentId == TAB_TRENDING -> songItems(
-            matchingHomeShelf("trend", "viral", "top hits", "popular")?.songs?.takeIf { it.isNotEmpty() }
-                ?: if (YtRepo.userAuthCookie.contains("SAPISID")) YtRepo.searchSongs("trending music") else emptyList()
-        )
+        parentId == TAB_HEARD_SHORTS -> songItems(matchingHomeShelf("short")?.songs.orEmpty())
+        parentId == TAB_TRENDING -> songItems(matchingHomeShelf("trend", "viral", "top hits", "popular")?.songs.orEmpty())
         parentId == TAB_LIBRARY -> listOf(
             folderItem(TAB_LIKED, "Liked songs", "Your saved tracks"),
-            folderItem(TAB_PLAYLISTS, "Playlists", "Your playlists")
+            folderItem(TAB_PLAYLISTS, "Playlists", "Your playlists"),
+            folderItem(TAB_OFFLINE, "Offline Vault", "Downloaded music")
         )
-        parentId == TAB_SHELVES -> HomeCache.get().mapIndexed { i, shelf ->
+        parentId == TAB_SHELVES -> carHomeShelves().mapIndexed { i, shelf ->
             folderItem("shelf:$i", shelf.title, art = shelf.songs.firstOrNull()?.coverUrl)
         }
         parentId == TAB_LIKED -> register(Favorites.songs().map { it.toMediaItem() })
@@ -1004,7 +1485,7 @@ class VybeMediaService : MediaLibraryService() {
             val localFolders = savedPlaylists().map { playlist ->
                 folderItem("savedpl:${playlist.id}", playlist.name, "${playlist.songs.size} songs", playlist.songs.firstOrNull()?.coverUrl)
             }
-            val remoteFolders = HomeCache.get().asSequence().flatMap { it.songs.asSequence() }
+            val remoteFolders = carHomeShelves().asSequence().flatMap { it.songs.asSequence() }
                 .filter { it.playlistId.isNotBlank() }
                 .distinctBy { it.playlistId }
                 .map { folderItem("pl:${it.playlistId}", it.title, it.artist, it.coverUrl) }
@@ -1016,18 +1497,16 @@ class VybeMediaService : MediaLibraryService() {
         )
         parentId.startsWith("shelf:") -> {
             val i = parentId.removePrefix("shelf:").toIntOrNull() ?: -1
-            songItems(HomeCache.get().getOrNull(i)?.songs.orEmpty())
+            songItems(carHomeShelves().getOrNull(i)?.songs.orEmpty())
         }
-        parentId.startsWith("pl:") -> register(
-            YtRepo.fetchPlaylistTracks(parentId.removePrefix("pl:")).map { it.toMediaItem() }
-        )
+        parentId.startsWith("pl:") -> emptyList()
         else -> emptyList()
     }
 
     private fun searchItems(q: String): List<MediaItem> {
         if (!YtRepo.userAuthCookie.contains("SAPISID")) return emptyList()
         val songs = if (q.isBlank()) {
-            HomeCache.get().firstOrNull()?.songs.orEmpty()
+            carHomeShelves().firstOrNull()?.songs.orEmpty()
         } else {
             YtRepo.searchSongs(q)
         }
@@ -1035,13 +1514,25 @@ class VybeMediaService : MediaLibraryService() {
         return register(songs.filter { it.videoId.isNotEmpty() && (!hideExplicit || !it.isExplicit) }.map { it.toMediaItem() })
     }
 
-    private fun resolveItem(item: MediaItem): List<MediaItem> {
+    private fun resolveItem(item: MediaItem, includeFollowingSiblings: Boolean = true): List<MediaItem> {
         if (item.mediaId.isEmpty()) {
             val query = voiceSearchQuery(item)
             return if (query.isNotBlank()) searchItems(query)
             else SessionStore.recentSongs().map { it.toMediaItem() }.ifEmpty { searchItems("") }
         }
-        index[item.mediaId]?.let { return siblings[item.mediaId] ?: listOf(it) }
+        index[item.mediaId]?.let { selected ->
+            val group = siblings[item.mediaId].orEmpty()
+            if (!includeFollowingSiblings || group.isEmpty()) return listOf(selected)
+            val selectedIndex = group.indexOfFirst { it.mediaId == item.mediaId }
+                .takeIf { it >= 0 } ?: group.indexOfFirst { it.mediaId == selected.mediaId }
+            return if (selectedIndex <= 0) group
+            else group.drop(selectedIndex) + group.take(selectedIndex)
+        }
+        if (item.mediaMetadata.isBrowsable == true) {
+            // A browse folder is not a stream. Expand it through the same local
+            // catalog/cache used by Android Auto's child callback.
+            return childrenFromCache(item.mediaId).filter { it.mediaMetadata.isPlayable == true }
+        }
         return listOf(item.buildUpon().setUri("vybe://stream/${item.mediaId}").build())
     }
 
@@ -1062,7 +1553,7 @@ class VybeMediaService : MediaLibraryService() {
 
     @UnstableApi
     private inner class AutoCallback : MediaLibrarySession.Callback {
-        override fun onConnect(session: MediaSession, controller: MediaSession.ControllerInfo): MediaSession.ConnectionResult {
+        override fun onConnect(session: MediaSession, controller: MediaSession.ControllerInfo): MediaSession.ConnectionResult = traceCallback("onConnect controller=${controller.packageName}") {
             if (controller.packageName == "com.google.android.projection.gearhead" &&
                 getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
                     .getBoolean("auto_play_car_connect", false) &&
@@ -1103,12 +1594,37 @@ class VybeMediaService : MediaLibraryService() {
                 .build()
         }
 
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controller: MediaSession.ControllerInfo
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
+            bg("onPlaybackResumption controller=${controller.packageName}") {
+                val player = mediaSession.player
+                if (player.mediaItemCount > 0 && player.currentMediaItem != null) {
+                    val queue = (0 until player.mediaItemCount).map(player::getMediaItemAt)
+                    MediaSession.MediaItemsWithStartPosition(
+                        ImmutableList.copyOf(queue),
+                        player.currentMediaItemIndex.coerceIn(0, queue.lastIndex),
+                        player.currentPosition.coerceAtLeast(0L)
+                    )
+                } else {
+                    val restored = SessionStore.load()
+                    val items = restored?.items?.takeIf { it.isNotEmpty() }
+                        ?: SessionStore.recentSongs().map { it.toMediaItem() }
+                    MediaSession.MediaItemsWithStartPosition(
+                        ImmutableList.copyOf(items),
+                        restored?.index?.coerceIn(0, items.lastIndex.coerceAtLeast(0)) ?: 0,
+                        restored?.posMs?.coerceAtLeast(0L) ?: 0L
+                    )
+                }
+            }
+
         override fun onCustomCommand(
             session: MediaSession,
             controller: MediaSession.ControllerInfo,
             customCommand: SessionCommand,
             args: Bundle
-        ): ListenableFuture<SessionResult> {
+        ): ListenableFuture<SessionResult> = traceCallback("onCustomCommand controller=${controller.packageName} action=${customCommand.customAction}") {
             when (customCommand.customAction) {
                 LIKE_COMMAND.customAction -> {
                     session.player.currentMediaItem?.let { Favorites.toggle(it.toSong()) }
@@ -1130,28 +1646,33 @@ class VybeMediaService : MediaLibraryService() {
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                 }
             }
-            return super.onCustomCommand(session, controller, customCommand, args)
+            super.onCustomCommand(session, controller, customCommand, args)
         }
 
         override fun onGetLibraryRoot(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
             params: LibraryParams?
-        ): ListenableFuture<LibraryResult<MediaItem>> =
+        ): ListenableFuture<LibraryResult<MediaItem>> = traceCallback("onGetLibraryRoot controller=${browser.packageName}") {
+            Log.i(TAG, "Browse root requested controller=${browser.packageName} signedIn=${isSignedIn()}")
+            val root = folderItem(ROOT, "KILO")
             Futures.immediateFuture(
                 LibraryResult.ofItem(
-                    folderItem(ROOT, "KILO"),
+                    validMediaItems(ROOT, listOf(root)).first(),
                     LibraryParams.Builder()
                         .setOffline(params?.isOffline ?: false)
                         .setRecent(params?.isRecent ?: false)
                         .setSuggested(params?.isSuggested ?: false)
                         .setExtras(Bundle(params?.extras ?: Bundle()).apply {
                             putBoolean("android.media.browse.SEARCH_SUPPORTED", true)
+                            putBoolean(AUTO_STYLE_SUPPORTED, true)
+                            putInt(AUTO_BROWSABLE_HINT, AUTO_STYLE_LIST)
+                            putInt(AUTO_PLAYABLE_HINT, AUTO_STYLE_LIST)
                         })
                         .build()
                 )
             )
-
+        }
         override fun onGetChildren(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
@@ -1160,44 +1681,60 @@ class VybeMediaService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> =
-            bg {
-                val all = runCatching { childrenOf(parentId) }.getOrDefault(emptyList())
-                all.asSequence()
-                    .filter { it.mediaMetadata.isPlayable == true && !it.mediaId.startsWith("radio:") }
-                    .take(2)
-                    .forEach { item -> PlayerHolder.prefetch(this@VybeMediaService, item.mediaId) }
-                val paged = if (pageSize > 0 && pageSize != Int.MAX_VALUE) {
-                    all.drop(page * pageSize).take(pageSize)
-                } else all
-                LibraryResult.ofItemList(ImmutableList.copyOf(paged), params)
+            bg("onGetChildren controller=${browser.packageName} parent=$parentId") {
+                try {
+                val all = childrenFromCache(parentId)
+                val safeItems = validMediaItems(parentId, all)
+                val paged = safeItems.pageSafely(page, pageSize)
+                Log.i(TAG, "Browse parent=$parentId total=${safeItems.size} page=$page pageSize=$pageSize returned=${paged.size}")
+                LibraryResult.ofItemList(ImmutableList.copyOf(paged), listStyleLibraryParams(params))
+                } catch (error: Throwable) {
+                    Log.e(TAG, "CHILDREN_FAILURE parent=$parentId; serving local fallback", error)
+                    val fallback = runCatching {
+                        validMediaItems(parentId, fallbackChildren(parentId))
+                    }.onFailure { Log.e(TAG, "Fallback tree failed parent=$parentId", it) }
+                        .getOrDefault(emptyList())
+                    val safe = fallback.ifEmpty {
+                        listOf(folderItem(TAB_HOME, "Home", "Browse KILO music"))
+                    }
+                    LibraryResult.ofItemList(
+                        ImmutableList.copyOf(safe.pageSafely(page, pageSize)),
+                        listStyleLibraryParams(params)
+                    )
+                }
             }
-
         override fun onGetItem(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
             mediaId: String
-        ): ListenableFuture<LibraryResult<MediaItem>> {
-            val item = index[mediaId] ?: if (mediaId == ROOT) folderItem(ROOT, "KILO") else null
-            return Futures.immediateFuture(
-                if (item != null) LibraryResult.ofItem(item, null)
-                else LibraryResult.ofError(androidx.media3.session.SessionError.ERROR_BAD_VALUE)
-            )
+        ): ListenableFuture<LibraryResult<MediaItem>> = bg("onGetItem controller=${browser.packageName} mediaId=$mediaId") {
+            val item = index[mediaId] ?: runCatching { AutoBrowseCache.find(this@VybeMediaService, mediaId) }
+                .onFailure { Log.e(TAG, "Room lookup failed for mediaId=$mediaId", it) }
+                .getOrNull()
+                ?: if (mediaId == ROOT) folderItem(ROOT, "KILO") else null
+            val valid = item?.let { validMediaItems(mediaId, listOf(it)).firstOrNull() }
+            if (valid != null) LibraryResult.ofItem(register(listOf(valid)).first(), null)
+            else {
+                Log.w(TAG, "Unknown Android Auto mediaId=$mediaId")
+                LibraryResult.ofError(androidx.media3.session.SessionError.ERROR_BAD_VALUE)
+            }
         }
-
         override fun onSearch(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
             query: String,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<Void>> =
-            bg {
-                val items = searchItems(query)
-                items.filterNot { it.mediaId.startsWith("radio:") }.take(2).forEach { item -> PlayerHolder.prefetch(this@VybeMediaService, item.mediaId) }
-                searchCache[query] = items
-                main.post { session.notifySearchResultChanged(browser, query, items.size, params) }
+            bg("onSearch controller=${browser.packageName} query=$query") {
+                val results = runCatching { validMediaItems("search:$query", searchItems(query)) }
+                    .onFailure { Log.e(TAG, "SEARCH_FAILURE query=$query", it) }
+                    .getOrDefault(emptyList())
+                    .ifEmpty { emptyList() }
+                searchCache[query] = results
+                cacheChildren("search:$query", results)
+                main.post { session?.notifySearchResultChanged(browser, query, results.size, params) }
                 LibraryResult.ofVoid()
             }
-
         override fun onGetSearchResult(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
@@ -1206,21 +1743,24 @@ class VybeMediaService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> =
-            bg {
-                val all = searchCache[query] ?: searchItems(query)
-                val paged = if (pageSize > 0 && pageSize != Int.MAX_VALUE) {
-                    all.drop(page * pageSize).take(pageSize)
-                } else all
-                LibraryResult.ofItemList(ImmutableList.copyOf(paged), params)
+            bg("onGetSearchResult controller=${browser.packageName} query=$query") {
+                val all = validMediaItems("search:$query", searchCache[query] ?: runCatching {
+                    AutoBrowseCache.read(this@VybeMediaService, "search:$query")
+                }.onFailure { Log.e(TAG, "Room search lookup failed query=$query", it) }.getOrDefault(emptyList()))
+                    .ifEmpty { emptyList() }
+                register(all)
+                val paged = all.pageSafely(page, pageSize)
+                LibraryResult.ofItemList(ImmutableList.copyOf(paged), listStyleLibraryParams(params))
             }
-
         override fun onAddMediaItems(
             mediaSession: MediaSession,
             controller: MediaSession.ControllerInfo,
             mediaItems: MutableList<MediaItem>
         ): ListenableFuture<MutableList<MediaItem>> =
-            bg { mediaItems.flatMap { resolveItem(it) }.toMutableList() }
-
+            bg("onAddMediaItems controller=${controller.packageName}") {
+                val includeSiblings = mediaItems.size == 1
+                mediaItems.flatMap { resolveItem(it, includeFollowingSiblings = includeSiblings) }.toMutableList()
+            }
         override fun onSetMediaItems(
             mediaSession: MediaSession,
             controller: MediaSession.ControllerInfo,
@@ -1228,16 +1768,30 @@ class VybeMediaService : MediaLibraryService() {
             startIndex: Int,
             startPositionMs: Long
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
-            bg {
-                val query = voiceSearchQuery(mediaItems.firstOrNull())
+            bg("onSetMediaItems controller=${controller.packageName}") {
+                val firstRequestedItem = mediaItems.firstOrNull()
+                // A selected search result can carry both its song mediaId and
+                // the query that produced it. The mediaId identifies the user's
+                // selection; only treat this as a voice search when no item ID
+                // was supplied by the controller.
+                val query = firstRequestedItem
+                    ?.takeIf { it.mediaId.isBlank() }
+                    ?.let(::voiceSearchQuery)
+                    .orEmpty()
                 val resolved = when {
                     query.isNotBlank() -> searchItems(query)
-                    mediaItems.isNotEmpty() -> mediaItems.flatMap { resolveItem(it) }
+                    mediaItems.size == 1 -> resolveItem(mediaItems.single())
+                    mediaItems.size > 1 -> mediaItems.flatMap {
+                        resolveItem(it, includeFollowingSiblings = false)
+                    }
                     else -> SessionStore.recentSongs().map { it.toMediaItem() }.ifEmpty { searchItems("") }
                 }
                 if (resolved.isEmpty()) throw UnsupportedOperationException("No matching music found")
-                resolved.filterNot { it.mediaId.startsWith("radio:") }.take(2).forEach { item -> PlayerHolder.prefetch(this@VybeMediaService, item.mediaId) }
-                val idx = if (query.isNotBlank()) 0 else startIndex.coerceIn(0, resolved.lastIndex)
+                val idx = if (query.isNotBlank() || mediaItems.size == 1) {
+                    0
+                } else {
+                    startIndex.coerceIn(0, resolved.lastIndex)
+                }
                 val pos = if (query.isNotBlank()) C.TIME_UNSET else startPositionMs
                 MediaSession.MediaItemsWithStartPosition(resolved, idx, pos)
             }

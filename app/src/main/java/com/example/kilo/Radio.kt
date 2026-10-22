@@ -291,7 +291,7 @@ fun RadioScreen(vm: MainViewModel) {
                     ) {
                         Column(Modifier.fillMaxWidth().padding(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                             Text("VIRTUAL FM TUNER", color = accent, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
-                            Text("${"%.1f".format(java.util.Locale.US, frequency)}", color = Color.White, fontSize = 48.sp, fontWeight = FontWeight.Bold)
+            Text("${"%.1f".format(java.util.Locale.US, frequency)}", color = Color.White, fontSize = 48.sp, fontWeight = FontWeight.Bold)
                             Text("MHz  •  ${activeStation.name}", color = Color.LightGray, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             if (visibleStations.size > 1) {
                                 Slider(

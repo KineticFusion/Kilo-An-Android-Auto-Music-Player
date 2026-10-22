@@ -1,4 +1,4 @@
-@file:OptIn(androidx.media3.common.util.UnstableApi::class)
+@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 
 package com.example.kilo
 
@@ -121,25 +121,33 @@ import java.util.Calendar
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 
-private class PlayedSongHistoryDb(context: Context) : SQLiteOpenHelper(context, "kilo_played_history.db", null, 2) {
+private class PlayedSongHistoryDb(context: Context) : SQLiteOpenHelper(context, "kilo_played_history.db", null, 3) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE played_songs (song_id TEXT PRIMARY KEY NOT NULL, played_at INTEGER NOT NULL)")
         createInteractionsTable(db)
+        createDiscoveryTable(db)
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createInteractionsTable(db)
+        if (oldVersion < 3) createDiscoveryTable(db)
     }
 
     private fun createInteractionsTable(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE IF NOT EXISTS discovery_interactions (event_id INTEGER PRIMARY KEY AUTOINCREMENT, song_id TEXT NOT NULL, artist TEXT NOT NULL, title TEXT NOT NULL, `action` TEXT NOT NULL, value REAL NOT NULL, event_at INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX IF NOT EXISTS discovery_interactions_artist_idx ON discovery_interactions(artist, `action`)")
     }
+
+    private fun createDiscoveryTable(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS discovery_catalog (song_id TEXT PRIMARY KEY NOT NULL, video_id TEXT NOT NULL, title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT NOT NULL, cover_url TEXT NOT NULL, duration_ms INTEGER NOT NULL, is_explicit INTEGER NOT NULL, first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, source TEXT NOT NULL)")
+        db.execSQL("CREATE INDEX IF NOT EXISTS discovery_catalog_seen_idx ON discovery_catalog(last_seen_at)")
+    }
 }
 
 private data class DiscoveryProfile(val artistWeights: Map<String, Float>, val recentSearches: List<String>)
 
-private object PlayedSongHistory {
+internal object PlayedSongHistory {
+    private const val DISCOVERY_COOLDOWN_MS = 7L * 24L * 60L * 60L * 1000L
     @Volatile private var database: PlayedSongHistoryDb? = null
     @Volatile private var cache: MutableSet<String>? = null
 
@@ -170,8 +178,73 @@ private object PlayedSongHistory {
             put("song_id", songId)
             put("played_at", System.currentTimeMillis())
         }
-        database?.writableDatabase?.insertWithOnConflict("played_songs", null, values, SQLiteDatabase.CONFLICT_IGNORE)
+        database?.writableDatabase?.insertWithOnConflict("played_songs", null, values, SQLiteDatabase.CONFLICT_REPLACE)
         cache = all
+    }
+
+    @Synchronized
+    fun discoveredIds(): Set<String> {
+        val ids = linkedSetOf<String>()
+        database?.readableDatabase?.rawQuery("SELECT song_id FROM discovery_catalog", null)?.use { cursor ->
+            while (cursor.moveToNext()) ids.add(cursor.getString(0))
+        }
+        return ids
+    }
+
+    /** Songs previously shown to the listener, left unseen for a week, and still not meaningfully played. */
+    @Synchronized
+    fun discoveredButUnplayed(nowMs: Long = System.currentTimeMillis()): List<SongItemClean> {
+        val cutoff = (nowMs - DISCOVERY_COOLDOWN_MS).toString()
+        val songs = mutableListOf<SongItemClean>()
+        database?.readableDatabase?.rawQuery(
+            "SELECT d.song_id, d.video_id, d.title, d.artist, d.album, d.cover_url, d.duration_ms, d.is_explicit " +
+                "FROM discovery_catalog d LEFT JOIN played_songs p ON p.song_id = d.song_id " +
+                "WHERE p.song_id IS NULL AND d.last_seen_at <= ? ORDER BY d.last_seen_at ASC LIMIT 300",
+            arrayOf(cutoff)
+        )?.use { cursor ->
+            while (cursor.moveToNext()) {
+                songs += SongItemClean(
+                    id = cursor.getString(0), videoId = cursor.getString(1), title = cursor.getString(2),
+                    artist = cursor.getString(3), album = cursor.getString(4), coverUrl = cursor.getString(5),
+                    durationMs = cursor.getLong(6), isExplicit = cursor.getInt(7) != 0
+                )
+            }
+        }
+        return songs
+    }
+
+    @Synchronized
+    fun markDiscovered(songs: List<SongItemClean>, source: String) {
+        val db = database?.writableDatabase ?: return
+        val now = System.currentTimeMillis()
+        songs.filter { it.videoId.isNotBlank() }.distinctBy { it.id }.forEach { song ->
+            val values = ContentValues().apply {
+                put("song_id", song.id)
+                put("video_id", song.videoId)
+                put("title", song.title)
+                put("artist", song.artist)
+                put("album", song.album)
+                put("cover_url", song.coverUrl)
+                put("duration_ms", song.durationMs)
+                put("is_explicit", if (song.isExplicit) 1 else 0)
+                put("first_seen_at", now)
+                put("last_seen_at", now)
+                put("source", source)
+            }
+            db.insertWithOnConflict("discovery_catalog", null, values, SQLiteDatabase.CONFLICT_IGNORE)
+            val updated = ContentValues().apply {
+                put("video_id", song.videoId)
+                put("title", song.title)
+                put("artist", song.artist)
+                put("album", song.album)
+                put("cover_url", song.coverUrl)
+                put("duration_ms", song.durationMs)
+                put("is_explicit", if (song.isExplicit) 1 else 0)
+                put("last_seen_at", now)
+                put("source", source)
+            }
+            db.update("discovery_catalog", updated, "song_id = ?", arrayOf(song.id))
+        }
     }
 
     fun recordSignal(song: SongItemClean, action: String, value: Float = 0f) {
@@ -192,7 +265,7 @@ private object PlayedSongHistory {
         recordSignal(SongItemClean(id = "search:${System.currentTimeMillis()}", title = clean, artist = "", album = "", coverUrl = ""), "search")
     }
 
-    fun profile(): DiscoveryProfile {
+    private fun profile(): DiscoveryProfile {
         val weights = linkedMapOf<String, Float>()
         database?.readableDatabase?.rawQuery(
             "SELECT artist, SUM(CASE `action` WHEN 'like' THEN 5.0 WHEN 'unlike' THEN -5.0 WHEN 'complete' THEN 3.0 WHEN 'replay' THEN 2.5 WHEN 'listen' THEN MIN(value / 30000.0, 2.0) WHEN 'skip' THEN -4.0 ELSE 0.0 END) AS score FROM discovery_interactions WHERE artist != '' GROUP BY artist ORDER BY score DESC LIMIT 40",
@@ -213,6 +286,7 @@ private object PlayedSongHistory {
     fun clear() {
         database?.writableDatabase?.delete("played_songs", null, null)
         database?.writableDatabase?.delete("discovery_interactions", null, null)
+        database?.writableDatabase?.delete("discovery_catalog", null, null)
         cache = mutableSetOf()
     }
 }
@@ -361,13 +435,29 @@ enum class OverlayTab {
     NONE, QUEUE, LYRICS, CODEC_INFO
 }
 
-val AUTO_LAYOUT_MODES = listOf(
+private val AUTO_LAYOUT_PROFILES = listOf(
+    "Balanced" to "A little of everything, starting with your current listening.",
+    "Quick picks first" to "Put personal recommendations at the top.",
+    "Recently played first" to "Jump back into music you played lately.",
+    "Trending first" to "Lead with popular and newly discovered music.",
+    "Library first" to "Put liked songs and playlists before discovery."
+)
+val AUTO_LAYOUT_MODES = AUTO_LAYOUT_PROFILES.flatMapIndexed { profileIndex, profile ->
+    (2..6).map { shelfCount -> "${profileIndex + 1}|$shelfCount|${profile.first}" }
+}
+private val LEGACY_AUTO_LAYOUT_MODES = listOf(
     "01 Classic Browse", "02 Album Focus", "03 Minimal Home", "04 Split Sections", "05 Queue First",
     "06 Search Focus", "07 Browse Home", "08 Category Groups", "09 Horizontal Shelves", "10 Artist Focus",
     "11 Playlist Focus", "12 Album List", "13 Discovery Carousel", "14 Recent First", "15 Large Artwork",
     "16 Quick Picks + Library", "17 Compact Browse", "18 Clean List", "19 Trending First", "20 Mood Shelves",
     "21 Quick Actions", "22 Library First", "23 Artwork First", "24 Audio Controls", "25 Recommendations First"
 )
+private fun normalizeAutoLayoutMode(value: String?): String {
+    val currentIndex = AUTO_LAYOUT_MODES.indexOf(value)
+    if (currentIndex >= 0) return AUTO_LAYOUT_MODES[currentIndex]
+    val oldIndex = LEGACY_AUTO_LAYOUT_MODES.indexOf(value)
+    return AUTO_LAYOUT_MODES.getOrElse(oldIndex.coerceAtLeast(0)) { AUTO_LAYOUT_MODES.first() }
+}
 
 val AUTO_MENU_TABS = listOf(
     "Quick picks",
@@ -742,8 +832,10 @@ object dYtRepo {
     private fun bestThumb(container: JSONObject?): String {
         val arr = container?.optJSONArray("thumbnails") ?: return ""
         if (arr.length() == 0) return ""
+        // Android Auto only renders small artwork tiles. Request a thumbnail
+        // sized for those tiles instead of downloading the larger phone image.
         return arr.getJSONObject(arr.length() - 1).optString("url")
-            .replace(Regex("=w\\d+-h\\d+.*$"), "=w544-h544")
+            .replace(Regex("=w\\d+-h\\d+.*$"), "=w256-h256")
     }
 
     private fun parseDuration(s: String): Long {
@@ -927,19 +1019,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         "Early automatic track transition: ${previousSong.videoId} at ${lastKnownPositionMs}ms; catalog duration ${expectedMs}ms"
                     )
                     val previousIndex = _state.value.currentIndex
+                    val resumePositionMs = _state.value.currentPosMs.coerceAtLeast(0L)
                     if (earlyEndRetries.add(previousSong.id)) {
                         // Rebuild the affected MediaSource on retry. Reusing the
                         // prepared queue here would keep its already-resolved URL,
                         // defeating the stream invalidation above.
                         LosslessSource.invalidate(previousSong.videoId.ifBlank { previousSong.id })
                         FastStream.invalidate(previousSong.videoId)
-                        loadTrack(previousIndex, autoPlay = true, retryingEarlyEnd = true)
+                        loadTrack(
+                            previousIndex,
+                            autoPlay = true,
+                            startPositionMs = resumePositionMs,
+                            retryingEarlyEnd = true
+                        )
                     } else {
                         player.pause()
-                        player.setMediaItem(previousSong.toMediaItem())
+                        player.setMediaItem(previousSong.toMediaItem(), resumePositionMs)
                         _state.value = _state.value.copy(
                             playlist = listOf(previousSong), currentIndex = 0,
-                            progress = 0f, currentPosMs = 0L,
+                            progress = (resumePositionMs.toFloat() / previousSong.durationMs.coerceAtLeast(1L)).coerceIn(0f, 1f),
+                            currentPosMs = resumePositionMs,
                             isPlaying = false, isLoadingStream = false
                         )
                         Toast.makeText(getApplication(), "This track ended early. Tap play to retry it.", Toast.LENGTH_LONG).show()
@@ -992,14 +1091,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             Log.d("SeekBenchmark", "isPlaying=$isPlaying position=${player.currentPosition}ms")
             finishSeekMeasurementIfReady()
             _state.value = _state.value.copy(isPlaying = isPlaying)
-            if (isPlaying) {
-                val playingId = _state.value.activeSong.id
-                viewModelScope.launch(Dispatchers.IO) { PlayedSongHistory.record(playingId) }
-                prefetchNextStream(_state.value.currentIndex)
-            }
-            if (isPlaying && _state.value.autoMixEnabled && player.volume < 0.99f) {
-                fadePlayerVolume(1f, 700L, _state.value.activeSong.id)
-            }
+            if (isPlaying) prefetchNextStream(_state.value.currentIndex)
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -1069,7 +1161,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             displayName = preferences.getString("display_name", "Arnav") ?: "Arnav",
             autoMixEnabled = preferences.getBoolean("auto_mix_enabled", false),
             autoConnectCar = preferences.getBoolean("auto_connect_car_enabled", true),
-            autoLayoutMode = preferences.getString("auto_layout_mode", AUTO_LAYOUT_MODES.first()) ?: AUTO_LAYOUT_MODES.first(),
+            autoLayoutMode = normalizeAutoLayoutMode(preferences.getString("auto_layout_mode", AUTO_LAYOUT_MODES.first())),
             autoPlayOnCarConnect = preferences.getBoolean("auto_play_car_connect", false),
             pauseForCalls = preferences.getBoolean("pause_for_calls", true),
             filterMatureContent = preferences.getBoolean("filter_mature_content", true),
@@ -1078,6 +1170,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             losslessSourceHasToken = LosslessSource.hasToken(application),
             losslessSourceStatus = preferences.getString("lossless_source_status", "Optional: connect a compatible FLAC source") ?: "Optional: connect a compatible FLAC source"
         )
+        preferences.edit().putString("auto_layout_mode", _state.value.autoLayoutMode).apply()
         val savedRegion = preferences.getString("music_region_code", "AUTO") ?: "AUTO"
         YtRepo.setRegionCode(savedRegion)
         _state.value = _state.value.copy(musicRegionCode = savedRegion)
@@ -1152,6 +1245,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun reloadHome() = loadHome()
+    fun playFromAssistantQuery(query: String) {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return
+        viewModelScope.launch {
+            val state = _state.value
+            val matches = if (state.isLoggedIn) {
+                withContext(Dispatchers.IO) { YtRepo.searchSongs(cleanQuery) }
+            } else {
+                state.downloadedSongs.filter { song ->
+                    song.title.contains(cleanQuery, ignoreCase = true) ||
+                        song.artist.contains(cleanQuery, ignoreCase = true) ||
+                        "${song.artist} ${song.title}".contains(cleanQuery, ignoreCase = true)
+                }
+            }
+            val playable = matches.filter { it.videoId.isNotBlank() || it.isDownloaded }
+            val selected = playable.firstOrNull()
+            if (selected != null) {
+                playSongFromShelf(selected, playable)
+            } else {
+                Toast.makeText(getApplication(), "No matching song found", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     private fun loadHome() {
         viewModelScope.launch {
@@ -1177,37 +1293,73 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 discoveryThemes[(launchNumber - 1) % discoveryThemes.size]
             }
-            val (fetched, previouslyPlayed, personalized) = withContext(Dispatchers.IO) {
-                val oldIds = preferences.getStringSet("discovery_seen_ids", emptySet()).orEmpty()
-                val priorRecent = SessionStore.recentSongs().map { it.id }
-                (oldIds + priorRecent).forEach(PlayedSongHistory::record)
-                val home = YtRepo.fetchHome()
-                val playedIds = PlayedSongHistory.ids()
-                val recommendations = YtRepo.searchSongs(recommendationQuery)
-                    .filter { it.id !in playedIds && it.videoId.isNotBlank() }
-                Triple(home, playedIds, recommendations)
-            }
-            val blockedIds = previouslyPlayed + _state.value.notRecommendedIds
-            val personalizedFresh = personalized.filter { song ->
-                song.id !in blockedIds && (!_state.value.filterMatureContent || !song.isExplicit)
-            }.distinctBy { it.id }
-            val freshIds = personalizedFresh.map { it.id }.toSet()
-            val personalizedShelf = personalizedFresh.takeIf { it.isNotEmpty() }?.let {
-                HomeShelf(
-                    if (baseInterests.isNotEmpty()) "Picked for your taste" else "Fresh discoveries",
-                    it,
-                    false
-                )
-            }
-            val contentShelves = fetched.mapIndexed { index, shelf ->
-                val eligible = shelf.songs.filter { song ->
-                    song.id !in blockedIds && song.id !in freshIds &&
-                        (!_state.value.filterMatureContent || !song.isExplicit)
+            val freshThemes = listOf(
+                "new music releases",
+                "new indie artists",
+                "fresh alternative songs",
+                "new electronic music",
+                "rising pop songs",
+                "underground R&B discoveries",
+                "new regional music",
+                "emerging artists"
+            )
+            val freshQuery = freshThemes[(launchNumber - 1) % freshThemes.size]
+            val (fetched, playedBefore, discoveryState) = withContext(Dispatchers.IO) {
+                    val home = YtRepo.fetchHome()
+                    val played = PlayedSongHistory.ids()
+                    val discovered = PlayedSongHistory.discoveredIds()
+                    val unplayedDiscovered = PlayedSongHistory.discoveredButUnplayed()
+                    val similar = if (baseInterests.isNotEmpty()) YtRepo.searchSongs(recommendationQuery) else emptyList()
+                    val fresh = YtRepo.searchSongs(freshQuery)
+                    Triple(home, played, Triple(discovered, unplayedDiscovered, Pair(similar, fresh)))
                 }
-                val offset = if (eligible.isEmpty()) 0 else ((launchNumber + index) % eligible.size)
-                shelf.copy(songs = eligible.drop(offset) + eligible.take(offset))
-            }.filter { it.songs.isNotEmpty() }
-            val shelves = listOfNotNull(personalizedShelf) + contentShelves
+            val (discoveredBefore, dormantDiscovered, queryResults) = discoveryState
+            val (similarResults, freshResults) = queryResults
+            val blockedIds = playedBefore + _state.value.notRecommendedIds
+            fun acceptable(song: SongItemClean) = song.videoId.isNotBlank() && song.id !in blockedIds &&
+                (!_state.value.filterMatureContent || !song.isExplicit)
+
+            val similarSongs = similarResults.asSequence()
+                .filter(::acceptable)
+                .filter { it.id !in discoveredBefore }
+                .distinctBy { it.id }
+                .take(20).toList()
+            val similarIds = similarSongs.mapTo(mutableSetOf()) { it.id }
+            val discoveredSongs = dormantDiscovered.asSequence()
+                .filter(::acceptable)
+                .filter { it.id !in similarIds }
+                .distinctBy { it.id }
+                .shuffled()
+                .take(20).toList()
+            val discoveredIds = (discoveredBefore + discoveredSongs.map { it.id }).toSet()
+            val homeSongs = fetched.flatMap { it.songs }
+            val freshSongs = (freshResults + homeSongs).asSequence()
+                .filter(::acceptable)
+                .filter { it.id !in discoveredIds && it.id !in similarIds }
+                .distinctBy { it.id }
+                .shuffled()
+                .take(24).toList()
+
+            val shelves = buildList {
+                if (similarSongs.isNotEmpty()) add(HomeShelf("Similar to your favorites", similarSongs, false))
+                if (discoveredSongs.isNotEmpty()) add(HomeShelf("Discovered, not played", discoveredSongs, false))
+                if (freshSongs.isNotEmpty()) add(HomeShelf("Fresh discoveries", freshSongs, false))
+                if (isEmpty()) {
+                    // Last-resort rotation intentionally brings familiar tracks back only after
+                    // similar, waiting, and genuinely new recommendations are exhausted.
+                    val familiar = (SessionStore.recentSongs() + Favorites.songs())
+                        .asSequence().filter(::acceptable).distinctBy { it.id }.shuffled().take(20).toList()
+                    if (familiar.isNotEmpty()) add(HomeShelf("Familiar favorites", familiar, false))
+                }
+            }
+            val similarShelfSongs = shelves.firstOrNull { it.title == "Similar to your favorites" }?.songs.orEmpty()
+            val discoveredShelfSongs = shelves.firstOrNull { it.title == "Discovered, not played" }?.songs.orEmpty()
+            val freshShelfSongs = shelves.firstOrNull { it.title == "Fresh discoveries" }?.songs.orEmpty()
+            withContext(Dispatchers.IO) {
+                PlayedSongHistory.markDiscovered(similarShelfSongs, "similar")
+                PlayedSongHistory.markDiscovered(discoveredShelfSongs, "discovered")
+                PlayedSongHistory.markDiscovered(freshShelfSongs, "fresh")
+            }
             HomeCache.set(shelves)
             val all = shelves.flatMap { it.songs }.filter { it.videoId.isNotEmpty() }.distinctBy { it.id }
             val picks = shelves.firstOrNull()?.songs.orEmpty()
@@ -1389,7 +1541,12 @@ _state.value = _state.value.copy(
                 startPlaybackService()
                 val mediaItems = list.map { it.toMediaItem() }
                 player.setMediaItems(mediaItems, idx, startPositionMs)
-                player.volume = if (_state.value.autoMixEnabled) 0f else 1f
+                if (_state.value.autoMixEnabled) {
+                    player.volume = 0f
+                    fadePlayerVolume(1f, 700L, song.id)
+                } else {
+                    player.volume = 1f
+                }
                 player.prepare()
                 if (autoPlay) player.play()
                 (LosslessSource.peek(song.videoId) ?: FastStream.peek(song.videoId))?.let { info ->
@@ -1414,7 +1571,12 @@ _state.value = _state.value.copy(
             startPlaybackService()
             if (player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED || player.mediaItemCount == 0) {
                 val radio = _state.value.lastRadioStation?.takeIf { _state.value.activeSong.id == "radio:" + it.id }
-                if (radio != null) playRadioStation(radio) else loadTrack(_state.value.currentIndex, autoPlay = true)
+                if (radio != null) playRadioStation(radio)
+                else loadTrack(
+                    _state.value.currentIndex,
+                    autoPlay = true,
+                    startPositionMs = _state.value.currentPosMs.coerceAtLeast(0L)
+                )
             } else {
                 player.play()
                 _state.value = _state.value.copy(isPlaying = true)
@@ -2437,6 +2599,20 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 VybeRootApp(viewModel)
             }
+        }
+        handleAssistantVoiceIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleAssistantVoiceIntent(intent)
+    }
+
+    private fun handleAssistantVoiceIntent(intent: Intent?) {
+        val query = intent?.getStringExtra("query")?.trim().orEmpty()
+        if (query.isNotEmpty()) {
+            window.decorView.post { viewModel.playFromAssistantQuery(query) }
         }
     }
 }
@@ -3952,7 +4128,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(formatMillis(state.currentPosMs), color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
-                        Text("${state.activeSong.codecInfo.substringBefore(" • ")} • 1.03×", color = playerAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        Text("${state.activeSong.codecInfo.substringBefore(" • ")} • 1.00×", color = playerAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                         Text("-${formatMillis(remainingMs)}", color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
                     }
 
@@ -4094,6 +4270,7 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
     var losslessSourceUrl by remember(state.losslessSourceUrl) { mutableStateOf(state.losslessSourceUrl) }
     var losslessSourceToken by remember { mutableStateOf("") }
     var regionMenuExpanded by remember { mutableStateOf(false) }
+    var showVoiceControlGuide by remember { mutableStateOf(false) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         vm.setDownloadDirectory(uri)
     }
@@ -4174,6 +4351,40 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
             )
         }
 
+        SettingsSectionHeader("VOICE CONTROL")
+        SettingsGroupCard {
+            SettingsRowItem(
+                icon = Icons.Default.Mic,
+                title = "Gemini & voice commands",
+                subtitle = "Set up KILO for hands-free music requests",
+                trailingValue = "Setup guide",
+                onClick = { showVoiceControlGuide = true }
+            )
+            Text(
+                "KILO supports Android Auto media search. Gemini controls which services appear in its provider list.",
+                color = Color.White.copy(alpha = 0.58f), fontSize = 12.sp, lineHeight = 17.sp,
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp)
+            )
+        }
+        if (showVoiceControlGuide) {
+            AlertDialog(
+                onDismissRequest = { showVoiceControlGuide = false },
+                title = { Text("Set up voice playback", fontWeight = FontWeight.Bold) },
+                text = {
+                    Text(
+                        "If Gemini shows a music services or provider setting, open Gemini settings, choose Music, and select KILO if it is listed. Then try saying, ‘Play [song or artist] on KILO.’\n\nIf KILO is not listed, Gemini does not currently offer it as a selectable provider on this device. You can still browse KILO from Android Auto’s media apps. Sign in to KILO for online search; while signed out, voice search can use downloaded songs only."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = { showVoiceControlGuide = false }) {
+                        Text("Got it", color = accent)
+                    }
+                },
+                containerColor = Color(0xFF1C1829),
+                titleContentColor = Color.White,
+                textContentColor = Color.White.copy(alpha = 0.82f)
+            )
+        }
         SettingsSectionHeader("MUSIC DISCOVERY")
         SettingsGroupCard {
             Box {
@@ -4671,7 +4882,7 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val accent = state.activeSkin.highlight
     Column(
-        modifier = Modifier.fillMaxSize().background(Color(0xFF0A0B10)).statusBarsPadding()
+        modifier = Modifier.fillMaxSize().background(primaryBackdrop(state.activeSkin)).statusBarsPadding()
     ) {
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
@@ -4691,7 +4902,7 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
         ) {
             item {
                 Text(
-                    "Choose what appears first while browsing. Android Auto controls the on-screen controls and visual layout for safe driving; these presets organize Kilo’s browse sections.",
+                    "Choose which music sections appear first and how many recommendation shelves KILO shows. Android Auto adapts the screen for your car.",
                     color = Color.White.copy(alpha = 0.65f), fontSize = 13.sp, lineHeight = 19.sp,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                 )
@@ -4715,41 +4926,29 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
                     )
                 }
             }
-            item {
-                SettingsSectionHeader("25 BROWSE LAYOUTS")
-            }
-            AUTO_LAYOUT_MODES.chunked(2).forEachIndexed { rowIndex, row ->
-                item(key = "auto_layout_row_$rowIndex") {
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        row.forEach { mode ->
-                            val layoutIndex = AUTO_LAYOUT_MODES.indexOf(mode)
-                            val selected = state.autoLayoutMode == mode
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .background(if (selected) accent.copy(alpha = 0.18f) else Color(0xFF17151F))
-                                    .border(1.dp, if (selected) accent else Color.White.copy(alpha = 0.08f), RoundedCornerShape(16.dp))
-                                    .clickable { vm.setAutoLayoutMode(mode) }
-                                    .padding(9.dp)
-                            ) {
-                                AutoLayoutPreview(layoutIndex, accent)
-                                Spacer(Modifier.height(9.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                                    Icon(
-                                        if (selected) Icons.Default.CheckCircle else Icons.Default.DirectionsCar,
-                                        contentDescription = null,
-                                        tint = if (selected) accent else Color.White.copy(alpha = 0.65f),
-                                        modifier = Modifier.size(17.dp)
-                                    )
-                                    Text(mode.substringBefore(' '), color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold)
+            item { SettingsSectionHeader("BROWSE ORDER") }
+            AUTO_LAYOUT_PROFILES.forEachIndexed { profileIndex, profile ->
+                item(key = "auto_layout_profile_$profileIndex") {
+                    SettingsGroupCard {
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(profile.first, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            Text(profile.second, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp)
+                            (2..6).toList().chunked(3).forEach { rowCounts ->
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    rowCounts.forEach { shelfCount ->
+                                        val mode = "${profileIndex + 1}|$shelfCount|${profile.first}"
+                                        FilterChip(
+                                            selected = state.autoLayoutMode == mode,
+                                            onClick = { vm.setAutoLayoutMode(mode) },
+                                            label = { Text("$shelfCount shelves") },
+                                            leadingIcon = if (state.autoLayoutMode == mode) ({
+                                                Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
+                                            }) else null
+                                        )
+                                    }
                                 }
-                                Spacer(Modifier.height(6.dp))
-                                Text(mode.substringAfter(' '), color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold, maxLines = 2, minLines = 2)
-                                Text(if (selected) "Selected" else "Tap to preview & apply", color = if (selected) accent else Color.Gray, fontSize = 9.sp)
                             }
                         }
-                        if (row.size == 1) Spacer(Modifier.weight(1f))
                     }
                 }
             }

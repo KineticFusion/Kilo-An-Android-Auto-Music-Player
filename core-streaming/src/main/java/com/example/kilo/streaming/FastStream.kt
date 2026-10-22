@@ -28,6 +28,7 @@ import java.util.concurrent.atomic.AtomicLong
 object FastStream {
     private const val TAG = "VybeFast"
 
+    /*
     private class Client(
         val name: String,
         val version: String,
@@ -56,6 +57,7 @@ object FastStream {
             )
         )
     )
+    */
 
     private val cache = ResolvedStreamCache()
     private val inflight = ConcurrentHashMap<String, FutureTask<StreamInfo?>>()
@@ -115,6 +117,35 @@ object FastStream {
         }
     }
 
+    private class Client(
+        val name: String,
+        val version: String,
+        val userAgent: String,
+        val clientId: String,
+        val extra: Map<String, Any>
+    )
+
+    private val clients = listOf(
+        Client(
+            "ANDROID_VR", "1.65.10",
+            "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+            "28",
+            mapOf(
+                "deviceMake" to "Oculus", "deviceModel" to "Quest 3", "osName" to "Android",
+                "osVersion" to "12L", "androidSdkVersion" to 32
+            )
+        ),
+        Client(
+            "IOS", "20.10.4",
+            "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+            "5",
+            mapOf(
+                "deviceMake" to "Apple", "deviceModel" to "iPhone16,2", "osName" to "iPhone",
+                "osVersion" to "18.3.2.22D82"
+            )
+        )
+    )
+
     private fun resolve(videoId: String, fallback: (String) -> StreamInfo?, targetBitrateKbps: Int): StreamInfo? {
         if (preferFallbackOnNextResolve.remove(videoId) == true) {
             fallback(videoId)?.let { return it }
@@ -123,8 +154,6 @@ object FastStream {
             Callable<StreamInfo> { fromClient(c, videoId, targetBitrateKbps) ?: throw IOException("${c.name}: no stream") }
         }
         val fast = try {
-            // Prefetch normally fills this cache before a tap. Keep a bounded
-            // resolver wait when it is cold, then use the established fallback.
             pool.invokeAny(calls, 2_500, TimeUnit.MILLISECONDS)
         } catch (_: Exception) {
             null
@@ -188,7 +217,7 @@ object FastStream {
         val ceiling = targetBitrateKbps * 1_000
         val selected = candidates.filter { it.bitrate <= ceiling }
             .maxWithOrNull(compareBy<AudioCandidate> { it.bitrate }.thenBy { it.rank })
-            ?: candidates.minByOrNull { it.bitrate }
+            ?: candidates.maxByOrNull { it.rank }
         return selected?.let {
             StreamInfo(it.url, it.label, client.userAgent, bitrateKbps = it.bitrate / 1_000)
         }
@@ -235,7 +264,11 @@ object AudioCache {
         runCatching {
             val host = Uri.parse(info.url).host.orEmpty()
             val referer = if (host.endsWith("youtube.com") || host.endsWith("googlevideo.com")) {
-                mapOf("Referer" to "https://www.youtube.com/")
+                mapOf(
+                    "Referer" to "https://www.youtube.com/",
+                    "Origin" to "https://www.youtube.com",
+                    "Accept-Encoding" to "identity"
+                )
             } else emptyMap()
             val source = dataSourceFactory(ctx, info.userAgent, info.requestHeaders + referer).createDataSource()
             val spec = DataSpec.Builder()
