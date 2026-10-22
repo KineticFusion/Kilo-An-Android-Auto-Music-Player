@@ -5,6 +5,7 @@ package com.example.kilo
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Application
+import android.app.ActivityManager
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -52,6 +53,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
@@ -345,13 +347,17 @@ private data class RegionalArtistPicks(val label: String, val artists: List<Stri
 
 private val GLOBAL_ARTIST_PICKS = listOf(
     "Taylor Swift", "The Weeknd", "Beyoncé", "Drake", "Ed Sheeran", "Billie Eilish",
-    "Bad Bunny", "BTS", "Shakira", "Adele", "Bruno Mars", "Coldplay"
+    "Bad Bunny", "BTS", "Shakira", "Adele", "Bruno Mars", "Coldplay", "Rihanna", "Eminem",
+    "Dua Lipa", "Justin Bieber", "The Beatles", "Queen", "Metallica", "Lana Del Rey",
+    "Kendrick Lamar", "Sabrina Carpenter", "SZA", "Linkin Park", "Hans Zimmer", "ABBA"
 )
 
 private fun regionalArtistPicks(countryCode: String): RegionalArtistPicks = when (countryCode.uppercase(Locale.ROOT)) {
     "IN", "BD", "NP", "LK", "PK" -> RegionalArtistPicks("South Asia", listOf(
         "Arijit Singh", "A. R. Rahman", "Shreya Ghoshal", "Diljit Dosanjh", "Anirudh Ravichander",
-        "Sid Sriram", "Atif Aslam", "Ritviz", "Jasleen Royal", "Sanam Puri", "Pritam", "Karan Aujla"
+        "Sid Sriram", "Atif Aslam", "Ritviz", "Jasleen Royal", "Sanam Puri", "Pritam", "Karan Aujla",
+        "Shankar-Ehsaan-Loy", "Sunidhi Chauhan", "Sonu Nigam", "Badshah", "AP Dhillon", "Neha Kakkar",
+        "S. P. Balasubrahmanyam", "Ilaiyaraaja", "Sukhwinder Singh", "Vishal-Shekhar", "Rashid Khan", "Rahat Fateh Ali Khan"
     ))
     "US", "CA" -> RegionalArtistPicks("North America", listOf(
         "SZA", "Kendrick Lamar", "Post Malone", "Ariana Grande", "Justin Bieber", "Tyler, The Creator",
@@ -498,7 +504,19 @@ val PLAYER_STYLE_PRESETS = PLAYER_STYLE_FAMILIES.flatMapIndexed { familyIndex, (
             layoutStyle = combination % 6
         )
     }
-}
+} + PlayerStylePreset(
+    "style_custom", "Custom Studio", Color(0xFFFF795F), Color(0xFF14131D),
+    28, 0.22f, 0.9f, controlShape = 2, backgroundStyle = 1, detailStyle = 2, layoutStyle = 0
+)
+
+private fun parsePlayerColor(hex: String): Color? = runCatching {
+    val normalized = hex.trim().removePrefix("#")
+    require(normalized.matches(Regex("[0-9a-fA-F]{6}([0-9a-fA-F]{2})?")))
+    val argb = if (normalized.length == 6) "FF$normalized" else normalized
+    Color(android.graphics.Color.parseColor("#$argb"))
+}.getOrNull()
+
+private fun playerColorHex(color: Color): String = "#%06X".format(color.toArgb() and 0xFFFFFF)
 
 private fun playerArtworkShape(style: PlayerStylePreset): androidx.compose.ui.graphics.Shape = RoundedCornerShape(style.cornerRadius.dp)
 
@@ -659,6 +677,10 @@ data class AppStateModel(
     val userAuthCookie: String = "",
     val showWebLoginDialog: Boolean = false,
     val showAccountManagerDialog: Boolean = false,
+    val showCreateProfileDialog: Boolean = false,
+    val showResetAllDataDialog: Boolean = false,
+    val showCustomPlayerColorDialog: Boolean = false,
+    val customPlayerAccent: Color = Color(0xFFFF795F),
     val accountsList: List<UserProfileAccount> = listOf(
         UserProfileAccount("1", "Main Profile", "https://picsum.photos/seed/user1/200", "", "Hi-Fi & Pop")
     ),
@@ -1086,6 +1108,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingSeekTargetMs: Long = 0L
     private var pendingSeekWasPlaying = false
     private var pendingSeekDiscontinuity = false
+    private var homeLoadGeneration = 0
     private val earlyEndRetries = mutableSetOf<String>()
     private var advertisedAudioEffectSessionId = C.AUDIO_SESSION_ID_UNSET
     private val signaledListenIds = mutableSetOf<String>()
@@ -1314,9 +1337,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             downloadedSongs = loadDownloadedSongs(),
             uiCustomizations = savedCustomizations,
             selectedPlayerStyleId = preferences.getString("player_style_id", PLAYER_STYLE_PRESETS.first().id) ?: PLAYER_STYLE_PRESETS.first().id,
+            customPlayerAccent = preferences.getString("custom_player_accent", "#FFFF795F")?.let(::parsePlayerColor) ?: Color(0xFFFF795F),
             selectedMood = preferences.getString("discovery_mood", "Discover") ?: "Discover",
             listenerProfile = ProfileEngine.load(preferences),
-            showPersonalizationWizard = preferences.getBoolean("personalization_pending", false),
+            showPersonalizationWizard = preferences.getBoolean(
+                "personalization_pending_${preferences.getString("active_account_id", "1") ?: "1"}",
+                preferences.getBoolean("personalization_pending", false)
+            ),
             accountsList = loadAccounts(),
             activeAccountId = preferences.getString("active_account_id", "1") ?: "1",
             savedPlaylists = loadSavedPlaylists(),
@@ -1451,6 +1478,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun loadHome() {
         viewModelScope.launch {
+            val generation = ++homeLoadGeneration
             _state.value = _state.value.copy(isSearching = true)
             val launchNumber = preferences.getInt("home_launch_number", 0) + 1
             preferences.edit().putInt("home_launch_number", launchNumber).apply()
@@ -1465,17 +1493,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .eachCount()
                 .entries.sortedByDescending { it.value }.map { it.key }.distinct()
             val discoveryThemes = listOf("new indie artists", "fresh alternative songs", "new electronic music", "rising pop songs", "underground R&B discoveries")
-            val selectedMood = _state.value.selectedMood.takeUnless { it.equals("Discover", ignoreCase = true) }
-            val activeMood = selectedMood ?: profile.favoriteMoods.firstOrNull()
-            val activeGenre = profile.favoriteGenres.firstOrNull()
-            val recommendationQuery = if (baseInterests.isNotEmpty()) {
-                "songs like ${baseInterests[(launchNumber - 1) % baseInterests.size]}"
-            } else if (activeMood != null) {
-                moodDiscoveryQuery(activeMood, activeGenre)
-            } else if (activeGenre != null) {
-                genreDiscoveryQuery(activeGenre)
-            } else {
-                discoveryThemes[(launchNumber - 1) % discoveryThemes.size]
+            val selectedValue = _state.value.selectedMood
+            val selectedDiscovery = selectedValue.takeUnless { it.equals("Discover", ignoreCase = true) }
+            val activeMood = if (selectedDiscovery != null) selectedDiscovery.takeIf { it in PERSONALIZATION_MOODS }
+                else if (selectedValue.equals("Discover", ignoreCase = true)) null else profile.favoriteMoods.firstOrNull()
+            val activeGenre = if (selectedDiscovery != null) selectedDiscovery.takeIf { it in PERSONALIZATION_GENRES }
+                else if (selectedValue.equals("Discover", ignoreCase = true)) null else profile.favoriteGenres.firstOrNull()
+            val recommendationQuery = when {
+                activeMood != null -> "${moodDiscoveryQuery(activeMood, activeGenre)} recommendations"
+                activeGenre != null -> "${genreDiscoveryQuery(activeGenre)} recommendations"
+                baseInterests.isNotEmpty() -> "songs like ${baseInterests[(launchNumber - 1) % baseInterests.size]}"
+                else -> discoveryThemes[(launchNumber - 1) % discoveryThemes.size]
             }
             val freshThemes = listOf(
                 "new music releases",
@@ -1488,11 +1516,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 "emerging artists"
             )
             val freshQuery = when {
-                activeMood != null -> moodDiscoveryQuery(activeMood, activeGenre)
-                activeGenre != null -> genreDiscoveryQuery(activeGenre)
+                activeMood != null -> "new ${moodDiscoveryQuery(activeMood, activeGenre)}"
+                activeGenre != null -> "new ${genreDiscoveryQuery(activeGenre)}"
                 else -> freshThemes[(launchNumber - 1) % freshThemes.size]
             }
-            val hasPersonalizedInterest = baseInterests.isNotEmpty() || selectedMood != null ||
+            val hasPersonalizedInterest = baseInterests.isNotEmpty() || selectedDiscovery != null ||
                 profile.favoriteMoods.isNotEmpty() || profile.favoriteGenres.isNotEmpty()
             val loadResult = coroutineScope {
                 val homeTask = async(Dispatchers.IO) { YtRepo.fetchHomeCatalog() }
@@ -1521,6 +1549,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             val fetched = loadResult.first
+            if (generation != homeLoadGeneration) return@launch
             val historyState = loadResult.second.first
             val playedBefore = historyState.first
             val discoveredBefore = historyState.second
@@ -1543,8 +1572,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .distinctBy { it.id }
                 .take(shelfLimit).toList()
             val similarIds = similarSongs.mapTo(mutableSetOf()) { it.id }
+            val discoveryScopeIds = if (activeMood != null || activeGenre != null) {
+                freshResults.mapTo(mutableSetOf()) { it.id }
+            } else null
             val discoveredSongs = dormantDiscovered.asSequence()
                 .filter(::acceptable)
+                .filter { discoveryScopeIds == null || it.id in discoveryScopeIds }
                 .filter { it.id !in similarIds }
                 .distinctBy { it.id }
                 .sortedBy { it.title.lowercase() }
@@ -1560,7 +1593,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             val shelves = buildList {
                 if (similarSongs.isNotEmpty()) add(HomeShelf(
-                    if (baseInterests.isEmpty() && activeMood != null) "For your $activeMood mood" else "Similar to your favorites",
+                    if (activeMood != null) "For your $activeMood mood" else if (activeGenre != null) "For your $activeGenre" else "Similar to your favorites",
                     similarSongs,
                     false
                 ))
@@ -1576,7 +1609,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     if (familiar.isNotEmpty()) add(HomeShelf("Familiar favorites", familiar, false))
                 }
             }
-            val similarShelfSongs = shelves.firstOrNull { it.title == "Similar to your favorites" }?.songs.orEmpty()
+            val similarShelfSongs = shelves.firstOrNull { it.title.startsWith("For your ") || it.title == "Similar to your favorites" }?.songs.orEmpty()
             val discoveredShelfSongs = shelves.firstOrNull { it.title == "Discovered, not played" }?.songs.orEmpty()
             val freshShelfSongs = shelves.firstOrNull { it.title == "Fresh discoveries" }?.songs.orEmpty()
             withContext(Dispatchers.IO) {
@@ -1872,9 +1905,57 @@ _state.value = _state.value.copy(
     fun closeWebLogin() { _state.value = _state.value.copy(showWebLoginDialog = false) }
     fun toggleAccountManager(show: Boolean) { _state.value = _state.value.copy(showAccountManagerDialog = show) }
 
+    fun openCreateProfileDialog() {
+        _state.value = _state.value.copy(showCreateProfileDialog = true, showAccountManagerDialog = false)
+    }
+
+    fun closeCreateProfileDialog() {
+        _state.value = _state.value.copy(showCreateProfileDialog = false)
+    }
+
+    fun createListenerProfile(name: String) {
+        val cleanedName = name.trim().take(32)
+        if (cleanedName.isBlank()) {
+            Toast.makeText(getApplication(), "Enter a profile name", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val current = _state.value
+        val source = current.accountsList.firstOrNull { it.id == current.activeAccountId }
+        val newId = java.util.UUID.randomUUID().toString()
+        val newProfile = UserProfileAccount(
+            id = newId,
+            name = cleanedName,
+            profileImage = source?.profileImage.orEmpty(),
+            cookie = source?.cookie.orEmpty(),
+            favoriteGenre = "Discover"
+        )
+        val accounts = current.accountsList + newProfile
+        persistAccounts(accounts, newId)
+        ProfileEngine.save(preferences, ListenerProfile(), newId)
+        preferences.edit().putString("discovery_mood", "Discover")
+            .putBoolean("personalization_pending_$newId", true).apply()
+        val audioSnapshot = equalizerController.setPreferredProfile("Balanced")
+        _state.value = current.copy(
+            accountsList = accounts,
+            activeAccountId = newId,
+            selectedMood = "Discover",
+            listenerProfile = ListenerProfile(),
+            equalizerSnapshot = audioSnapshot,
+            showCreateProfileDialog = false,
+            showPersonalizationWizard = true,
+            profileArtistSuggestions = emptyList()
+        )
+        HomeCache.set(emptyList())
+        loadHome()
+    }
+
     fun addNewAccount(accountName: String, cookie: String) {
+        _state.value.accountsList.firstOrNull { it.cookie == cookie && cookie.isNotBlank() }?.let { existing ->
+            switchAccount(existing.id)
+            return
+        }
         val newAcc = UserProfileAccount(
-            id = System.currentTimeMillis().toString(),
+            id = java.util.UUID.randomUUID().toString(),
             name = accountName,
             profileImage = "https://picsum.photos/seed/$accountName/200",
             cookie = cookie,
@@ -1883,13 +1964,19 @@ _state.value = _state.value.copy(
         YtRepo.userAuthCookie = cookie
         val accounts = _state.value.accountsList + newAcc
         persistAccounts(accounts, newAcc.id)
+        ProfileEngine.save(preferences, ListenerProfile(), newAcc.id)
+        preferences.edit().putString("discovery_mood", newAcc.favoriteGenre)
+            .putBoolean("personalization_pending_${newAcc.id}", _state.value.isSetupComplete).apply()
         _state.value = _state.value.copy(
             accountsList = accounts,
             activeAccountId = newAcc.id,
             userAuthCookie = cookie,
             isLoggedIn = cookie.contains("SAPISID"),
             showAccountManagerDialog = false,
-            showWebLoginDialog = false
+            showWebLoginDialog = false,
+            selectedMood = newAcc.favoriteGenre,
+            listenerProfile = ListenerProfile(),
+            showPersonalizationWizard = _state.value.isSetupComplete
         )
         loadHome()
     }
@@ -1898,14 +1985,21 @@ _state.value = _state.value.copy(
         val acc = _state.value.accountsList.find { it.id == accountId } ?: return
         YtRepo.userAuthCookie = acc.cookie
         persistAccounts(_state.value.accountsList, acc.id)
+        val profile = ProfileEngine.load(preferences, acc.id)
+        val audioSnapshot = equalizerController.setPreferredProfile(profile.audioPreference)
         _state.value = _state.value.copy(
             activeAccountId = acc.id,
             userAuthCookie = acc.cookie,
             isLoggedIn = acc.cookie.contains("SAPISID"),
             selectedMood = acc.favoriteGenre,
-            showAccountManagerDialog = false
+            listenerProfile = profile,
+            equalizerSnapshot = audioSnapshot,
+            showAccountManagerDialog = false,
+            showPersonalizationWizard = preferences.getBoolean("personalization_pending_${acc.id}", false),
+            profileArtistSuggestions = emptyList()
         )
         preferences.edit().putString("discovery_mood", acc.favoriteGenre).apply()
+        HomeCache.set(emptyList())
         loadHome()
     }
 
@@ -1944,20 +2038,22 @@ _state.value = _state.value.copy(
     }
 
     fun skipPersonalizationWizard() {
-        preferences.edit().putBoolean("personalization_pending", false).apply()
+        preferences.edit().putBoolean("personalization_pending", false)
+            .putBoolean("personalization_pending_${_state.value.activeAccountId}", false).apply()
         _state.value = _state.value.copy(showPersonalizationWizard = false)
     }
 
     fun saveListenerProfile(profile: ListenerProfile, finishSetup: Boolean = false) {
         val cleaned = profile.copy(
-            favoriteGenres = profile.favoriteGenres.intersect(PERSONALIZATION_GENRES.toSet()),
+            favoriteGenres = profile.favoriteGenres.intersect(PERSONALIZATION_GENRES.toSet()).take(1).toSet(),
             followedArtists = profile.followedArtists.map(String::trim).filter(String::isNotBlank).distinct().take(50),
-            favoriteMoods = profile.favoriteMoods.intersect(PERSONALIZATION_MOODS.toSet())
+            favoriteMoods = profile.favoriteMoods.intersect(PERSONALIZATION_MOODS.toSet()).take(1).toSet()
         )
-        ProfileEngine.save(preferences, cleaned)
+        ProfileEngine.save(preferences, cleaned, _state.value.activeAccountId)
         val audioSnapshot = equalizerController.setPreferredProfile(cleaned.audioPreference)
         preferences.edit().apply {
             putBoolean("personalization_pending", false)
+            putBoolean("personalization_pending_${_state.value.activeAccountId}", false)
             if (finishSetup) {
                 putBoolean("setup_complete", true)
                 putInt("setup_step", 11)
@@ -1985,18 +2081,20 @@ _state.value = _state.value.copy(
 
     fun toggleProfileGenre(genre: String) {
         val current = _state.value.listenerProfile
-        val genres = current.favoriteGenres.toMutableSet().apply { if (!add(genre)) remove(genre) }
+        val genres = if (genre in current.favoriteGenres) emptySet() else setOf(genre)
         val profile = current.copy(favoriteGenres = genres)
-        ProfileEngine.save(preferences, profile)
+        ProfileEngine.save(preferences, profile, _state.value.activeAccountId)
         _state.value = _state.value.copy(listenerProfile = profile)
+        loadHome()
     }
 
     fun toggleProfileMood(mood: String) {
         val current = _state.value.listenerProfile
-        val moods = current.favoriteMoods.toMutableSet().apply { if (!add(mood)) remove(mood) }
+        val moods = if (mood in current.favoriteMoods) emptySet() else setOf(mood)
         val profile = current.copy(favoriteMoods = moods)
-        ProfileEngine.save(preferences, profile)
+        ProfileEngine.save(preferences, profile, _state.value.activeAccountId)
         _state.value = _state.value.copy(listenerProfile = profile)
+        loadHome()
     }
 
     fun searchProfileArtists(query: String) {
@@ -2015,7 +2113,7 @@ _state.value = _state.value.copy(
         val artists = current.followedArtists.toMutableList()
         if (!artists.remove(name)) artists.add(name)
         val profile = current.copy(followedArtists = artists.take(50))
-        ProfileEngine.save(preferences, profile)
+        ProfileEngine.save(preferences, profile, _state.value.activeAccountId)
         _state.value = _state.value.copy(listenerProfile = profile)
     }
 
@@ -2026,16 +2124,48 @@ _state.value = _state.value.copy(
             audioPreference = audio ?: current.audioPreference,
             androidAutoUsage = androidAuto ?: current.androidAutoUsage
         )
-        ProfileEngine.save(preferences, profile)
+        ProfileEngine.save(preferences, profile, _state.value.activeAccountId)
         _state.value = _state.value.copy(listenerProfile = profile)
     }
 
-    fun resetRecommendations() {
+    fun resetPersonalization() {
+        val activeId = _state.value.activeAccountId
+        ProfileEngine.clear(preferences, activeId)
         PlayedSongHistory.resetRecommendationSignals()
         preferences.edit().remove("not_recommended_ids").apply()
-        _state.value = _state.value.copy(notRecommendedIds = emptySet())
+        val accounts = _state.value.accountsList.map { account ->
+            if (account.id == activeId) account.copy(favoriteGenre = "Discover") else account
+        }
+        persistAccounts(accounts, activeId)
+        preferences.edit().putString("discovery_mood", "Discover")
+            .putBoolean("personalization_pending_$activeId", true).apply()
+        _state.value = _state.value.copy(
+            listenerProfile = ListenerProfile(),
+            selectedMood = "Discover",
+            accountsList = accounts,
+            notRecommendedIds = emptySet(),
+            showPersonalizationWizard = true
+        )
         HomeCache.set(emptyList())
         loadHome()
+    }
+
+    fun requestResetAllAppData() {
+        _state.value = _state.value.copy(showResetAllDataDialog = true)
+    }
+
+    fun cancelResetAllAppData() {
+        _state.value = _state.value.copy(showResetAllDataDialog = false)
+    }
+
+    fun resetAllAppData() {
+        val app = getApplication<Application>()
+        val manager = app.getSystemService(ActivityManager::class.java)
+        val accepted = runCatching { manager?.clearApplicationUserData() == true }.getOrDefault(false)
+        if (!accepted) {
+            _state.value = _state.value.copy(showResetAllDataDialog = false)
+            Toast.makeText(app, "Kilo could not reset its app data. Try clearing it in Android Settings.", Toast.LENGTH_LONG).show()
+        }
     }
 
     fun rebuildProfile() {
@@ -2045,16 +2175,25 @@ _state.value = _state.value.copy(
         saveListenerProfile(profile.copy(followedArtists = artists))
     }
 
-    fun exportProfile() {
-        val send = Intent(Intent.ACTION_SEND).apply {
-            type = "application/json"
-            putExtra(Intent.EXTRA_TEXT, ProfileEngine.export(_state.value.listenerProfile))
+    fun exportProfileXml(uri: Uri) {
+        val result = runCatching {
+            val output = getApplication<Application>().contentResolver.openOutputStream(uri)
+                ?: error("Could not open the selected file")
+            output.use { it.write(ProfileEngine.exportXml(_state.value.listenerProfile).toByteArray(Charsets.UTF_8)) }
         }
-        runCatching {
-            getApplication<Application>().startActivity(
-                Intent.createChooser(send, "Export KILO profile").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            )
+        Toast.makeText(getApplication(), if (result.isSuccess) "Profile exported as XML" else "Could not export profile XML", Toast.LENGTH_LONG).show()
+    }
+
+    fun importProfileXml(uri: Uri) {
+        val result = runCatching {
+            val input = getApplication<Application>().contentResolver.openInputStream(uri)
+                ?: error("Could not open the selected file")
+            input.bufferedReader(Charsets.UTF_8).use { reader ->
+                ProfileEngine.parseXml(reader.readText()) ?: error("Invalid KILO profile XML")
+            }
         }
+        result.onSuccess { saveListenerProfile(it) }
+        Toast.makeText(getApplication(), if (result.isSuccess) "Profile loaded from XML" else "Could not load that XML profile", Toast.LENGTH_LONG).show()
     }
 
     fun setAutoMixEnabled(enabled: Boolean) {
@@ -2890,6 +3029,25 @@ _state.value = _state.value.copy(
         _state.value = _state.value.copy(selectedPlayerStyleId = styleId)
     }
 
+    fun openCustomPlayerColorDialog() {
+        _state.value = _state.value.copy(showCustomPlayerColorDialog = true)
+    }
+
+    fun closeCustomPlayerColorDialog() {
+        _state.value = _state.value.copy(showCustomPlayerColorDialog = false)
+    }
+
+    fun setCustomPlayerAccent(hex: String) {
+        val color = parsePlayerColor(hex) ?: return
+        preferences.edit().putString("custom_player_accent", playerColorHex(color))
+            .putString("player_style_id", "style_custom").apply()
+        _state.value = _state.value.copy(
+            customPlayerAccent = color,
+            selectedPlayerStyleId = "style_custom",
+            showCustomPlayerColorDialog = false
+        )
+    }
+
     private fun loadAccounts(): List<UserProfileAccount> = runCatching {
         val json = JSONArray(preferences.getString("profile_accounts", "[]"))
         (0 until json.length()).mapNotNull { index ->
@@ -3042,9 +3200,35 @@ fun VybeRootApp(vm: MainViewModel) {
         AccountManagerDialog(
             accounts = state.accountsList,
             activeId = state.activeAccountId,
+            onCreateProfile = vm::openCreateProfileDialog,
             onAddAccount = { vm.openWebLogin() },
             onSelectAccount = { vm.switchAccount(it) },
             onDismiss = { vm.toggleAccountManager(false) }
+        )
+    }
+
+    if (state.showCreateProfileDialog) {
+        CreateListenerProfileDialog(
+            onCreate = vm::createListenerProfile,
+            onDismiss = vm::closeCreateProfileDialog
+        )
+    }
+
+    if (state.showResetAllDataDialog) {
+        AlertDialog(
+            onDismissRequest = vm::cancelResetAllAppData,
+            title = { Text("Reset all Kilo data?") },
+            text = {
+                Text("This permanently deletes all Kilo app data on this device, including profiles, preferences, saved playlists, history, downloads stored in app data and account sign-in. The app will return to the first setup step.")
+            },
+            confirmButton = {
+                TextButton(onClick = vm::resetAllAppData) {
+                    Text("Erase everything", color = Color(0xFFFF6B6B))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = vm::cancelResetAllAppData) { Text("Cancel") }
+            }
         )
     }
 
@@ -3130,14 +3314,14 @@ private fun PersonalizationWizardDialog(vm: MainViewModel) {
                     when (step) {
                         0 -> {
                             Text("Choose genres you enjoy", color = Color.White, fontWeight = FontWeight.Bold)
-                            ProfileChoiceGrid(PERSONALIZATION_GENRES, profile.favoriteGenres, vm::toggleProfileGenre)
+                            ProfileChoiceGrid(PERSONALIZATION_GENRES, profile.favoriteGenres, state.activeSkin.highlight, vm::toggleProfileGenre)
                         }
                         1 -> {
                             ProfileArtistPicker(vm, state, artistQuery) { artistQuery = it }
                         }
                         2 -> {
                             Text("Pick moods for different moments", color = Color.White, fontWeight = FontWeight.Bold)
-                            ProfileChoiceGrid(PERSONALIZATION_MOODS, profile.favoriteMoods, vm::toggleProfileMood)
+                            ProfileChoiceGrid(PERSONALIZATION_MOODS, profile.favoriteMoods, state.activeSkin.highlight, vm::toggleProfileMood)
                         }
                         else -> {
                             Text("Tune your recommendations", color = Color.White, fontWeight = FontWeight.Bold)
@@ -3209,21 +3393,41 @@ private fun ProfileArtistPick(name: String, selected: Boolean, accent: Color, on
 }
 
 @Composable
-private fun ProfileChoiceGrid(options: List<String>, selected: Set<String>, onToggle: (String) -> Unit) {
-    Column(Modifier.fillMaxWidth().padding(top = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+private fun ProfileChoiceGrid(options: List<String>, selected: Set<String>, accent: Color, onToggle: (String) -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(top = 10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
         options.chunked(3).forEach { row ->
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
                 row.forEach { value ->
-                    FilterChip(
-                        selected = value in selected,
-                        onClick = { onToggle(value) },
-                        label = { Text(value, fontSize = 11.sp) },
-                        modifier = Modifier.weight(1f)
-                    )
+                    val isSelected = value in selected
+                    Row(
+                        modifier = Modifier.weight(1f).heightIn(min = 44.dp)
+                            .clip(RoundedCornerShape(15.dp))
+                            .background(if (isSelected) accent.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.045f))
+                            .border(1.dp, if (isSelected) accent.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.08f), RoundedCornerShape(15.dp))
+                            .clickable { onToggle(value) }
+                            .padding(horizontal = 10.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Text(value, fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                            color = if (isSelected) Color.White else Color.White.copy(alpha = 0.78f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
                 }
                 repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
+    }
+}
+
+@Composable
+private fun DiscoveryChoiceChip(label: String, selected: Boolean, accent: Color, onClick: () -> Unit) {
+    Box(
+        Modifier.clip(RoundedCornerShape(14.dp))
+            .background(if (selected) Brush.linearGradient(listOf(accent.copy(alpha = 0.42f), accent.copy(alpha = 0.18f))) else Brush.linearGradient(listOf(Color.White.copy(alpha = 0.055f), Color.White.copy(alpha = 0.035f))))
+            .border(1.dp, if (selected) accent.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.1f), RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick).padding(horizontal = 15.dp, vertical = 9.dp)
+    ) {
+        Text(label, color = Color.White.copy(alpha = if (selected) 1f else 0.82f), fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium, fontSize = 12.sp)
     }
 }
 
@@ -3419,22 +3623,30 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                 LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(PERSONALIZATION_MOODS) { mood ->
                         val selected = mood in state.listenerProfile.favoriteMoods || state.selectedMood == mood
-                        FilterChip(
-                            selected = selected,
-                            onClick = { vm.toggleProfileMood(mood); vm.setDiscoveryMood(mood) },
-                            label = { Text(mood, fontSize = 11.sp) }
-                        )
+                        DiscoveryChoiceChip(mood, selected, accent) {
+                            if (state.selectedMood == mood) {
+                                vm.toggleProfileMood(mood)
+                                vm.setDiscoveryMood("Discover")
+                            } else {
+                                vm.toggleProfileMood(mood)
+                                vm.setDiscoveryMood(mood)
+                            }
+                        }
                     }
                 }
                 Text("GENRES", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.2.sp, modifier = Modifier.padding(start = 20.dp, top = 7.dp, bottom = 3.dp))
                 LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(PERSONALIZATION_GENRES) { genre ->
                         val selected = genre in state.listenerProfile.favoriteGenres || state.selectedMood == genre
-                        FilterChip(
-                            selected = selected,
-                            onClick = { vm.toggleProfileGenre(genre); vm.setDiscoveryMood(genre) },
-                            label = { Text(genre, fontSize = 11.sp) }
-                        )
+                        DiscoveryChoiceChip(genre, selected, accent) {
+                            if (state.selectedMood == genre) {
+                                vm.toggleProfileGenre(genre)
+                                vm.setDiscoveryMood("Discover")
+                            } else {
+                                vm.toggleProfileGenre(genre)
+                                vm.setDiscoveryMood(genre)
+                            }
+                        }
                     }
                 }
             }
@@ -3934,6 +4146,7 @@ private fun LegacyFreshFriendlyHomeScreen(vm: MainViewModel) {
 fun AccountManagerDialog(
     accounts: List<UserProfileAccount>,
     activeId: String,
+    onCreateProfile: () -> Unit,
     onAddAccount: () -> Unit,
     onSelectAccount: (String) -> Unit,
     onDismiss: () -> Unit
@@ -3949,7 +4162,7 @@ fun AccountManagerDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Switch Profile", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                    Text("Listener Profiles", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                     IconButton(onClick = onDismiss) {
                         Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.Gray)
                     }
@@ -3986,6 +4199,17 @@ fun AccountManagerDialog(
                 }
                 Spacer(modifier = Modifier.height(10.dp))
                 Button(
+                    onClick = onCreateProfile,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF352747))
+                ) {
+                    Icon(Icons.Default.PersonAdd, contentDescription = null, tint = Color.White)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Create listener profile", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
                     onClick = { onDismiss(); onAddAccount() },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(14.dp),
@@ -3993,11 +4217,39 @@ fun AccountManagerDialog(
                 ) {
                     Icon(Icons.Default.Add, contentDescription = null, tint = Color.Black)
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text("Add YouTube Account", color = Color.Black, fontWeight = FontWeight.Bold)
+                    Text("Connect another YouTube account", color = Color.Black, fontWeight = FontWeight.Bold)
                 }
             }
         }
     }
+}
+
+@Composable
+private fun CreateListenerProfileDialog(
+    onCreate: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Create listener profile") },
+        text = {
+            Column {
+                Text("This profile shares the current YouTube Music account, with its own genres, moods, artists and discovery preferences.")
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it.take(32) },
+                    singleLine = true,
+                    label = { Text("Profile name") }
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onCreate(name) }, enabled = name.isNotBlank()) { Text("Create") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+    )
 }
 
 @Composable
@@ -4105,6 +4357,7 @@ fun BitchordSongRowItem(
     onClick: () -> Unit,
     vm: MainViewModel
 ) {
+    val state by vm.state.collectAsState()
     val custom = LocalUiCustomizations.current
     val skin = LocalPrimarySkin.current
     val compact = custom["compactRows"] == true || custom["compactLibrary"] == true
@@ -4175,6 +4428,15 @@ fun BitchordSongRowItem(
                 )
             }
         }
+        val isLiked = song.id in state.favoriteIds
+        IconButton(onClick = { vm.toggleFavorite(song.id) }, modifier = Modifier.size(38.dp)) {
+            Icon(
+                imageVector = if (isLiked) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
+                contentDescription = if (isLiked) "Remove from liked songs" else "Add to liked songs",
+                tint = if (isLiked) skin.highlight else Color.White.copy(alpha = 0.68f),
+                modifier = Modifier.size(19.dp)
+            )
+        }
         SongOverflowMenuButton(song = song, vm = vm)
     }
 }
@@ -4201,6 +4463,12 @@ fun SongOverflowMenuButton(song: SongItemClean, vm: MainViewModel) {
             }
         }
         DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            val isLiked = song.id in state.favoriteIds
+            DropdownMenuItem(
+                text = { Text(if (isLiked) "Remove from liked songs" else "Add to liked songs") },
+                leadingIcon = { Icon(if (isLiked) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder, contentDescription = null) },
+                onClick = { expanded = false; vm.toggleFavorite(song.id) }
+            )
             DropdownMenuItem(
                 text = { Text("Save to playlist") },
                 leadingIcon = { Icon(Icons.Outlined.PlaylistAdd, contentDescription = null) },
@@ -4296,7 +4564,8 @@ fun BitchordFloatingMiniPlayer(
     val custom = LocalUiCustomizations.current
     val skin = state.activeSkin
     val compact = custom["compactPlayer"] == true
-    val playerStyle = PLAYER_STYLE_PRESETS.firstOrNull { it.id == state.selectedPlayerStyleId } ?: PLAYER_STYLE_PRESETS.first()
+    val playerStyle = (PLAYER_STYLE_PRESETS.firstOrNull { it.id == state.selectedPlayerStyleId } ?: PLAYER_STYLE_PRESETS.first())
+        .let { if (it.id == "style_custom") it.copy(accent = state.customPlayerAccent) else it }
     val playerAccent = playerStyle.accent
     val playerShape = primaryCardShape(skin)
     val playerBrush = when (skin.layoutFamily) {
@@ -4461,7 +4730,8 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
     val custom = LocalUiCustomizations.current
     val song = state.activeSong
     val skin = state.activeSkin
-    val playerStyle = PLAYER_STYLE_PRESETS.firstOrNull { it.id == state.selectedPlayerStyleId } ?: PLAYER_STYLE_PRESETS.first()
+    val playerStyle = (PLAYER_STYLE_PRESETS.firstOrNull { it.id == state.selectedPlayerStyleId } ?: PLAYER_STYLE_PRESETS.first())
+        .let { if (it.id == "style_custom") it.copy(accent = state.customPlayerAccent) else it }
     val playerAccent = playerStyle.accent
     var isSeeking by remember(song.id) { mutableStateOf(false) }
     var seekProgress by remember(song.id) { mutableFloatStateOf(state.progress) }
@@ -4840,6 +5110,12 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         vm.setDownloadDirectory(uri)
     }
+    val profileExportPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/xml")) { uri ->
+        uri?.let(vm::exportProfileXml)
+    }
+    val profileImportPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(vm::importProfileXml)
+    }
     val accent = state.activeSkin.highlight
     val folderName = state.downloadDirectoryUri?.let { value ->
         runCatching { DocumentsContract.getTreeDocumentId(Uri.parse(value)).substringAfterLast(':') }.getOrNull()
@@ -4881,9 +5157,16 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
             HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
             SettingsRowItem(
                 icon = Icons.Default.Refresh,
-                title = "Reset Recommendations",
-                subtitle = "Clear learned discovery signals and start fresh",
-                onClick = vm::resetRecommendations
+                title = "Reset Personalization",
+                subtitle = "Clear this profile’s preferences and choose new ones",
+                onClick = vm::resetPersonalization
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
+                icon = Icons.Default.DeleteForever,
+                title = "Reset all app data",
+                subtitle = "Erase all Kilo data and restart the setup wizard",
+                onClick = vm::requestResetAllAppData
             )
             HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
             SettingsRowItem(
@@ -4896,8 +5179,15 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
             SettingsRowItem(
                 icon = Icons.Default.Share,
                 title = "Export Profile",
-                subtitle = "Share a copy of your local personalization data",
-                onClick = vm::exportProfile
+                subtitle = "Save a reusable XML preset in a folder you choose",
+                onClick = { profileExportPicker.launch("KILO-Profile.xml") }
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
+                icon = Icons.Default.FolderOpen,
+                title = "Load Profile XML",
+                subtitle = "Choose a KILO preset XML file from your files",
+                onClick = { profileImportPicker.launch(arrayOf("application/xml", "text/xml")) }
             )
             HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
             SettingsRowItem(
@@ -5430,11 +5720,11 @@ private fun AppLayoutPreview(index: Int, accent: Color) {
 }
 
 @Composable
-private fun AutoLayoutPreview(index: Int, accent: Color) {
+private fun AutoLayoutPreview(index: Int, accent: Color, modifier: Modifier = Modifier) {
     val shell = RoundedCornerShape(9.dp)
     val tile = RoundedCornerShape(if (index % 3 == 0) 8.dp else 3.dp)
     Row(
-        Modifier.fillMaxWidth().height(76.dp).clip(shell).background(Color(0xFF070B11)).border(1.dp, accent.copy(alpha = 0.3f), shell).padding(5.dp),
+        modifier.fillMaxWidth().height(76.dp).clip(shell).background(Color(0xFF070B11)).border(1.dp, accent.copy(alpha = 0.3f), shell).padding(5.dp),
         horizontalArrangement = Arrangement.spacedBy(5.dp)
     ) {
         Column(Modifier.width(12.dp).fillMaxHeight(), verticalArrangement = Arrangement.SpaceEvenly, horizontalAlignment = Alignment.CenterHorizontally) {
@@ -5496,8 +5786,8 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
-                Text(
-                    "Choose which music sections appear first and how many recommendation shelves KILO shows. Android Auto adapts the screen for your car.",
+            Text(
+                    "Choose a browse style and the number of shelves. There are 25 combinations: five styles with two to six shelves.",
                     color = Color.White.copy(alpha = 0.65f), fontSize = 13.sp, lineHeight = 19.sp,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                 )
@@ -5521,29 +5811,33 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
                     )
                 }
             }
-            item { SettingsSectionHeader("BROWSE ORDER") }
-            AUTO_LAYOUT_PROFILES.forEachIndexed { profileIndex, profile ->
-                item(key = "auto_layout_profile_$profileIndex") {
-                    SettingsGroupCard {
-                        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Text(profile.first, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                            Text(profile.second, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp)
-                            (2..6).toList().chunked(3).forEach { rowCounts ->
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    rowCounts.forEach { shelfCount ->
-                                        val mode = "${profileIndex + 1}|$shelfCount|${profile.first}"
-                                        FilterChip(
-                                            selected = state.autoLayoutMode == mode,
-                                            onClick = { vm.setAutoLayoutMode(mode) },
-                                            label = { Text("$shelfCount shelves") },
-                                            leadingIcon = if (state.autoLayoutMode == mode) ({
-                                                Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(16.dp))
-                                            }) else null
-                                        )
-                                    }
-                                }
+            item { SettingsSectionHeader("ALL 25 LAYOUTS") }
+            item {
+                Text("Five browse styles, each with two to six shelves. Preview and choose any layout below.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(horizontal = 4.dp))
+            }
+            val layoutChoices = AUTO_LAYOUT_PROFILES.flatMapIndexed { profileIndex, profile ->
+                (2..6).map { shelfCount ->
+                    Triple(profileIndex * 5 + shelfCount - 2, "${profileIndex + 1}|$shelfCount|${profile.first}", "${profile.first} · $shelfCount shelves")
+                }
+            }
+            layoutChoices.chunked(2).forEachIndexed { rowIndex, rowChoices ->
+                item(key = "auto_layout_row_$rowIndex") {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        rowChoices.forEach { (previewIndex, mode, title) ->
+                            val selected = state.autoLayoutMode == mode
+                            Column(
+                                Modifier.weight(1f).clip(RoundedCornerShape(18.dp))
+                                    .background(if (selected) accent.copy(alpha = 0.13f) else Color.White.copy(alpha = 0.035f))
+                                    .border(1.dp, if (selected) accent.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.09f), RoundedCornerShape(18.dp))
+                                    .clickable { vm.setAutoLayoutMode(mode) }.padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(7.dp)
+                            ) {
+                                AutoLayoutPreview(previewIndex, accent)
+                                Text(title, color = if (selected) Color.White else Color.White.copy(alpha = 0.8f), fontSize = 11.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, maxLines = 2, minLines = 2, overflow = TextOverflow.Ellipsis)
+                                Text(if (selected) "Selected" else "Tap to use", color = if (selected) accent else Color.White.copy(alpha = 0.48f), fontSize = 10.sp)
                             }
                         }
+                        if (rowChoices.size == 1) Spacer(Modifier.weight(1f))
                     }
                 }
             }
@@ -5615,6 +5909,11 @@ private fun PlayerStylePreview(style: PlayerStylePreset) {
 @Composable
 fun PlayerStylesScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
+    var colorHex by remember(state.customPlayerAccent) { mutableStateOf(playerColorHex(state.customPlayerAccent)) }
+    val customColorOptions = listOf(
+        Color(0xFFFF795F), Color(0xFFB783FF), Color(0xFF45D6C5), Color(0xFFFFC857),
+        Color(0xFFFF5C9A), Color(0xFF6CB6FF), Color(0xFFF5F1FF), Color(0xFF8BD450)
+    )
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -5631,24 +5930,41 @@ fun PlayerStylesScreen(vm: MainViewModel) {
             Text("Player Styles (${PLAYER_STYLE_PRESETS.size})", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
         }
         LazyColumn(contentPadding = PaddingValues(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            item {
+                Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(20.dp)).background(Color(0xFF17141F)).border(1.dp, state.customPlayerAccent.copy(alpha = 0.4f), RoundedCornerShape(20.dp)).padding(16.dp), verticalArrangement = Arrangement.spacedBy(11.dp)) {
+                    Text("CUSTOM STUDIO COLOR", color = state.customPlayerAccent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.3.sp)
+                    Text("Choose an accent for your custom player style.", color = Color.White.copy(alpha = 0.68f), fontSize = 12.sp)
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        customColorOptions.forEach { swatch ->
+                            Box(Modifier.size(30.dp).clip(CircleShape).background(swatch)
+                                .then(if (swatch == state.customPlayerAccent) Modifier.border(2.dp, Color.White, CircleShape) else Modifier)
+                                .clickable { vm.setCustomPlayerAccent(playerColorHex(swatch)) })
+                        }
+                    }
+                    OutlinedButton(onClick = vm::openCustomPlayerColorDialog, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp)) {
+                        Text("Enter HEX color  ${playerColorHex(state.customPlayerAccent)}", color = state.customPlayerAccent, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
             PLAYER_STYLE_PRESETS.chunked(2).forEach { rowStyles ->
                 item {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         rowStyles.forEach { preset ->
+                            val displayPreset = if (preset.id == "style_custom") preset.copy(accent = state.customPlayerAccent) else preset
                             val selected = preset.id == state.selectedPlayerStyleId
                             Column(
                                 modifier = Modifier
                                     .weight(1f)
                                     .clip(RoundedCornerShape(18.dp))
-                                    .background(preset.background)
-                                    .border(1.5.dp, if (selected) preset.accent else Color.White.copy(alpha = 0.1f), RoundedCornerShape(18.dp))
+                                    .background(displayPreset.background)
+                                    .border(1.5.dp, if (selected) displayPreset.accent else Color.White.copy(alpha = 0.1f), RoundedCornerShape(18.dp))
                                     .clickable { vm.setPlayerStyle(preset.id) }
                                     .padding(14.dp)
                             ) {
-                                PlayerStylePreview(preset)
+                                PlayerStylePreview(displayPreset)
                                 Spacer(Modifier.height(8.dp))
                                 Text(preset.name, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                                Text(if (selected) "Active" else "Tap to apply", color = if (selected) preset.accent else Color.Gray, fontSize = 11.sp)
+                                Text(if (selected) "Active" else "Tap to apply", color = if (selected) displayPreset.accent else Color.Gray, fontSize = 11.sp)
                             }
                         }
                         if (rowStyles.size == 1) Spacer(Modifier.weight(1f))
@@ -5656,6 +5972,36 @@ fun PlayerStylesScreen(vm: MainViewModel) {
                 }
             }
         }
+    }
+    if (state.showCustomPlayerColorDialog) {
+        val parsedColor = parsePlayerColor(colorHex)
+        AlertDialog(
+            onDismissRequest = vm::closeCustomPlayerColorDialog,
+            title = { Text("Custom player color", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("Enter a six-digit HEX color. The preview updates when you apply it.", color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+                    OutlinedTextField(
+                        value = colorHex,
+                        onValueChange = { colorHex = it.take(9) },
+                        label = { Text("HEX color") },
+                        singleLine = true,
+                        isError = parsedColor == null,
+                        leadingIcon = { if (parsedColor != null) Box(Modifier.size(18.dp).clip(CircleShape).background(parsedColor)) },
+                        colors = OutlinedTextFieldDefaults.colors(focusedTextColor = Color.White, unfocusedTextColor = Color.White, focusedBorderColor = state.customPlayerAccent, unfocusedBorderColor = Color.White.copy(alpha = 0.25f))
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.setCustomPlayerAccent(colorHex) }, enabled = parsedColor != null) {
+                    Text("Apply custom style", color = state.customPlayerAccent)
+                }
+            },
+            dismissButton = { TextButton(onClick = vm::closeCustomPlayerColorDialog) { Text("Cancel", color = Color.White.copy(alpha = 0.72f)) } },
+            containerColor = Color(0xFF17141F),
+            titleContentColor = Color.White,
+            textContentColor = Color.White
+        )
     }
 }
 
@@ -5873,7 +6219,7 @@ fun SearchScreen(vm: MainViewModel) {
                 if (state.artistSearchResults.isNotEmpty()) {
                     item { SettingsSectionHeader("ARTISTS") }
                     itemsIndexed(state.artistSearchResults.take(5), key = { _, artist -> "search-artist-${artist.id}" }) { _, artist ->
-                        ArtistSearchRow(artist) { vm.openArtist(artist) }
+                        ArtistSearchRow(artist, artist.name in state.listenerProfile.followedArtists, { vm.toggleFollowedArtist(artist.name) }) { vm.openArtist(artist) }
                     }
                     item { SettingsSectionHeader("SONGS") }
                 }
@@ -5887,7 +6233,7 @@ fun SearchScreen(vm: MainViewModel) {
                 }
             } else if (selectedSearchTab == 1) {
                 itemsIndexed(state.artistSearchResults, key = { _, artist -> artist.id }) { _, artist ->
-                    ArtistSearchRow(artist) { vm.openArtist(artist) }
+                    ArtistSearchRow(artist, artist.name in state.listenerProfile.followedArtists, { vm.toggleFollowedArtist(artist.name) }) { vm.openArtist(artist) }
                 }
             } else {
                 itemsIndexed(state.communityPlaylistResults, key = { _, playlist -> playlist.id }) { _, playlist ->
@@ -5901,20 +6247,30 @@ fun SearchScreen(vm: MainViewModel) {
 }
 
 @Composable
-private fun ArtistSearchRow(artist: ArtistItem, onClick: () -> Unit) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 20.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
-        AsyncImage(
-            model = artist.coverUrl,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.size(58.dp).clip(CircleShape)
-        )
-        Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Text(artist.name, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(artist.subtitle.ifBlank { "Artist" }, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+private fun ArtistSearchRow(artist: ArtistItem, following: Boolean, onFollow: () -> Unit, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp).clip(RoundedCornerShape(18.dp)).background(Color.White.copy(alpha = 0.035f)).padding(horizontal = 12.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+        Row(Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).clickable(onClick = onClick).padding(end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            AsyncImage(
+                model = artist.coverUrl,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.size(54.dp).clip(CircleShape)
+            )
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(artist.name, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(artist.subtitle.ifBlank { "Artist" }, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            Icon(Icons.Default.ChevronRight, contentDescription = "Open artist", tint = Color.White.copy(alpha = 0.65f))
         }
-        Icon(Icons.Default.ChevronRight, contentDescription = "Open artist", tint = Color.White.copy(alpha = 0.75f))
+        Box(
+            Modifier.clip(RoundedCornerShape(12.dp)).background(if (following) Color.White.copy(alpha = 0.08f) else Color(0xFFB783FF).copy(alpha = 0.2f))
+                .border(1.dp, if (following) Color.White.copy(alpha = 0.12f) else Color(0xFFB783FF).copy(alpha = 0.55f), RoundedCornerShape(12.dp))
+                .clickable(onClick = onFollow).padding(horizontal = 13.dp, vertical = 9.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(if (following) "Following" else "Follow", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 11.sp)
+        }
     }
 }
 
@@ -6425,7 +6781,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                         Icon(Icons.Default.CheckCircle, contentDescription = null, tint = state.activeSkin.highlight, modifier = Modifier.size(64.dp))
                     }
                     7 -> WizardStepContent("8. Choose your genres", "Pick the styles you want KILO to use for your Home shelves and recommendations.") {
-                        ProfileChoiceGrid(PERSONALIZATION_GENRES, state.listenerProfile.favoriteGenres, vm::toggleProfileGenre)
+                        ProfileChoiceGrid(PERSONALIZATION_GENRES, state.listenerProfile.favoriteGenres, state.activeSkin.highlight, vm::toggleProfileGenre)
                     }
                     8 -> WizardStepContent("9. Follow artists", "Browse popular worldwide and regional artists, or search YouTube Music.") {
                         Column(Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
@@ -6433,7 +6789,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                         }
                     }
                     9 -> WizardStepContent("10. Pick your moods", "Choose moods for Home, mixes and Android Auto.") {
-                        ProfileChoiceGrid(PERSONALIZATION_MOODS, state.listenerProfile.favoriteMoods, vm::toggleProfileMood)
+                        ProfileChoiceGrid(PERSONALIZATION_MOODS, state.listenerProfile.favoriteMoods, state.activeSkin.highlight, vm::toggleProfileMood)
                     }
                     10 -> WizardStepContent("11. Tune your listening", "These preferences shape recommendations and sound on this device.") {
                         Column(Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
