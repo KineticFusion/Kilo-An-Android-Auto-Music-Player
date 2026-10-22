@@ -3,6 +3,7 @@ package com.example.kilo
 import android.util.Log
 import android.webkit.CookieManager
 import androidx.compose.ui.graphics.Color
+import com.example.kilo.streaming.StreamInfo
 import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
@@ -15,6 +16,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 object YtRepo {
@@ -22,11 +24,24 @@ object YtRepo {
     private const val ORIGIN = "https://music.youtube.com"
     private const val WEB_REMIX_VERSION = "1.20250310.01.00"
     private const val SONGS_FILTER = "EgWKAQIIAWoMEA4QChADEAQQCRAF"
+    private const val ARTISTS_FILTER = "EgWKAQIgAWoMEA4QChADEAQQCRAF"
+    private const val COMMUNITY_PLAYLISTS_FILTER = "Eg-KAQwIABA"
     private const val WEB_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     @Volatile
     var userAuthCookie: String = ""
+
+    @Volatile
+    private var regionOverride: String = "AUTO"
+
+    fun setRegionCode(code: String) {
+        regionOverride = code.uppercase().takeIf { it == "AUTO" || it.matches(Regex("[A-Z]{2}")) } ?: "AUTO"
+    }
+
+    private fun regionCode(): String = regionOverride.takeUnless { it == "AUTO" }
+        ?: Locale.getDefault().country.uppercase().takeIf { it.matches(Regex("[A-Z]{2}")) }
+        ?: "US"
 
     val paletteColors = listOf(
         Color(0xFFFF7043), Color(0xFFAB47BC), Color(0xFF26A69A), Color(0xFF42A5F5), Color(0xFFFFCA28)
@@ -110,7 +125,8 @@ object YtRepo {
                 setRequestProperty("Origin", ORIGIN)
                 setRequestProperty("Referer", "$ORIGIN/")
                 setRequestProperty("X-Origin", ORIGIN)
-                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                val language = Locale.getDefault().language.takeIf { it.matches(Regex("[a-zA-Z]{2,3}")) } ?: "en"
+                setRequestProperty("Accept-Language", "$language-${regionCode()},$language;q=0.9")
                 setRequestProperty("User-Agent", WEB_UA)
                 if (userAuthCookie.isNotEmpty()) {
                     setRequestProperty("Cookie", userAuthCookie)
@@ -120,11 +136,13 @@ object YtRepo {
                     setRequestProperty("Cookie", "SOCS=CAI")
                 }
             }
+            val language = Locale.getDefault().language.takeIf { it.matches(Regex("[a-zA-Z]{2,3}")) } ?: "en"
+            val region = regionCode()
             body.put("context", JSONObject().put("client", JSONObject().apply {
                 put("clientName", "WEB_REMIX")
                 put("clientVersion", WEB_REMIX_VERSION)
-                put("hl", "en")
-                put("gl", "IN")
+                put("hl", language)
+                put("gl", region)
             }))
             OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
             val code = conn.responseCode
@@ -150,6 +168,169 @@ object YtRepo {
         return songs
     }
 
+    fun searchArtists(query: String): List<ArtistItem> {
+        if (query.isBlank()) return emptyList()
+        val filtered = ytMusicPost("search", JSONObject().put("query", query).put("params", ARTISTS_FILTER))
+        val candidates = filtered?.let(::parseArtists).orEmpty()
+        if (candidates.isNotEmpty()) return candidates
+        val fallback = ytMusicPost("search", JSONObject().put("query", query)) ?: return emptyList()
+        return parseArtists(fallback).filter { it.subtitle.contains("artist", ignoreCase = true) }
+    }
+
+    private fun parseArtists(json: JSONObject): List<ArtistItem> {
+        val rows = mutableListOf<JSONObject>()
+        collect(json, "musicTwoRowItemRenderer", rows)
+        collect(json, "musicResponsiveListItemRenderer", rows)
+        return rows.mapNotNull { row ->
+            val title = runsText(row.optJSONObject("title")).firstOrNull()
+                ?: row.optJSONArray("flexColumns")?.optJSONObject(0)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+                    ?.let { runsText(it).firstOrNull() }
+                ?: return@mapNotNull null
+            val browseId = row.optJSONObject("navigationEndpoint")?.optJSONObject("browseEndpoint")
+                ?.optString("browseId").orEmpty().ifBlank {
+                    row.optJSONObject("navigationItemRenderer")?.optJSONObject("navigationEndpoint")
+                        ?.optJSONObject("browseEndpoint")?.optString("browseId").orEmpty()
+                }
+            if (browseId.isBlank()) return@mapNotNull null
+            val subtitle = runsText(row.optJSONObject("subtitle")).joinToString("").ifBlank {
+                row.optJSONArray("flexColumns")?.optJSONObject(1)
+                    ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+                    ?.let { runsText(it).joinToString("") }.orEmpty()
+            }
+            val thumbnail = row.optJSONObject("thumbnailRenderer")?.optJSONObject("musicThumbnailRenderer")
+                ?.optJSONObject("thumbnail") ?: row.optJSONObject("thumbnail")
+            if (subtitle.isNotBlank() && !subtitle.contains("artist", ignoreCase = true)) return@mapNotNull null
+            ArtistItem(browseId, title, subtitle, bestThumb(thumbnail))
+        }.distinctBy { it.id }.take(20)
+    }
+
+    fun fetchArtistCatalog(artist: ArtistItem): Triple<ArtistItem, List<SongItemClean>, List<SongItemClean>> {
+        val json = ytMusicPost("browse", JSONObject().put("browseId", artist.id)) ?: return Triple(artist, emptyList(), emptyList())
+        val refreshedArtist = run {
+            val headers = mutableListOf<JSONObject>()
+            collect(json, "musicImmersiveHeaderRenderer", headers)
+            collect(json, "musicVisualHeaderRenderer", headers)
+            val header = headers.firstOrNull()
+            val name = runsText(header?.optJSONObject("title")).firstOrNull().orEmpty().ifBlank { artist.name }
+            val thumbnail = header?.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer")
+                ?.optJSONObject("thumbnail")
+            artist.copy(name = name, coverUrl = bestThumb(thumbnail).ifBlank { artist.coverUrl })
+        }
+
+        val albumShelves = mutableListOf<JSONObject>()
+        collect(json, "musicCarouselShelfRenderer", albumShelves)
+        val albums = albumShelves.flatMapIndexed { shelfIndex, shelf ->
+            val header = runsText(shelf.optJSONObject("header")
+                ?.optJSONObject("musicCarouselShelfBasicHeaderRenderer")?.optJSONObject("title"))
+                .firstOrNull().orEmpty()
+            if (!header.contains(Regex("album|single|discography|release", RegexOption.IGNORE_CASE))) emptyList()
+            else shelf.optJSONArray("contents")?.let { contents ->
+                (0 until contents.length()).mapNotNull { index ->
+                    contents.optJSONObject(index)?.optJSONObject("musicTwoRowItemRenderer")?.let { parseTwoRowItem(it, shelfIndex + index) }
+                }
+            }.orEmpty()
+        }.filter { it.albumBrowseId.isNotBlank() }.distinctBy { it.albumBrowseId }
+
+        val musicShelves = mutableListOf<JSONObject>()
+        collect(json, "musicShelfRenderer", musicShelves)
+        val songs = musicShelves.flatMapIndexed { shelfIndex, shelf ->
+            val contents = shelf.optJSONArray("contents") ?: return@flatMapIndexed emptyList()
+            (0 until contents.length()).mapNotNull { index ->
+                val row = contents.optJSONObject(index)?.optJSONObject("musicResponsiveListItemRenderer")
+                    ?: return@mapNotNull null
+                parseResponsiveItem(row, shelfIndex + index)?.let { song ->
+                    song.copy(artist = song.artist.takeUnless { it == "Unknown" }.orEmpty().ifBlank { refreshedArtist.name })
+                }
+            }
+        }.distinctBy { it.videoId }
+        return Triple(refreshedArtist, albums, songs)
+    }
+
+    fun fetchAlbumTracks(browseId: String, artistName: String): List<SongItemClean> {
+        val json = ytMusicPost("browse", JSONObject().put("browseId", browseId)) ?: return emptyList()
+        val rows = mutableListOf<JSONObject>()
+        collect(json, "musicResponsiveListItemRenderer", rows)
+        return rows.mapIndexedNotNull { index, row ->
+            parseResponsiveItem(row, index)?.let { song ->
+                song.copy(artist = song.artist.takeUnless { it == "Unknown" }.orEmpty().ifBlank { artistName })
+            }
+        }.distinctBy { it.videoId }
+    }
+
+    fun searchCommunityPlaylists(query: String): List<SongItemClean> {
+        if (query.isBlank()) return emptyList()
+        val filtered = ytMusicPost(
+            "search",
+            JSONObject().put("query", query).put("params", COMMUNITY_PLAYLISTS_FILTER)
+        )
+        val filteredResults = filtered?.let(::parseCommunityPlaylistResults).orEmpty()
+        if (filteredResults.isNotEmpty()) return filteredResults
+        val fallback = ytMusicPost("search", JSONObject().put("query", query)) ?: return emptyList()
+        return parseCommunityPlaylistResults(fallback)
+    }
+
+    private fun parseCommunityPlaylistResults(json: JSONObject): List<SongItemClean> {
+        val twoRowItems = mutableListOf<JSONObject>()
+        collect(json, "musicTwoRowItemRenderer", twoRowItems)
+        val results = twoRowItems.mapIndexedNotNull { index, row -> parseCommunityPlaylist(row, index) }
+        if (results.isNotEmpty()) return results.distinctBy { it.playlistId }
+
+        // Some search responses use compact list renderers for playlists.
+        val listItems = mutableListOf<JSONObject>()
+        collect(json, "musicResponsiveListItemRenderer", listItems)
+        return listItems.mapIndexedNotNull { index, row -> parseCommunityPlaylist(row, index) }
+            .distinctBy { it.playlistId }
+    }
+
+    private fun parseCommunityPlaylist(row: JSONObject, index: Int): SongItemClean? {
+        val flex = row.optJSONArray("flexColumns")
+        fun columnText(index: Int): String {
+            val text = flex?.optJSONObject(index)
+                ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
+            return text?.optString("simpleText")?.takeIf(String::isNotBlank)
+                ?: runsText(text).joinToString("")
+        }
+        val titleNode = row.optJSONObject("title")
+        val title = titleNode?.optString("simpleText")?.takeIf(String::isNotBlank)
+            ?: runsText(titleNode).joinToString("").takeIf(String::isNotBlank)
+            ?: columnText(0).takeIf(String::isNotBlank)
+            ?: return null
+
+        val navigation = row.optJSONObject("navigationEndpoint")
+        val playNavigation = row.optJSONObject("overlay")
+            ?.optJSONObject("musicItemThumbnailOverlayRenderer")
+            ?.optJSONObject("content")?.optJSONObject("musicPlayButtonRenderer")
+            ?.optJSONObject("playNavigationEndpoint")
+        val playlistId = sequenceOf(
+            navigation?.optJSONObject("watchEndpoint")?.optString("playlistId"),
+            navigation?.optJSONObject("watchPlaylistEndpoint")?.optString("playlistId"),
+            navigation?.optJSONObject("browseEndpoint")?.optString("browseId"),
+            playNavigation?.optJSONObject("watchEndpoint")?.optString("playlistId"),
+            playNavigation?.optJSONObject("watchPlaylistEndpoint")?.optString("playlistId"),
+            row.optJSONObject("playlistItemData")?.optString("playlistId")
+        ).filterNotNull().firstOrNull { it.isNotBlank() && it != "null" }
+            ?.removePrefix("VL")
+            ?.takeIf { it.startsWith("PL") || it.startsWith("OLAK5uy_") || it.startsWith("RD") }
+            ?: return null
+        val subtitleNode = row.optJSONObject("subtitle")
+        val subtitle = subtitleNode?.optString("simpleText")?.takeIf(String::isNotBlank)
+            ?: runsText(subtitleNode).joinToString("").ifBlank { columnText(1) }
+        val thumbnailContainer = row.optJSONObject("thumbnailRenderer")
+            ?.optJSONObject("musicThumbnailRenderer")?.optJSONObject("thumbnail")
+            ?: row.optJSONObject("thumbnail")?.optJSONObject("musicThumbnailRenderer")?.optJSONObject("thumbnail")
+        val thumbnail = bestThumb(thumbnailContainer)
+        return SongItemClean(
+            id = "pl_$playlistId",
+            playlistId = playlistId,
+            title = title,
+            artist = subtitle.ifBlank { "Community playlist" },
+            album = "Community playlist",
+            coverUrl = thumbnail,
+            themeColor = paletteColors[index % paletteColors.size]
+        )
+    }
+
     fun fetchHome(): List<HomeShelf> {
         val shelves = mutableListOf<HomeShelf>()
         var json = ytMusicPost("browse", JSONObject().put("browseId", "FEmusic_home"))
@@ -168,27 +349,78 @@ object YtRepo {
     }
 
     fun fetchPlaylistTracks(playlistId: String): List<SongItemClean> {
-        val json = ytMusicPost(
+        var json: JSONObject? = ytMusicPost(
             "next",
             JSONObject().put("playlistId", playlistId)
                 .put("enablePersistentPlaylistPanel", true)
                 .put("isAudioOnly", true)
         ) ?: return emptyList()
-        val nodes = mutableListOf<JSONObject>()
-        collect(json, "playlistPanelVideoRenderer", nodes)
-        return nodes.mapIndexedNotNull { idx, r ->
-            val vid = r.optString("videoId")
-            if (vid.isEmpty()) return@mapIndexedNotNull null
-            val title = runsText(r.optJSONObject("title")).firstOrNull() ?: return@mapIndexedNotNull null
-            val artist = runsText(r.optJSONObject("longBylineText")).firstOrNull() ?: "Unknown"
-            val dur = parseDuration(runsText(r.optJSONObject("lengthText")).firstOrNull().orEmpty())
-            SongItemClean(
-                id = vid, videoId = vid, title = title, artist = artist, album = "YouTube Music",
-                coverUrl = bestThumb(r.optJSONObject("thumbnail")),
-                themeColor = paletteColors[idx % paletteColors.size],
-                durationMs = dur,
-                isExplicit = r.toString().contains("explicit", ignoreCase = true),
+        val tracks = mutableListOf<SongItemClean>()
+        var pages = 0
+        while (json != null && pages < 20) {
+            val nodes = mutableListOf<JSONObject>()
+            collect(json, "playlistPanelVideoRenderer", nodes)
+            nodes.forEach { row ->
+                val videoId = row.optString("videoId")
+                val title = runsText(row.optJSONObject("title")).firstOrNull()
+                if (videoId.isNotBlank() && title != null) {
+                    val artist = runsText(row.optJSONObject("longBylineText")).firstOrNull() ?: "Unknown"
+                    tracks += SongItemClean(
+                        id = videoId, videoId = videoId, title = title, artist = artist, album = "YouTube Music",
+                        coverUrl = bestThumb(row.optJSONObject("thumbnail")),
+                        themeColor = paletteColors[tracks.size % paletteColors.size],
+                        durationMs = parseDuration(runsText(row.optJSONObject("lengthText")).firstOrNull().orEmpty()),
+                        isExplicit = row.toString().contains("explicit", ignoreCase = true)
+                    )
+                }
+            }
+            val nextTokens = mutableListOf<JSONObject>()
+            collect(json, "nextContinuationData", nextTokens)
+            val continuation = nextTokens.firstOrNull()?.optString("continuation").orEmpty()
+            if (continuation.isBlank()) break
+            val encoded = URLEncoder.encode(continuation, "UTF-8")
+            json = ytMusicPost(
+                "next",
+                JSONObject().put("playlistId", playlistId).put("continuation", continuation)
+                    .put("enablePersistentPlaylistPanel", true).put("isAudioOnly", true),
+                "&ctoken=$encoded&continuation=$encoded&type=next"
             )
+            pages++
+        }
+        return tracks.distinctBy { it.videoId }
+    }
+
+    /** Best-effort YouTube Music lyrics lookup via the song's Lyrics browse tab. */
+    fun fetchLyrics(song: SongItemClean): List<LyricLine> {
+        if (song.videoId.isBlank()) return emptyList()
+        val next = ytMusicPost(
+            "next",
+            JSONObject().put("videoId", song.videoId).put("isAudioOnly", true)
+        ) ?: return emptyList()
+        val tabs = mutableListOf<JSONObject>()
+        collect(next, "tabRenderer", tabs)
+        var browseId = tabs.firstNotNullOfOrNull { tab ->
+            val title = tab.optJSONObject("title")?.optString("simpleText")
+                ?: runsText(tab.optJSONObject("title")).joinToString("")
+            if (title.contains("lyrics", ignoreCase = true)) {
+                tab.optJSONObject("endpoint")?.optJSONObject("browseEndpoint")?.optString("browseId")
+            } else null
+        }.orEmpty()
+        if (browseId.isBlank()) {
+            val endpoints = mutableListOf<JSONObject>()
+            collect(next, "browseEndpoint", endpoints)
+            browseId = endpoints.firstOrNull { it.optString("browseId").startsWith("MPLYt") }
+                ?.optString("browseId").orEmpty()
+        }
+        if (browseId.isBlank()) return emptyList()
+        val response = ytMusicPost("browse", JSONObject().put("browseId", browseId)) ?: return emptyList()
+        val lyricRows = mutableListOf<JSONObject>()
+        collect(response, "lyricLineRenderer", lyricRows)
+        return lyricRows.mapNotNull { row ->
+            val textNode = row.optJSONObject("text")
+            val text = textNode?.optString("simpleText")
+                ?: runsText(textNode).joinToString("")
+            text.trim().takeIf(String::isNotBlank)?.let { LyricLine(-1L, it) }
         }
     }
 
@@ -218,7 +450,10 @@ object YtRepo {
                 ?: return null
             val fmt = if (best.format?.name?.lowercase()?.contains("opus") == true) "Opus" else "AAC"
             val kbps = (best.averageBitrate / 1000).coerceAtLeast(128)
-            StreamInfo(best.content, "$fmt • 48.0 kHz • $kbps kbps • Stereo", userAgentFor(best.content))
+            StreamInfo(
+                best.content, "$fmt • 48.0 kHz • $kbps kbps • Stereo", userAgentFor(best.content),
+                bitrateKbps = kbps
+            )
         } catch (e: Exception) {
             Log.e(TAG, "NewPipe stream extract failed for $videoId", e)
             null
@@ -284,7 +519,9 @@ object YtRepo {
                         else "AAC • 44.1 kHz • $kbps kbps • Stereo"
                     }
                 }
-                if (bestUrl.isNotEmpty()) return StreamInfo(bestUrl, label, client.userAgent)
+                if (bestUrl.isNotEmpty()) return StreamInfo(
+                    bestUrl, label, client.userAgent, bitrateKbps = bestBitrate / 1_000
+                )
             } catch (e: Exception) {
                 Log.e(TAG, "player(${client.name}) failed", e)
             }
@@ -370,7 +607,9 @@ object YtRepo {
         val playlistId = watch?.optString("playlistId").orEmpty()
             .ifEmpty { play?.optJSONObject("watchPlaylistEndpoint")?.optString("playlistId").orEmpty() }
             .ifEmpty { nav?.optJSONObject("watchPlaylistEndpoint")?.optString("playlistId").orEmpty() }
-        if (videoId.isEmpty() && playlistId.isEmpty()) return null
+        val albumBrowseId = nav?.optJSONObject("browseEndpoint")?.optString("browseId").orEmpty()
+            .ifBlank { r.optJSONObject("navigationEndpoint")?.optJSONObject("browseEndpoint")?.optString("browseId").orEmpty() }
+        if (videoId.isEmpty() && playlistId.isEmpty() && albumBrowseId.isEmpty()) return null
 
         val subtitle = runsText(r.optJSONObject("subtitle")).joinToString("").trim()
         val thumb = bestThumb(
@@ -379,8 +618,9 @@ object YtRepo {
         )
 
         return SongItemClean(
-            id = videoId.ifEmpty { "pl_$playlistId" },
+            id = videoId.ifEmpty { playlistId.takeIf { it.isNotBlank() }?.let { "pl_$it" } ?: "album_$albumBrowseId" },
             videoId = videoId, playlistId = playlistId,
+            albumBrowseId = albumBrowseId,
             title = title, artist = subtitle.ifEmpty { "YouTube Music" }, album = "YouTube Music",
             coverUrl = thumb.ifEmpty { "https://i.ytimg.com/vi/$videoId/hqdefault.jpg" },
             themeColor = paletteColors[idx % paletteColors.size],

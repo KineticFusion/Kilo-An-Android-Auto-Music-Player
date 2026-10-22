@@ -1,6 +1,7 @@
 package com.example.kilo
 
 import android.content.Context
+import com.example.kilo.streaming.StreamInfo
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
@@ -141,7 +142,12 @@ object LosslessSource {
                 if (sampleRate > 0) append(" • ${sampleRate / 1000.0} kHz")
                 append(" • Lossless")
             }
-            StreamInfo(streamUrl, label, UA, headers).also {
+            StreamInfo(
+                streamUrl, label, UA, headers,
+                bitrateKbps = stream.optInt("bitrate", 0) / 1_000,
+                durationMs = song.durationMs,
+                expiresAtEpochMs = System.currentTimeMillis() + 240_000L
+            ).also {
                 resolved[mediaId] = Resolved(it, System.currentTimeMillis() + 240_000L)
                 misses.remove(mediaId)
             }

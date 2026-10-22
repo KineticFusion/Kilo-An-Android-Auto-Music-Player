@@ -1,6 +1,6 @@
 @file:OptIn(androidx.media3.common.util.UnstableApi::class)
 
-package com.example.kilo
+package com.example.kilo.streaming
 
 import android.content.Context
 import android.net.Uri
@@ -57,18 +57,16 @@ object FastStream {
         )
     )
 
-    private class Cached(val info: StreamInfo, val expiresAt: Long)
-
-    private val cache = ConcurrentHashMap<String, Cached>()
+    private val cache = ResolvedStreamCache()
     private val inflight = ConcurrentHashMap<String, FutureTask<StreamInfo?>>()
     private val preferFallbackOnNextResolve = ConcurrentHashMap<String, Boolean>()
     private val pool = Executors.newCachedThreadPool()
 
     fun peek(videoId: String): StreamInfo? =
-        cache[videoId]?.takeIf { it.expiresAt > System.currentTimeMillis() }?.info
+        cache.get(videoId)
 
     fun invalidate(videoId: String) {
-        cache.remove(videoId)
+        cache.invalidate(videoId)
         // If this stream failed, try the NewPipe/legacy resolver on the next
         // request instead of selecting the same fast-client URL again.
         preferFallbackOnNextResolve[videoId] = true
@@ -85,14 +83,14 @@ object FastStream {
         }
     }
 
-    fun get(videoId: String, fallback: (String) -> StreamInfo?): StreamInfo? {
+    fun get(videoId: String, fallback: (String) -> StreamInfo?, context: Context? = null): StreamInfo? {
         peek(videoId)?.let { return it }
         var owner = false
         val task = inflight.computeIfAbsent(videoId) {
             owner = true
             FutureTask<StreamInfo?>(Callable {
-                resolve(videoId, fallback)?.also { resolved ->
-                    cache[videoId] = Cached(resolved, expiryOf(resolved.url))
+                resolve(videoId, fallback, AdaptiveBitrateManager.targetAudioBitrateKbps(context))?.also { resolved ->
+                    cache.put(videoId, resolved, expiryOf(resolved.url))
                 }
             })
         }
@@ -117,12 +115,12 @@ object FastStream {
         }
     }
 
-    private fun resolve(videoId: String, fallback: (String) -> StreamInfo?): StreamInfo? {
+    private fun resolve(videoId: String, fallback: (String) -> StreamInfo?, targetBitrateKbps: Int): StreamInfo? {
         if (preferFallbackOnNextResolve.remove(videoId) == true) {
             fallback(videoId)?.let { return it }
         }
         val calls = clients.map { c ->
-            Callable<StreamInfo> { fromClient(c, videoId) ?: throw IOException("${c.name}: no stream") }
+            Callable<StreamInfo> { fromClient(c, videoId, targetBitrateKbps) ?: throw IOException("${c.name}: no stream") }
         }
         val fast = try {
             // Prefetch normally fills this cache before a tap. Keep a bounded
@@ -135,7 +133,7 @@ object FastStream {
         return fallback(videoId)
     }
 
-    private fun fromClient(client: Client, videoId: String): StreamInfo? {
+    private fun fromClient(client: Client, videoId: String, targetBitrateKbps: Int): StreamInfo? {
         val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
             .openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -169,10 +167,8 @@ object FastStream {
         if (res.optJSONObject("playabilityStatus")?.optString("status") != "OK") return null
         val formats = res.optJSONObject("streamingData")?.optJSONArray("adaptiveFormats") ?: return null
 
-        var bestUrl = ""
-        var bestRank = -1
-        var bestBitrate = -1
-        var label = ""
+        data class AudioCandidate(val url: String, val rank: Int, val bitrate: Int, val label: String)
+        val candidates = mutableListOf<AudioCandidate>()
         for (i in 0 until formats.length()) {
             val f = formats.getJSONObject(i)
             val mime = f.optString("mimeType")
@@ -184,16 +180,18 @@ object FastStream {
                 mime.contains("opus") -> 1
                 else -> 0
             }
-            if (rank > bestRank || (rank == bestRank && bitrate > bestBitrate)) {
-                bestRank = rank
-                bestBitrate = bitrate
-                bestUrl = url
-                val kbps = (bitrate / 1000).coerceAtLeast(48)
-                label = if (rank == 1) "Opus • 48.0 kHz • $kbps kbps • Stereo"
-                else "AAC • 44.1 kHz • $kbps kbps • Stereo"
-            }
+            val kbps = (bitrate / 1000).coerceAtLeast(48)
+            val label = if (rank == 1) "Opus • 48.0 kHz • $kbps kbps • Stereo"
+            else "AAC • 44.1 kHz • $kbps kbps • Stereo"
+            candidates += AudioCandidate(url, rank, bitrate, label)
         }
-        return if (bestUrl.isNotEmpty()) StreamInfo(bestUrl, label, client.userAgent) else null
+        val ceiling = targetBitrateKbps * 1_000
+        val selected = candidates.filter { it.bitrate <= ceiling }
+            .maxWithOrNull(compareBy<AudioCandidate> { it.bitrate }.thenBy { it.rank })
+            ?: candidates.minByOrNull { it.bitrate }
+        return selected?.let {
+            StreamInfo(it.url, it.label, client.userAgent, bitrateKbps = it.bitrate / 1_000)
+        }
     }
 }
 

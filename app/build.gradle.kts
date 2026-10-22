@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 3
-        versionName = "1.5.0"
+        versionCode = 4
+        versionName = "1.5.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -45,6 +45,7 @@ android {
         implementation(libs.androidx.compose.ui.graphics)
         implementation(libs.androidx.compose.ui.tooling.preview)
         implementation(libs.androidx.core.ktx)
+        implementation(project(":core-streaming"))
         implementation(libs.androidx.lifecycle.runtime.ktx)
         testImplementation(libs.junit)
         androidTestImplementation(platform(libs.androidx.compose.bom))
@@ -58,6 +59,7 @@ android {
         implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.5")
         implementation("androidx.compose.material:material-icons-extended")
         implementation("androidx.media3:media3-exoplayer:1.4.1")
+        implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
         implementation("androidx.media3:media3-exoplayer-dash:1.4.1")
         implementation("androidx.media3:media3-common:1.4.1")
         implementation("androidx.media3:media3-datasource:1.4.1")

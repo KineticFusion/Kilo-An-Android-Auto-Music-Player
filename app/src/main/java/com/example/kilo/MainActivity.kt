@@ -25,6 +25,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -76,6 +77,8 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -93,6 +96,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
+import com.example.kilo.streaming.*
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -218,6 +222,7 @@ data class SongItemClean(
     val id: String,
     val videoId: String = "",
     val playlistId: String = "",
+    val albumBrowseId: String = "",
     val title: String,
     val artist: String,
     val album: String,
@@ -231,12 +236,7 @@ data class SongItemClean(
 )
 
 data class HomeShelf(val title: String, val songs: List<SongItemClean>, val isList: Boolean)
-data class StreamInfo(
-    val url: String,
-    val codec: String,
-    val userAgent: String,
-    val requestHeaders: Map<String, String> = emptyMap()
-)
+data class ArtistItem(val id: String, val name: String, val subtitle: String, val coverUrl: String)
 data class VideoStreamInfo(
     val videoUrl: String,
     val audioUrl: String?,
@@ -353,7 +353,8 @@ private fun primaryPanelColor(skin: SkinTheme): Color = when (skin.layoutFamily)
 }
 
 enum class ScreenNav {
-    HOME, EXPLORE, LIBRARY, SEARCH, OFFLINE, RADIO, SETTINGS, APP_APPEARANCE, ANDROID_AUTO_SETTINGS, PLAYER_STYLES
+    HOME, EXPLORE, LIBRARY, SEARCH, OFFLINE, RADIO, SETTINGS, APP_APPEARANCE, ANDROID_AUTO_SETTINGS,
+    PLAYER_STYLES, EQUALIZER, V2_ROADMAP, ARTIST_DETAIL
 }
 
 enum class OverlayTab {
@@ -486,6 +487,13 @@ data class AppStateModel(
     val homeShelves: List<HomeShelf> = emptyList(),
     val searchQuery: String = "",
     val searchResults: List<SongItemClean> = emptyList(),
+    val artistSearchResults: List<ArtistItem> = emptyList(),
+    val activeArtist: ArtistItem? = null,
+    val artistAlbums: List<SongItemClean> = emptyList(),
+    val artistSongs: List<SongItemClean> = emptyList(),
+    val selectedArtistAlbumTitle: String? = null,
+    val musicRegionCode: String = "AUTO",
+    val communityPlaylistResults: List<SongItemClean> = emptyList(),
     val libraryTab: Int = 0,
     val currentIndex: Int = 0,
     val isPlaying: Boolean = false,
@@ -508,6 +516,13 @@ data class AppStateModel(
     val radioSleepTimerMinutes: Int? = null,
     val isRadioRecording: Boolean = false,
     val isSearching: Boolean = false,
+    val equalizerSnapshot: EqualizerSnapshot = EqualizerSnapshot(),
+    val isCheckingForUpdates: Boolean = false,
+    val updateCheckMessage: String = "Not checked yet",
+    val latestReleaseUrl: String = "",
+    val latestApkUrl: String = "",
+    val latestReleaseTitle: String = "",
+    val updateAvailable: Boolean = false,
     val currentScreen: ScreenNav = ScreenNav.HOME
 ) {
     val activeSong: SongItemClean
@@ -670,7 +685,7 @@ object dYtRepo {
     }
 
     fun fetchStream(videoId: String): StreamInfo? {
-        return FastStream.get(videoId) { id -> fetchStreamNewPipe(id) }
+        return FastStream.get(videoId, fallback = { id: String -> fetchStreamNewPipe(id) })
     }
 
     private fun userAgentFor(url: String): String {
@@ -695,7 +710,10 @@ object dYtRepo {
                 ?: return null
             val kbps = if (best.averageBitrate > 0) best.averageBitrate / 1000 else 128
             val fmt = best.format?.getName().orEmpty().ifEmpty { "AAC" }
-            StreamInfo(best.content, "$fmt • $kbps kbps • Stereo", userAgentFor(best.content))
+            StreamInfo(
+                best.content, "$fmt • $kbps kbps • Stereo", userAgentFor(best.content),
+                bitrateKbps = kbps
+            )
         } catch (e: Exception) {
             Log.e(TAG, "NewPipe extraction failed for $videoId", e)
             null
@@ -833,6 +851,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _state = MutableStateFlow(AppStateModel())
     val state: StateFlow<AppStateModel> = _state.asStateFlow()
     private val preferences = application.getSharedPreferences("vybe_app_settings", Application.MODE_PRIVATE)
+    private val equalizerController = EqualizerController(preferences)
+    private val screenBackStack = ArrayDeque<ScreenNav>()
 
     private val favoriteListener: () -> Unit = {
         _state.value = _state.value.copy(favoriteIds = Favorites.ids())
@@ -844,7 +864,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var radioRecordingJob: Job? = null
     private var videoJob: Job? = null
     private var mixFadeJob: Job? = null
+    private var mixTransitionJob: Job? = null
     private var autoMixFadedSongId: String? = null
+    private var pendingSeekStartedAtMs: Long? = null
+    private var pendingSeekTargetMs: Long = 0L
+    private var pendingSeekWasPlaying = false
+    private var pendingSeekDiscontinuity = false
     private val earlyEndRetries = mutableSetOf<String>()
     private var advertisedAudioEffectSessionId = C.AUDIO_SESSION_ID_UNSET
 
@@ -852,11 +877,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val playbackListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
+            val currentMediaId = player.currentMediaItem?.mediaId.orEmpty()
+            val radio = currentMediaId.startsWith("radio:")
+            Log.d(
+                if (radio) "KiloRadio" else "SeekBenchmark",
+                "state=${playbackStateName(playbackState)} mediaId=$currentMediaId position=${player.currentPosition}ms " +
+                    "buffered=${(player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)}ms " +
+                    "bandwidth=${PlayerHolder.estimatedBandwidthKbps()}kbps " +
+                    "playWhenReady=${player.playWhenReady} isPlaying=${player.isPlaying}"
+            )
             _state.value = _state.value.copy(
                 isLoadingStream = playbackState == Player.STATE_BUFFERING && player.playWhenReady,
                 isPlaying = player.isPlaying
             )
+            if (playbackState == Player.STATE_READY && player.playWhenReady && player.volume < 0.99f) {
+                // Auto Mix fades can be interrupted by a track change. Recover the
+                // shared player volume as soon as the new item is ready.
+                fadePlayerVolume(1f, 500L, _state.value.activeSong.id)
+            }
             updateAudioEffectSession(player.playWhenReady && playbackState in listOf(Player.STATE_BUFFERING, Player.STATE_READY))
+            finishSeekMeasurementIfReady()
+        }
+
+        override fun onPositionDiscontinuity(
+            oldPosition: Player.PositionInfo,
+            newPosition: Player.PositionInfo,
+            reason: Int
+        ) {
+            if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                pendingSeekDiscontinuity = true
+                Log.d(
+                    "SeekBenchmark",
+                    "position discontinuity reason=SEEK from=${oldPosition.positionMs}ms " +
+                        "to=${newPosition.positionMs}ms requested=${pendingSeekTargetMs}ms"
+                )
+                finishSeekMeasurementIfReady()
+            }
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -872,6 +928,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                     val previousIndex = _state.value.currentIndex
                     if (earlyEndRetries.add(previousSong.id)) {
+                        // Rebuild the affected MediaSource on retry. Reusing the
+                        // prepared queue here would keep its already-resolved URL,
+                        // defeating the stream invalidation above.
+                        LosslessSource.invalidate(previousSong.videoId.ifBlank { previousSong.id })
                         FastStream.invalidate(previousSong.videoId)
                         loadTrack(previousIndex, autoPlay = true, retryingEarlyEnd = true)
                     } else {
@@ -916,12 +976,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     currentIndex = idx
                 )
             }
+            val activeSong = _state.value.activeSong
+            if (_state.value.autoMixEnabled && player.playWhenReady && player.volume < 0.99f) {
+                fadePlayerVolume(1f, 700L, activeSong.id)
+            } else if (!_state.value.autoMixEnabled && player.volume <= 0.001f) {
+                // A cancelled transition fade must not leave later tracks silent.
+                player.volume = 1f
+            }
             // An automatic transition means the user was listening through the previous track.
             // Keep playback intent across track boundaries, including when a stream briefly buffers.
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) player.play()
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
+            Log.d("SeekBenchmark", "isPlaying=$isPlaying position=${player.currentPosition}ms")
+            finishSeekMeasurementIfReady()
             _state.value = _state.value.copy(isPlaying = isPlaying)
             if (isPlaying) {
                 val playingId = _state.value.activeSong.id
@@ -934,6 +1003,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            val radio = player.currentMediaItem?.mediaId.orEmpty().startsWith("radio:")
+            Log.e(if (radio) "KiloRadio" else "SeekBenchmark", "player error ${error.errorCodeName} at ${player.currentPosition}ms", error)
             val song = _state.value.activeSong
             val retrying = PlayerHolder.isRetrying(song.videoId.ifBlank { song.id })
             _state.value = _state.value.copy(isPlaying = false, isLoadingStream = retrying)
@@ -943,7 +1014,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun finishSeekMeasurementIfReady() {
+        val startedAt = pendingSeekStartedAtMs ?: return
+        if (!pendingSeekDiscontinuity || player.playbackState != Player.STATE_READY) return
+        if (pendingSeekWasPlaying && !player.isPlaying) return
+        Log.d(
+            "SeekBenchmark",
+            "seek complete target=${pendingSeekTargetMs}ms actual=${player.currentPosition}ms " +
+                "latency=${System.currentTimeMillis() - startedAt}ms " +
+                "buffered=${(player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)}ms"
+        )
+        pendingSeekStartedAtMs = null
+        pendingSeekDiscontinuity = false
+    }
+
+    private fun playbackStateName(state: Int): String = when (state) {
+        Player.STATE_IDLE -> "IDLE"
+        Player.STATE_BUFFERING -> "BUFFERING"
+        Player.STATE_READY -> "READY"
+        Player.STATE_ENDED -> "ENDED"
+        else -> "UNKNOWN($state)"
+    }
+
     init {
+        LyricsRepository.loadProviderOrder(application)
         PlayedSongHistory.init(application)
         Favorites.init(application)
         Favorites.addListener(favoriteListener)
@@ -984,6 +1078,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             losslessSourceHasToken = LosslessSource.hasToken(application),
             losslessSourceStatus = preferences.getString("lossless_source_status", "Optional: connect a compatible FLAC source") ?: "Optional: connect a compatible FLAC source"
         )
+        val savedRegion = preferences.getString("music_region_code", "AUTO") ?: "AUTO"
+        YtRepo.setRegionCode(savedRegion)
+        _state.value = _state.value.copy(musicRegionCode = savedRegion)
 
         try {
             NewPipe.init(
@@ -1058,6 +1155,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun loadHome() {
         viewModelScope.launch {
+            if (!_state.value.isLoggedIn) {
+                HomeCache.set(emptyList())
+                _state.value = _state.value.copy(
+                    homeShelves = emptyList(), quickPicks = emptyList(), playlist = emptyList(),
+                    currentIndex = 0, isSearching = false
+                )
+                return@launch
+            }
             _state.value = _state.value.copy(isSearching = true)
             val launchNumber = preferences.getInt("home_launch_number", 0) + 1
             preferences.edit().putInt("home_launch_number", launchNumber).apply()
@@ -1123,15 +1228,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(searchQuery = query)
         searchJob?.cancel()
         if (query.isBlank()) {
-            _state.value = _state.value.copy(searchResults = emptyList(), isSearching = false)
+            _state.value = _state.value.copy(
+                searchResults = emptyList(), communityPlaylistResults = emptyList(), artistSearchResults = emptyList(), isSearching = false
+            )
             return
         }
         searchJob = viewModelScope.launch {
             delay(250)
             _state.value = _state.value.copy(isSearching = true)
-            val results = withContext(Dispatchers.IO) { YtRepo.searchSongs(query) }
+            val (results, playlists, artists) = coroutineScope {
+                val songsRequest = async(Dispatchers.IO) { YtRepo.searchSongs(query) }
+                val playlistsRequest = async(Dispatchers.IO) { YtRepo.searchCommunityPlaylists(query) }
+                val artistsRequest = async(Dispatchers.IO) { YtRepo.searchArtists(query) }
+                Triple(songsRequest.await(), playlistsRequest.await(), artistsRequest.await())
+            }
             val visibleResults = results.filter { !_state.value.filterMatureContent || !it.isExplicit }
-        _state.value = _state.value.copy(searchResults = visibleResults, isSearching = false)
+            _state.value = _state.value.copy(
+                searchResults = visibleResults,
+                communityPlaylistResults = playlists,
+                artistSearchResults = artists,
+                isSearching = false
+            )
             results.take(3).forEach { song ->
                 LosslessSource.register(song)
                 song.videoId.takeIf(String::isNotBlank)?.let(::prefetchStream)
@@ -1139,7 +1256,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun openArtist(artist: ArtistItem) {
+        screenBackStack.addLast(ScreenNav.SEARCH)
+        _state.value = _state.value.copy(
+            activeArtist = artist, artistAlbums = emptyList(), artistSongs = emptyList(),
+            selectedArtistAlbumTitle = null, currentScreen = ScreenNav.ARTIST_DETAIL, isSearching = true
+        )
+        viewModelScope.launch {
+            val catalog = withContext(Dispatchers.IO) { YtRepo.fetchArtistCatalog(artist) }
+            if (_state.value.activeArtist?.id != artist.id) return@launch
+            _state.value = _state.value.copy(
+                activeArtist = catalog.first, artistAlbums = catalog.second, artistSongs = catalog.third,
+                isSearching = false
+            )
+        }
+    }
+
+    fun openArtistAlbum(album: SongItemClean) {
+        val artist = _state.value.activeArtist ?: return
+        if (album.albumBrowseId.isBlank()) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(isSearching = true, selectedArtistAlbumTitle = album.title)
+            val tracks = withContext(Dispatchers.IO) { YtRepo.fetchAlbumTracks(album.albumBrowseId, artist.name) }
+            if (_state.value.activeArtist?.id == artist.id) {
+                _state.value = _state.value.copy(artistSongs = tracks, isSearching = false)
+            }
+        }
+    }
+
+    fun showAllArtistSongs() {
+        val artist = _state.value.activeArtist ?: return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(isSearching = true, selectedArtistAlbumTitle = null)
+            val catalog = withContext(Dispatchers.IO) { YtRepo.fetchArtistCatalog(artist) }
+            if (_state.value.activeArtist?.id == artist.id) {
+                _state.value = _state.value.copy(artistSongs = catalog.third, isSearching = false)
+            }
+        }
+    }
+
+    fun setMusicRegion(code: String) {
+        val normalized = code.uppercase().takeIf { it == "AUTO" || it.matches(Regex("[A-Z]{2}")) } ?: "AUTO"
+        preferences.edit().putString("music_region_code", normalized).apply()
+        YtRepo.setRegionCode(normalized)
+        _state.value = _state.value.copy(musicRegionCode = normalized)
+        reloadHome()
+    }
+
     fun playSongFromShelf(song: SongItemClean, shelfList: List<SongItemClean>) {
+        if (song.videoId.isEmpty() && song.albumBrowseId.isNotEmpty()) {
+            viewModelScope.launch {
+                _state.value = _state.value.copy(isLoadingStream = true)
+                val tracks = withContext(Dispatchers.IO) { YtRepo.fetchAlbumTracks(song.albumBrowseId, song.artist) }
+                if (tracks.isNotEmpty()) {
+                    _state.value = _state.value.copy(playlist = tracks, currentIndex = 0)
+                    loadTrack(0, autoPlay = true)
+                } else {
+                    _state.value = _state.value.copy(isLoadingStream = false)
+                    Toast.makeText(getApplication(), "Could not load ${song.title}", Toast.LENGTH_SHORT).show()
+                }
+            }
+            return
+        }
         if (song.videoId.isEmpty() && song.playlistId.isNotEmpty()) {
             viewModelScope.launch {
                 _state.value = _state.value.copy(isLoadingStream = true)
@@ -1183,8 +1361,7 @@ _state.value = _state.value.copy(
         // Keep Media3's existing timeline for skips within the same queue. Replacing
         // all media items forces another source resolution and creates an avoidable
         // buffering gap on every manual next/previous tap.
-        val queueIsPrepared = player.playbackState == Player.STATE_READY ||
-            player.playbackState == Player.STATE_BUFFERING
+        val queueIsPrepared = !retryingEarlyEnd && player.playbackState == Player.STATE_READY
         val queueAlreadyLoaded = queueIsPrepared && player.mediaItemCount == list.size &&
             (0 until player.mediaItemCount).all { mediaIndex ->
                 val expectedId = list[mediaIndex].videoId.ifBlank { list[mediaIndex].id }
@@ -1251,8 +1428,9 @@ _state.value = _state.value.copy(
             loadTrack(index, autoPlay = true)
             return
         }
+        mixTransitionJob?.cancel()
         fadePlayerVolume(0f, 300L, songId)
-        viewModelScope.launch {
+        mixTransitionJob = viewModelScope.launch {
             mixFadeJob?.join()
             if (_state.value.activeSong.id == songId) loadTrack(index, autoPlay = true)
         }
@@ -1270,9 +1448,27 @@ _state.value = _state.value.copy(
 
     fun seekTo(frac: Float) {
         val dur = if (player.duration > 0) player.duration else _state.value.currentDurationMs
-        val target = (dur * frac).toLong()
+        if (dur <= 0L || player.currentMediaItem == null) return
+        val target = (dur * frac.coerceIn(0f, 1f)).toLong().coerceIn(0L, dur)
+        val shouldResume = player.playWhenReady
+        pendingSeekStartedAtMs = System.currentTimeMillis()
+        pendingSeekTargetMs = target
+        pendingSeekWasPlaying = shouldResume
+        pendingSeekDiscontinuity = false
+        Log.d(
+            "SeekBenchmark",
+            "seek requested from=${player.currentPosition}ms to=${target}ms " +
+                "buffered=${(player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)}ms " +
+                "playWhenReady=$shouldResume"
+        )
+        // A manual seek overrides any in-progress Auto Mix fade or pending skip.
+        mixTransitionJob?.cancel()
+        mixFadeJob?.cancel()
+        autoMixFadedSongId = null
+        player.volume = 1f
         player.seekTo(target)
-        _state.value = _state.value.copy(progress = frac, currentPosMs = target)
+        if (shouldResume) player.play()
+        _state.value = _state.value.copy(progress = target.toFloat() / dur.toFloat(), currentPosMs = target)
     }
 
     fun closeAppCompletely() {
@@ -1372,7 +1568,12 @@ _state.value = _state.value.copy(
         mixFadeJob = viewModelScope.launch {
             val steps = (durationMs / 50L).coerceAtLeast(1L)
             for (step in 1L..steps) {
-                if (_state.value.activeSong.id != songId) return@launch
+                if (_state.value.activeSong.id != songId) {
+                    // The fade owner changed tracks. Do not strand the new track
+                    // at the previous track's fade-out volume.
+                    if (_state.value.autoMixEnabled && player.playWhenReady) player.volume = 1f
+                    return@launch
+                }
                 val fraction = step.toFloat() / steps.toFloat()
                 player.volume = from + (to - from) * fraction
                 delay(50)
@@ -1658,6 +1859,67 @@ _state.value = _state.value.copy(
         val nextId = if (open) player.audioSessionId else C.AUDIO_SESSION_ID_UNSET
         if (nextId == advertisedAudioEffectSessionId) return
         advertisedAudioEffectSessionId = if (nextId > 0) nextId else C.AUDIO_SESSION_ID_UNSET
+        if (nextId > 0) {
+            _state.value = _state.value.copy(equalizerSnapshot = equalizerController.attach(nextId))
+        }
+    }
+
+    fun openEqualizer() {
+        val sessionId = player.audioSessionId
+        val snapshot = if (sessionId > 0) equalizerController.attach(sessionId) else EqualizerSnapshot()
+        _state.value = _state.value.copy(equalizerSnapshot = snapshot)
+        setScreen(ScreenNav.EQUALIZER)
+    }
+
+    fun setEqualizerEnabled(enabled: Boolean) {
+        _state.value = _state.value.copy(equalizerSnapshot = equalizerController.setEnabled(enabled))
+    }
+
+    fun setEqualizerBand(index: Int, levelMilliBels: Int) {
+        _state.value = _state.value.copy(equalizerSnapshot = equalizerController.setBandLevel(index, levelMilliBels))
+    }
+
+    fun applyEqualizerPreset(index: Int) {
+        _state.value = _state.value.copy(equalizerSnapshot = equalizerController.applyPreset(index))
+    }
+
+    fun checkForUpdates() {
+        if (_state.value.isCheckingForUpdates) return
+        viewModelScope.launch {
+            _state.value = _state.value.copy(isCheckingForUpdates = true, updateCheckMessage = "Checking GitHub releases…")
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    val installedVersion = getApplication<Application>().packageManager
+                        .getPackageInfo(getApplication<Application>().packageName, 0).versionName ?: "0"
+                    GitHubUpdateChecker.check(installedVersion)
+                }
+            }
+            result.onSuccess { release ->
+                _state.value = _state.value.copy(
+                    isCheckingForUpdates = false,
+                    updateAvailable = release.isUpdateAvailable,
+                    updateCheckMessage = if (release.isUpdateAvailable) "${release.title} is available" else "You’re on the latest release (${release.tagName}).",
+                    latestReleaseUrl = release.releaseUrl,
+                    latestApkUrl = release.apkUrl.orEmpty(),
+                    latestReleaseTitle = release.title
+                )
+            }.onFailure { error ->
+                _state.value = _state.value.copy(
+                    isCheckingForUpdates = false,
+                    updateCheckMessage = "Couldn’t check GitHub: ${error.localizedMessage ?: "connection failed"}"
+                )
+            }
+        }
+    }
+
+    fun openReleaseUrl(url: String) {
+        if (url.isBlank()) return
+        runCatching {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            getApplication<Application>().startActivity(intent)
+        }.onFailure {
+            Toast.makeText(getApplication<Application>(), "Could not open GitHub release", Toast.LENGTH_SHORT).show()
+        }
     }
 
     fun openSystemEqualizer() {
@@ -1690,13 +1952,14 @@ _state.value = _state.value.copy(
             try {
                 startPlaybackService()
                 val dataSourceFactory = DefaultHttpDataSource.Factory()
-                    .setUserAgent("Kilo/1.5.0 (Android Internet Radio)")
+                    .setUserAgent("Kilo/1.5.5 (Android Internet Radio)")
                     .setAllowCrossProtocolRedirects(true)
                     .setConnectTimeoutMs(15_000)
                     .setReadTimeoutMs(30_000)
                 val item = MediaItem.Builder()
                     .setMediaId(song.id)
                     .setUri(station.streamUrl)
+                    .setMimeType(if (station.streamUrl.substringBefore('?').endsWith(".m3u8", ignoreCase = true)) "application/x-mpegURL" else null)
                     .setMediaMetadata(
                         androidx.media3.common.MediaMetadata.Builder()
                             .setTitle(station.name)
@@ -1706,7 +1969,12 @@ _state.value = _state.value.copy(
                             .build()
                     )
                     .build()
-                player.setMediaSource(ProgressiveMediaSource.Factory(dataSourceFactory).createMediaSource(item))
+                // Let Media3 choose HLS or progressive playback from the stream URL/MIME type.
+                // Forcing ProgressiveMediaSource breaks stations that serve HLS playlists.
+                val mediaSource = DefaultMediaSourceFactory(dataSourceFactory)
+                    .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(5))
+                    .createMediaSource(item)
+                player.setMediaSource(mediaSource)
                 player.prepare()
                 player.play()
                 _state.value = _state.value.copy(isLoadingStream = true, isPlaying = true)
@@ -1784,7 +2052,7 @@ _state.value = _state.value.copy(
                 val streamConnection = (URL(station.streamUrl).openConnection() as HttpURLConnection).apply {
                     connectTimeout = 15_000
                     readTimeout = 30_000
-                    setRequestProperty("User-Agent", "Kilo/1.5.0 (Android Internet Radio)")
+                    setRequestProperty("User-Agent", "Kilo/1.5.5 (Android Internet Radio)")
                     connect()
                 }
                 connection = streamConnection
@@ -1816,7 +2084,36 @@ _state.value = _state.value.copy(
             }
         }
     }
-    fun setScreen(screen: ScreenNav) { _state.value = _state.value.copy(currentScreen = screen) }
+    fun setScreen(screen: ScreenNav) {
+        val current = _state.value.currentScreen
+        if (screen == current) return
+
+        val topLevelScreens = setOf(
+            ScreenNav.HOME, ScreenNav.EXPLORE, ScreenNav.LIBRARY, ScreenNav.SEARCH,
+            ScreenNav.OFFLINE, ScreenNav.RADIO, ScreenNav.SETTINGS
+        )
+        if (screen in topLevelScreens) {
+            screenBackStack.clear()
+            if (screen != ScreenNav.HOME) screenBackStack.addLast(ScreenNav.HOME)
+        } else {
+            screenBackStack.addLast(current)
+        }
+        _state.value = _state.value.copy(currentScreen = screen)
+    }
+
+    fun handleSystemBack() {
+        val current = _state.value
+        when {
+            current.playerOverlayTab != OverlayTab.NONE -> {
+                _state.value = current.copy(playerOverlayTab = OverlayTab.NONE)
+            }
+            current.isFullScreenPlayerOpen -> setFullScreenPlayer(false)
+            current.currentScreen != ScreenNav.HOME -> {
+                val previous = screenBackStack.removeLastOrNull() ?: ScreenNav.HOME
+                _state.value = current.copy(currentScreen = previous)
+            }
+        }
+    }
 
     fun toggleFavorite(songId: String) {
         val current = _state.value
@@ -1852,7 +2149,7 @@ _state.value = _state.value.copy(
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    var info = FastStream.get(song.videoId) { id -> YtRepo.fetchStream(id) }
+                    var info = FastStream.get(song.videoId, { id -> YtRepo.fetchStream(id) }, getApplication<Application>())
                         ?: error("Could not resolve audio stream")
                     val isM4a = info.codec.contains("m4a", ignoreCase = true) || info.codec.contains("aac", ignoreCase = true)
                     val mime = if (isM4a) "audio/mp4" else "audio/webm"
@@ -1917,7 +2214,7 @@ _state.value = _state.value.copy(
                                 .any { it.message?.contains("403") == true }
                             if (attempt++ > 0 || !wasForbidden) throw error
                             FastStream.invalidate(song.videoId)
-                            info = FastStream.get(song.videoId) { id -> YtRepo.fetchStream(id) }
+                            info = FastStream.get(song.videoId, { id -> YtRepo.fetchStream(id) }, getApplication<Application>())
                                 ?: throw error
                         }
                     }
@@ -2124,6 +2421,7 @@ _state.value = _state.value.copy(
         radioRecordingJob?.cancel()
         player.removeListener(playbackListener)
         updateAudioEffectSession(false)
+        equalizerController.release()
     }
 }
 
@@ -2174,6 +2472,13 @@ fun VybeRootApp(vm: MainViewModel) {
     if (!state.isSetupComplete) {
         BitChordSetupWizard(vm)
     } else {
+        BackHandler(
+            enabled = state.isFullScreenPlayerOpen ||
+                state.playerOverlayTab != OverlayTab.NONE ||
+                state.currentScreen != ScreenNav.HOME
+        ) {
+            vm.handleSystemBack()
+        }
         Box(modifier = Modifier.fillMaxSize()) {
             CompositionLocalProvider(
                 LocalUiCustomizations provides state.uiCustomizations,
@@ -2195,7 +2500,7 @@ fun VybeRootApp(vm: MainViewModel) {
             AlertDialog(
                 onDismissRequest = { showLoginPopup = false },
                 title = { Text("Sync Your YouTube Music", fontWeight = FontWeight.Bold) },
-                text = { Text("Sign in to unlock your personal mixes and cloud playlists, or continue exploring right away.") },
+                text = { Text("Sign in to load music discovery and online playlists. Without signing in, only songs saved in your Offline Vault are available.") },
                 confirmButton = {
                     TextButton(onClick = {
                         showLoginPopup = false
@@ -2206,7 +2511,7 @@ fun VybeRootApp(vm: MainViewModel) {
                 },
                 dismissButton = {
                     TextButton(onClick = { showLoginPopup = false }) {
-                        Text("Explore first", color = Color.Gray)
+                        Text("Offline only", color = Color.Gray)
                     }
                 },
                 containerColor = Color(0xFF14131D),
@@ -2272,6 +2577,9 @@ fun VybeMainScaffold(vm: MainViewModel) {
                     ScreenNav.APP_APPEARANCE -> AppAppearanceScreen(vm)
                     ScreenNav.ANDROID_AUTO_SETTINGS -> AndroidAutoSettingsScreen(vm)
                     ScreenNav.PLAYER_STYLES -> PlayerStylesScreen(vm)
+                    ScreenNav.EQUALIZER -> EqualizerScreen(vm)
+                    ScreenNav.V2_ROADMAP -> V2RoadmapScreen(vm)
+                    ScreenNav.ARTIST_DETAIL -> ArtistDetailScreen(vm)
                 }
             }
 
@@ -2298,6 +2606,38 @@ fun VybeMainScaffold(vm: MainViewModel) {
 }
 
 @Composable
+private fun SignInRequiredContent(vm: MainViewModel, skin: SkinTheme) {
+    val accent = skin.highlight
+    Box(
+        Modifier.fillMaxSize().background(primaryBackdrop(skin)).padding(28.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            Modifier.fillMaxWidth().clip(primaryCardShape(skin)).background(primaryPanelColor(skin))
+                .border(1.dp, accent.copy(alpha = 0.32f), primaryCardShape(skin)).padding(28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Icon(Icons.Default.Public, contentDescription = null, tint = accent, modifier = Modifier.size(48.dp))
+            Text("Sign in to discover music", color = Color.White, fontSize = 23.sp, fontWeight = FontWeight.ExtraBold, textAlign = TextAlign.Center)
+            Text(
+                "Connect YouTube Music to load regional recommendations, artists, albums and playlists. Your Offline Vault stays available for downloaded songs.",
+                color = Color.White.copy(alpha = 0.72f), fontSize = 14.sp, lineHeight = 20.sp, textAlign = TextAlign.Center
+            )
+            Button(
+                onClick = { vm.openWebLogin() },
+                colors = ButtonDefaults.buttonColors(containerColor = accent),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Sign in to YouTube Music", color = Color.Black, fontWeight = FontWeight.ExtraBold)
+            }
+            TextButton(onClick = { vm.setScreen(ScreenNav.OFFLINE) }) {
+                Text("Open Offline Vault", color = accent, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+@Composable
 fun FreshFriendlyHomeScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val skin = state.activeSkin
@@ -2311,6 +2651,11 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
     val songs = shelves.flatMap { it.songs }.distinctBy { it.id }
     val featured = if (state.isPlaying) state.activeSong else songs.firstOrNull()
     val family = skin.layoutFamily
+
+    if (!state.isLoggedIn) {
+        SignInRequiredContent(vm, skin)
+        return
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)),
@@ -3376,6 +3721,11 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
     val skin = state.activeSkin
     val playerStyle = PLAYER_STYLE_PRESETS.firstOrNull { it.id == state.selectedPlayerStyleId } ?: PLAYER_STYLE_PRESETS.first()
     val playerAccent = playerStyle.accent
+    var isSeeking by remember(song.id) { mutableStateOf(false) }
+    var seekProgress by remember(song.id) { mutableFloatStateOf(state.progress) }
+    LaunchedEffect(state.progress, isSeeking) {
+        if (!isSeeking) seekProgress = state.progress
+    }
     val remainingMs = (state.currentDurationMs - state.currentPosMs).coerceAtLeast(0L)
     val familyArtworkSize = when (skin.layoutFamily) { 0 -> 274; 1 -> 232; 2 -> 278; 3 -> 314; else -> 254 }
     val baseArtworkSize = familyArtworkSize + (skin.ordinal % 3 - 1) * 18
@@ -3576,8 +3926,15 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                     Spacer(modifier = Modifier.height(8.dp))
 
                     Slider(
-                        value = state.progress,
-                        onValueChange = { vm.seekTo(it) },
+                        value = if (isSeeking) seekProgress else state.progress,
+                        onValueChange = {
+                            seekProgress = it
+                            isSeeking = true
+                        },
+                        onValueChangeFinished = {
+                            vm.seekTo(seekProgress)
+                            isSeeking = false
+                        },
                         colors = SliderDefaults.colors(
                             thumbColor = playerAccent,
                             activeTrackColor = playerAccent,
@@ -3705,7 +4062,10 @@ fun BitChordBottomNavPill(state: AppStateModel, vm: MainViewModel) {
             val label = item.second
             val icon = item.third
             val selected = state.currentScreen == screen ||
-                (screen == ScreenNav.SETTINGS && state.currentScreen in setOf(ScreenNav.APP_APPEARANCE, ScreenNav.PLAYER_STYLES, ScreenNav.ANDROID_AUTO_SETTINGS))
+                (screen == ScreenNav.SETTINGS && state.currentScreen in setOf(
+                    ScreenNav.APP_APPEARANCE, ScreenNav.PLAYER_STYLES,
+                    ScreenNav.ANDROID_AUTO_SETTINGS, ScreenNav.EQUALIZER, ScreenNav.V2_ROADMAP
+                ))
 
             Box(
                 modifier = Modifier
@@ -3729,8 +4089,11 @@ fun BitChordBottomNavPill(state: AppStateModel, vm: MainViewModel) {
 @Composable
 fun BitChordSettingsScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
+    val context = LocalContext.current
+    var lyricProviderOrder by remember { mutableStateOf(LyricsRepository.loadProviderOrder(context)) }
     var losslessSourceUrl by remember(state.losslessSourceUrl) { mutableStateOf(state.losslessSourceUrl) }
     var losslessSourceToken by remember { mutableStateOf("") }
+    var regionMenuExpanded by remember { mutableStateOf(false) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         vm.setDownloadDirectory(uri)
     }
@@ -3801,6 +4164,83 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
                 trailingValue = "Customize",
                 onClick = { vm.setScreen(ScreenNav.ANDROID_AUTO_SETTINGS) }
             )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
+                icon = Icons.Default.Map,
+                title = "Kilo V2 Roadmap",
+                subtitle = "See the performance, audio and Auto milestones",
+                trailingValue = "View",
+                onClick = { vm.setScreen(ScreenNav.V2_ROADMAP) }
+            )
+        }
+
+        SettingsSectionHeader("MUSIC DISCOVERY")
+        SettingsGroupCard {
+            Box {
+                SettingsRowItem(
+                    icon = Icons.Default.Public,
+                    title = "Music country / region",
+                    subtitle = if (state.musicRegionCode == "AUTO") "Use device country (${java.util.Locale.getDefault().country.ifBlank { "US" }})" else "Use YouTube Music catalog for ${java.util.Locale("", state.musicRegionCode).getDisplayCountry(java.util.Locale.getDefault())}",
+                    trailingValue = if (state.musicRegionCode == "AUTO") "Auto" else java.util.Locale("", state.musicRegionCode).getDisplayCountry(java.util.Locale.getDefault()),
+                    onClick = { regionMenuExpanded = true }
+                )
+                DropdownMenu(expanded = regionMenuExpanded, onDismissRequest = { regionMenuExpanded = false }) {
+                    musicRegionOptions().forEach { (code, label) ->
+                        DropdownMenuItem(
+                            text = { Text(label) },
+                            onClick = { regionMenuExpanded = false; vm.setMusicRegion(code) },
+                            trailingIcon = if (state.musicRegionCode == code) ({ Icon(Icons.Default.Check, contentDescription = null) }) else null
+                        )
+                    }
+                }
+            }
+            Text("Country changes YouTube Music recommendations and search results. Auto uses your device's locale; it does not access GPS.", color = Color.White.copy(alpha = 0.58f), fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp))
+        }
+
+        SettingsSectionHeader("LYRICS PROVIDERS")
+        SettingsGroupCard {
+            Text(
+                "Lyrics are checked from top to bottom. Better Lyrics stays first by default; move providers to change lookup priority.",
+                color = Color.White.copy(alpha = 0.68f), fontSize = 13.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+            )
+            lyricProviderOrder.forEachIndexed { index, providerId ->
+                val provider = LyricsRepository.providers.firstOrNull { it.id == providerId } ?: return@forEachIndexed
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("${index + 1}.", color = accent, fontWeight = FontWeight.Bold, modifier = Modifier.width(28.dp))
+                    Text(provider.title, color = Color.White, modifier = Modifier.weight(1f))
+                    IconButton(
+                        onClick = {
+                            if (index > 0) {
+                                val changed = lyricProviderOrder.toMutableList().also {
+                                    val item = it.removeAt(index)
+                                    it.add(index - 1, item)
+                                }
+                                LyricsRepository.updateProviderOrder(context, changed)
+                                lyricProviderOrder = LyricsRepository.loadProviderOrder(context)
+                            }
+                        },
+                        enabled = index > 0
+                    ) { Icon(Icons.Default.ArrowUpward, contentDescription = "Move ${provider.title} up", tint = if (index > 0) accent else Color.Gray) }
+                    IconButton(
+                        onClick = {
+                            if (index < lyricProviderOrder.lastIndex) {
+                                val changed = lyricProviderOrder.toMutableList().also {
+                                    val item = it.removeAt(index)
+                                    it.add(index + 1, item)
+                                }
+                                LyricsRepository.updateProviderOrder(context, changed)
+                                lyricProviderOrder = LyricsRepository.loadProviderOrder(context)
+                            }
+                        },
+                        enabled = index < lyricProviderOrder.lastIndex
+                    ) { Icon(Icons.Default.ArrowDownward, contentDescription = "Move ${provider.title} down", tint = if (index < lyricProviderOrder.lastIndex) accent else Color.Gray) }
+                }
+                if (index < lyricProviderOrder.lastIndex) HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            }
         }
 
         SettingsSectionHeader("LOSSLESS STREAMING")
@@ -3882,6 +4322,14 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
         SettingsGroupCard {
             SettingsRowItem(
                 icon = Icons.Outlined.Equalizer,
+                title = "Kilo Equalizer",
+                subtitle = "Adjust the active player’s device-supported frequency bands",
+                trailingValue = "Open",
+                onClick = vm::openEqualizer
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
+                icon = Icons.Outlined.Equalizer,
                 title = "System Equalizer",
                 subtitle = "Launch device DSP audio effects",
                 onClick = vm::openSystemEqualizer
@@ -3893,6 +4341,35 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
                 accent = accent,
                 onCheckedChange = vm::setAutoMixEnabled
             )
+        }
+
+        SettingsSectionHeader("APP UPDATES")
+        SettingsGroupCard {
+            Text(
+                state.updateCheckMessage,
+                color = if (state.updateAvailable) accent else Color.White.copy(alpha = 0.68f),
+                fontSize = 13.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = vm::checkForUpdates, enabled = !state.isCheckingForUpdates) {
+                    if (state.isCheckingForUpdates) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(if (state.isCheckingForUpdates) "Checking…" else "Check GitHub")
+                }
+                if (state.latestReleaseUrl.isNotBlank()) {
+                    TextButton(onClick = { vm.openReleaseUrl(state.latestReleaseUrl) }) { Text("View release") }
+                }
+                if (state.latestApkUrl.isNotBlank()) {
+                    TextButton(onClick = { vm.openReleaseUrl(state.latestApkUrl) }) { Text("Get APK") }
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(22.dp))
@@ -3916,6 +4393,114 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
             Spacer(modifier = Modifier.height(20.dp))
         }
         Spacer(modifier = Modifier.height(40.dp))
+    }
+}
+
+@Composable
+fun EqualizerScreen(vm: MainViewModel) {
+    val state by vm.state.collectAsState()
+    val eq = state.equalizerSnapshot
+    val accent = state.activeSkin.highlight
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { vm.setScreen(ScreenNav.SETTINGS) }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back to settings", tint = Color.White)
+            }
+            Column(Modifier.weight(1f)) {
+                Text("SOUND", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.6.sp)
+                Text("Kilo Equalizer", color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.ExtraBold)
+            }
+        }
+        SettingsGroupCard {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Equalizer", color = Color.White, fontWeight = FontWeight.Bold)
+                    Text(eq.message, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                }
+                Switch(checked = eq.enabled, onCheckedChange = vm::setEqualizerEnabled, enabled = eq.available)
+            }
+        }
+        if (eq.presets.isNotEmpty()) {
+            SettingsSectionHeader("PRESETS")
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(horizontal = 2.dp)) {
+                itemsIndexed(eq.presets) { index, preset ->
+                    FilterChip(
+                        selected = eq.selectedPreset == index,
+                        onClick = { vm.applyEqualizerPreset(index) },
+                        label = { Text(preset) },
+                        enabled = eq.available
+                    )
+                }
+            }
+        }
+        if (eq.bands.isNotEmpty()) {
+            SettingsSectionHeader("FREQUENCY BANDS")
+            SettingsGroupCard {
+                eq.bands.forEachIndexed { rowIndex, band ->
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text(if (band.centerFrequencyHz >= 1000) "${band.centerFrequencyHz / 1000.0} kHz" else "${band.centerFrequencyHz} Hz", color = Color.White, modifier = Modifier.weight(1f))
+                            Text("${"%.1f".format(band.levelMilliBels / 100f)} dB", color = accent, fontSize = 12.sp)
+                        }
+                        Slider(
+                            value = band.levelMilliBels.toFloat(),
+                            onValueChange = { vm.setEqualizerBand(band.index, it.toInt()) },
+                            valueRange = eq.minimumLevelMilliBels.toFloat()..eq.maximumLevelMilliBels.toFloat(),
+                            enabled = eq.available && eq.enabled,
+                            colors = SliderDefaults.colors(thumbColor = accent, activeTrackColor = accent)
+                        )
+                    }
+                    if (rowIndex < eq.bands.lastIndex) HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+                }
+            }
+            Text("Band count and frequency range depend on the audio effects available on this phone.", color = Color.White.copy(alpha = 0.55f), fontSize = 12.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 10.dp))
+        } else {
+            Text("Start a song, then return here to connect the equalizer to the active playback session.", color = Color.White.copy(alpha = 0.68f), fontSize = 14.sp, lineHeight = 20.sp, modifier = Modifier.padding(8.dp))
+        }
+    }
+}
+
+@Composable
+fun V2RoadmapScreen(vm: MainViewModel) {
+    val state by vm.state.collectAsState()
+    val accent = state.activeSkin.highlight
+    val items = listOf(
+        Triple("Playback foundation", "Playback reliability, seeking, offline cache and queue recovery", "IN PLACE"),
+        Triple("Lyrics and community playlists", "Provider fallback, lyric source order and family playlist discovery", "IN PLACE"),
+        Triple("Radio reliability", "Format-aware streams, resilient buffering and station recovery", "IN PROGRESS"),
+        Triple("Equalizer", "Device-supported bands, presets and saved sound settings", "IN PROGRESS"),
+        Triple("Library scale", "Background indexing, paging and artwork/metadata preloading", "PLANNED"),
+        Triple("Downloads", "Queue controls, pause/resume and album or playlist downloads", "PLANNED"),
+        Triple("Android Auto", "Faster browse/search, quick play and cached driving shelves", "PLANNED"),
+        Triple("Themes and listening stats", "Composable visual styles, listening history and recaps", "PLANNED"),
+        Triple("DJ and smart mixes", "Crossfade controls, smart queueing and themed mixes", "PLANNED")
+    )
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { vm.setScreen(ScreenNav.SETTINGS) }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back to settings", tint = Color.White)
+            }
+            Column(Modifier.weight(1f)) {
+                Text("WHAT'S NEXT", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.6.sp)
+                Text("Kilo V2 Roadmap", color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.ExtraBold)
+            }
+        }
+        Text("A practical upgrade path focused on reliability and speed first. Planned items are targets, not promises of features already shipped.", color = Color.White.copy(alpha = 0.67f), fontSize = 13.sp, lineHeight = 19.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp))
+        Spacer(Modifier.height(12.dp))
+        items.forEach { (title, description, status) ->
+            SettingsGroupCard {
+                Row(Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.Top) {
+                    Column(Modifier.weight(1f)) {
+                        Text(title, color = Color.White, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(4.dp))
+                        Text(description, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp)
+                    }
+                    Text(status, color = accent, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(start = 8.dp, top = 3.dp))
+                }
+            }
+            Spacer(Modifier.height(9.dp))
+        }
+        Spacer(Modifier.height(30.dp))
     }
 }
 
@@ -4381,6 +4966,10 @@ fun ExploreScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val skin = state.activeSkin
     val accent = skin.highlight
+    if (!state.isLoggedIn) {
+        SignInRequiredContent(vm, skin)
+        return
+    }
     Column(modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)).padding(top = 16.dp)) {
         Text(when (skin.layoutFamily) { 0 -> "Explore, in glass"; 1 -> "Browse everything"; 2 -> "Explore & Vibe Reels"; 3 -> "Browse new sounds"; else -> "The sound stream" }, color = Color.White, fontSize = if (skin.layoutFamily == 3) 30.sp else 26.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 20.dp))
         Spacer(modifier = Modifier.height(14.dp))
@@ -4418,6 +5007,12 @@ fun SearchScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val skin = state.activeSkin
     val accent = skin.highlight
+    var selectedSearchTab by remember { mutableIntStateOf(0) }
+
+    if (!state.isLoggedIn) {
+        SignInRequiredContent(vm, skin)
+        return
+    }
 
     Column(modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)).padding(top = 16.dp)) {
         Text(when (skin.layoutFamily) { 0 -> "Find your frequency"; 1 -> "Search"; 2 -> "Search YouTube Music"; 3 -> "What do you want to hear?"; else -> "Search the sound" }, color = Color.White, fontSize = if (skin.layoutFamily == 3) 30.sp else 27.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 20.dp))
@@ -4425,7 +5020,7 @@ fun SearchScreen(vm: MainViewModel) {
         OutlinedTextField(
             value = state.searchQuery,
             onValueChange = { vm.onSearchQueryChanged(it) },
-            placeholder = { Text("Search songs, artists, albums...", color = Color.Gray) },
+            placeholder = { Text("Search songs, artists, albums, playlists...", color = Color.Gray) },
             trailingIcon = {
                 if (state.isSearching) {
                     CircularProgressIndicator(color = accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
@@ -4446,18 +5041,162 @@ fun SearchScreen(vm: MainViewModel) {
 
         Spacer(modifier = Modifier.height(12.dp))
 
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            listOf("Songs", "Artists", "Community playlists").forEachIndexed { index, title ->
+                val selected = selectedSearchTab == index
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(if (selected) accent else primaryPanelColor(skin))
+                        .clickable { selectedSearchTab = index }
+                        .padding(horizontal = 15.dp, vertical = 9.dp)
+                ) {
+                    Text(
+                        when (index) {
+                            1 -> if (state.artistSearchResults.isNotEmpty()) "$title (${state.artistSearchResults.size})" else title
+                            2 -> if (state.communityPlaylistResults.isNotEmpty()) "$title (${state.communityPlaylistResults.size})" else title
+                            else -> title
+                        },
+                        color = if (selected) Color.Black else Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
         val displayList = if (state.searchQuery.isBlank()) state.playlist else state.searchResults
 
         LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-            itemsIndexed(displayList) { _, song ->
-                BitchordSongRowItem(
-                    song = song,
-                    isCurrent = state.activeSong.id == song.id,
-                    onClick = { vm.playSongFromShelf(song, displayList) },
-                    vm = vm
-                )
+            if (selectedSearchTab == 0) {
+                if (state.artistSearchResults.isNotEmpty()) {
+                    item { SettingsSectionHeader("ARTISTS") }
+                    itemsIndexed(state.artistSearchResults.take(5), key = { _, artist -> "search-artist-${artist.id}" }) { _, artist ->
+                        ArtistSearchRow(artist) { vm.openArtist(artist) }
+                    }
+                    item { SettingsSectionHeader("SONGS") }
+                }
+                itemsIndexed(displayList) { _, song ->
+                    BitchordSongRowItem(
+                        song = song,
+                        isCurrent = state.activeSong.id == song.id,
+                        onClick = { vm.playSongFromShelf(song, displayList) },
+                        vm = vm
+                    )
+                }
+            } else if (selectedSearchTab == 1) {
+                itemsIndexed(state.artistSearchResults, key = { _, artist -> artist.id }) { _, artist ->
+                    ArtistSearchRow(artist) { vm.openArtist(artist) }
+                }
+            } else {
+                itemsIndexed(state.communityPlaylistResults, key = { _, playlist -> playlist.id }) { _, playlist ->
+                    CommunityPlaylistSearchRow(playlist) {
+                        vm.playSongFromShelf(playlist, listOf(playlist))
+                    }
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun ArtistSearchRow(artist: ArtistItem, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 20.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+        AsyncImage(
+            model = artist.coverUrl,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.size(58.dp).clip(CircleShape)
+        )
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(artist.name, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(artist.subtitle.ifBlank { "Artist" }, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Icon(Icons.Default.ChevronRight, contentDescription = "Open artist", tint = Color.White.copy(alpha = 0.75f))
+    }
+}
+
+@Composable
+fun ArtistDetailScreen(vm: MainViewModel) {
+    val state by vm.state.collectAsState()
+    val artist = state.activeArtist
+    val accent = state.activeSkin.highlight
+    Column(Modifier.fillMaxSize().background(primaryBackdrop(state.activeSkin))) {
+        Row(Modifier.fillMaxWidth().padding(start = 8.dp, end = 18.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = vm::handleSystemBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back to search", tint = Color.White) }
+            Column(Modifier.weight(1f)) {
+                Text("ARTIST", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.5.sp)
+                Text(artist?.name ?: "Artist", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            if (state.isSearching) CircularProgressIndicator(color = accent, modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+        }
+        if (artist == null) return@Column
+        LazyColumn(contentPadding = PaddingValues(bottom = 28.dp)) {
+            item {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    AsyncImage(model = artist.coverUrl, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.size(82.dp).clip(CircleShape))
+                    Spacer(Modifier.width(14.dp))
+                    Column {
+                        Text(artist.name, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                        Text(artist.subtitle.ifBlank { "Albums and songs" }, color = Color.White.copy(alpha = 0.65f), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+            }
+            if (state.artistAlbums.isNotEmpty()) {
+                item { SettingsSectionHeader("ALBUMS & SINGLES") }
+                item {
+                    LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        itemsIndexed(state.artistAlbums, key = { _, album -> album.albumBrowseId }) { _, album ->
+                            Column(Modifier.width(132.dp).clickable { vm.openArtistAlbum(album) }) {
+                                AsyncImage(model = album.coverUrl, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.size(132.dp).clip(RoundedCornerShape(14.dp)))
+                                Spacer(Modifier.height(6.dp))
+                                Text(album.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                Text(album.artist, color = Color.White.copy(alpha = 0.58f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                }
+            }
+            item {
+                Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 12.dp, top = 16.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(state.selectedArtistAlbumTitle ?: "Songs", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                    if (state.selectedArtistAlbumTitle != null) TextButton(onClick = vm::showAllArtistSongs) { Text("All songs", color = accent) }
+                }
+            }
+            itemsIndexed(state.artistSongs, key = { _, song -> song.id }) { _, song ->
+                BitchordSongRowItem(song, state.activeSong.id == song.id, onClick = { vm.playSongFromShelf(song, state.artistSongs) }, vm = vm)
+            }
+            if (!state.isSearching && state.artistAlbums.isEmpty() && state.artistSongs.isEmpty()) {
+                item { Text("No artist catalog was returned. Try again or check your connection.", color = Color.White.copy(alpha = 0.62f), modifier = Modifier.padding(20.dp)) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CommunityPlaylistSearchRow(playlist: SongItemClean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 20.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        AsyncImage(
+            model = playlist.coverUrl,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.size(58.dp).clip(RoundedCornerShape(12.dp))
+        )
+        Spacer(Modifier.width(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(playlist.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(playlist.artist.ifBlank { "Community playlist" }, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Icon(Icons.Default.PlayArrow, contentDescription = "Play playlist", tint = Color.White)
     }
 }
 
@@ -4685,6 +5424,12 @@ fun BitChordWebViewLoginDialog(
     }
 }
 
+private fun musicRegionOptions(): List<Pair<String, String>> =
+    (listOf("AUTO" to "Auto (device region)") + java.util.Locale.getISOCountries().mapNotNull { code ->
+        java.util.Locale.Builder().setRegion(code).build()
+            .getDisplayCountry(java.util.Locale.getDefault())
+            .takeIf(String::isNotBlank)?.let { code to it }
+    }).sortedWith(compareBy<Pair<String, String>> { it.first != "AUTO" }.thenBy { it.second.lowercase() })
 @Composable
 fun BitChordSetupWizard(vm: MainViewModel) {
     val state by vm.state.collectAsState()
@@ -4733,6 +5478,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {
         vm.setDownloadDirectory(it)
     }
+    var wizardRegionMenuExpanded by remember { mutableStateOf(false) }
     val selectedFolder = state.downloadDirectoryUri?.let { value ->
         runCatching { DocumentsContract.getTreeDocumentId(Uri.parse(value)).substringAfterLast(':') }.getOrNull()
     }?.takeIf { it.isNotBlank() } ?: "No folder selected yet"
@@ -4803,13 +5549,31 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                             Text(selectedFolder, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp, textAlign = TextAlign.Center)
                         }
                     }
-                    1 -> WizardStepContent("2. Connect YouTube Music", "Sign in to sync your personal home shelves and playlists.") {
-                        Button(
-                            onClick = { vm.openWebLogin() },
-                            colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(if (state.isLoggedIn) "✓ Connected to YouTube Music" else "Sign in to YouTube Music", color = Color.Black, fontWeight = FontWeight.Bold)
+                    1 -> WizardStepContent("2. Connect YouTube Music", "Sign in to load discovery tiles, regional recommendations and online playlists. You can continue without signing in and use songs saved in your Offline Vault.") {
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            Button(
+                                onClick = { vm.openWebLogin() },
+                                colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(if (state.isLoggedIn) "✓ Connected to YouTube Music" else "Sign in to YouTube Music", color = Color.Black, fontWeight = FontWeight.Bold)
+                            }
+                            Text("Music country / region", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                            Box {
+                                OutlinedButton(onClick = { wizardRegionMenuExpanded = true }, modifier = Modifier.fillMaxWidth()) {
+                                    Text(musicRegionOptions().firstOrNull { it.first == state.musicRegionCode }?.second ?: state.musicRegionCode, color = Color.White)
+                                }
+                                DropdownMenu(expanded = wizardRegionMenuExpanded, onDismissRequest = { wizardRegionMenuExpanded = false }) {
+                                    musicRegionOptions().forEach { (code, label) ->
+                                        DropdownMenuItem(
+                                            text = { Text(label) },
+                                            onClick = { wizardRegionMenuExpanded = false; vm.setMusicRegion(code) },
+                                            trailingIcon = if (state.musicRegionCode == code) ({ Icon(Icons.Default.Check, contentDescription = null) }) else null
+                                        )
+                                    }
+                                }
+                            }
+                            Text("Auto follows your device locale. You can change this any time in Settings.", color = Color.White.copy(alpha = 0.65f), fontSize = 12.sp)
                         }
                     }
                     2 -> WizardStepContent("3. Instant Parallel Streaming", "FastStream races ANDROID_VR and iOS InnerTube clients simultaneously so tracks start in under a second.") {

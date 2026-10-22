@@ -3,6 +3,7 @@
 package com.example.kilo
 
 import android.app.NotificationChannel
+import com.example.kilo.streaming.*
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
@@ -32,11 +33,15 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.TransferListener
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.ResolvingDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.session.CommandButton
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
@@ -345,6 +350,10 @@ object HomeCache {
 
     fun get(): List<HomeShelf> {
         val now = System.currentTimeMillis()
+        if (!YtRepo.userAuthCookie.contains("SAPISID")) {
+            set(emptyList())
+            return emptyList()
+        }
         val stale = shelves.isEmpty() || now - time > 900_000L
         if (stale && now - lastAttempt > 30_000L) {
             lastAttempt = now
@@ -359,13 +368,18 @@ object HomeCache {
 
 object PlayerHolder {
     private var player: ExoPlayer? = null
-    private const val MAX_PLAYBACK_RETRIES = 2
+    private var bandwidthMeter: DefaultBandwidthMeter? = null
     private val retryAttempts = ConcurrentHashMap<String, Int>()
     private val bgPool = Executors.newCachedThreadPool()
     @Volatile private var handleCallAudioFocus = true
 
     fun isRetrying(videoId: String): Boolean =
-        (retryAttempts[videoId] ?: 0) in 1..MAX_PLAYBACK_RETRIES
+        (retryAttempts[videoId] ?: 0) in 1..RetryManager.maxAttempts
+
+    fun estimatedBandwidthKbps(): Long {
+        val estimate = bandwidthMeter?.bitrateEstimate ?: -1L
+        return if (estimate > 0L) estimate / 1_000L else -1L
+    }
 
     @Synchronized
     fun get(context: Context): ExoPlayer {
@@ -376,10 +390,31 @@ object PlayerHolder {
         Favorites.init(app)
         SessionStore.init(app)
 
+        val meter = DefaultBandwidthMeter.Builder(app).build()
+        bandwidthMeter = meter
         val http = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(6000)
             .setReadTimeoutMs(30000)
+            .setTransferListener(object : TransferListener {
+                override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+                override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+                    if (isNetwork && dataSpec.position > 0L) {
+                        val headers = (source as? HttpDataSource)?.responseHeaders.orEmpty()
+                        val acceptRanges = headers.entries.firstOrNull { it.key.equals("Accept-Ranges", true) }
+                            ?.value?.joinToString()
+                        val contentRange = headers.entries.firstOrNull { it.key.equals("Content-Range", true) }
+                            ?.value?.joinToString()
+                        Log.d(
+                            "SeekBenchmark",
+                            "network range request position=${dataSpec.position} length=${dataSpec.length} " +
+                                "acceptRanges=${acceptRanges ?: "not reported"} contentRange=${contentRange ?: "not reported"}"
+                        )
+                    }
+                }
+                override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) = Unit
+                override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            })
 
         val cachedFactory = CacheDataSource.Factory()
             .setCache(AudioCache.get(app))
@@ -390,10 +425,17 @@ object PlayerHolder {
             resolve(app, spec)
         }
 
+        val bufferProfile = BufferController.profile(app)
         val p = ExoPlayer.Builder(app)
+            .setBandwidthMeter(meter)
             .setLoadControl(
                 DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(15_000, 45_000, 350, 900)
+                    .setBufferDurationsMs(
+                        bufferProfile.minBufferMs,
+                        bufferProfile.maxBufferMs,
+                        bufferProfile.startBufferMs,
+                        bufferProfile.rebufferMs
+                    )
                     .build()
             )
             .setMediaSourceFactory(
@@ -440,14 +482,14 @@ object PlayerHolder {
                     FastStream.invalidate(id)
                 }
                 val attempt = retryAttempts.merge(id, 1) { previous, increment -> previous + increment } ?: 1
-                if (attempt > MAX_PLAYBACK_RETRIES) return
+                val retryDelay = RetryManager.delayBeforeAttempt(attempt) ?: return
                 val shouldResume = p.playWhenReady
                 Handler(Looper.getMainLooper()).postDelayed({
                     if (p.currentMediaItem?.mediaId == id) {
                         p.prepare()
                         if (shouldResume) p.play()
                     }
-                }, 400L * attempt)
+                }, retryDelay)
             }
         })
         player = p
@@ -477,9 +519,10 @@ object PlayerHolder {
     fun prefetch(ctx: Context, videoId: String) {
         if (videoId.isBlank()) return
         bgPool.execute {
-            val info = LosslessSource.peek(videoId)
-                ?: LosslessSource.resolve(ctx, videoId)
-                ?: FastStream.get(videoId) { YtRepo.fetchStream(it) }
+            val info = StreamResolver(listOf(
+                StreamSource { id -> LosslessSource.peek(id) ?: LosslessSource.resolve(ctx, id) },
+                StreamSource { id -> FastStream.get(id, { YtRepo.fetchStream(it) }, ctx) }
+            )).resolve(videoId)
                 ?: return@execute
             AudioCache.prefetch(ctx, videoId, info)
         }
@@ -497,9 +540,10 @@ object PlayerHolder {
         if (localUriStr != null) {
             return spec.buildUpon().setUri(Uri.parse(localUriStr)).build()
         }
-        val info = LosslessSource.peek(videoId)
-            ?: LosslessSource.resolve(ctx, videoId)
-            ?: FastStream.get(videoId) { YtRepo.fetchStream(it) }
+            val info = StreamResolver(listOf(
+            StreamSource { id -> LosslessSource.peek(id) ?: LosslessSource.resolve(ctx, id) },
+            StreamSource { id -> FastStream.get(id, { YtRepo.fetchStream(it) }, ctx) }
+        )).resolve(videoId)
             ?: throw IOException("No playable stream for $videoId")
         val streamHost = Uri.parse(info.url).host.orEmpty()
         val refererHeaders = if (streamHost.endsWith("youtube.com") || streamHost.endsWith("googlevideo.com")) {
@@ -545,8 +589,14 @@ class VybeMediaService : MediaLibraryService() {
             val p = session?.player ?: return
             when (intent?.action) {
                 ACTION_TOGGLE_PLAY -> if (p.isPlaying) p.pause() else p.play()
-                ACTION_NEXT_TRACK -> if (p.mediaItemCount > 0) p.seekToNextMediaItem()
-                ACTION_PREV_TRACK -> if (p.mediaItemCount > 0) p.seekToPreviousMediaItem()
+                ACTION_NEXT_TRACK -> if (p.mediaItemCount > 0) {
+                    p.seekToNextMediaItem()
+                    p.play()
+                }
+                ACTION_PREV_TRACK -> if (p.mediaItemCount > 0) {
+                    p.seekToPreviousMediaItem()
+                    p.play()
+                }
                 ACTION_CLOSE_APP -> closeAppCompletely()
             }
         }
@@ -927,11 +977,11 @@ class VybeMediaService : MediaLibraryService() {
         )
         parentId == TAB_HEARD_SHORTS -> songItems(
             matchingHomeShelf("short")?.songs?.takeIf { it.isNotEmpty() }
-                ?: YtRepo.searchSongs("songs trending on YouTube Shorts")
+                ?: if (YtRepo.userAuthCookie.contains("SAPISID")) YtRepo.searchSongs("songs trending on YouTube Shorts") else emptyList()
         )
         parentId == TAB_TRENDING -> songItems(
             matchingHomeShelf("trend", "viral", "top hits", "popular")?.songs?.takeIf { it.isNotEmpty() }
-                ?: YtRepo.searchSongs("trending music")
+                ?: if (YtRepo.userAuthCookie.contains("SAPISID")) YtRepo.searchSongs("trending music") else emptyList()
         )
         parentId == TAB_LIBRARY -> listOf(
             folderItem(TAB_LIKED, "Liked songs", "Your saved tracks"),
@@ -975,6 +1025,7 @@ class VybeMediaService : MediaLibraryService() {
     }
 
     private fun searchItems(q: String): List<MediaItem> {
+        if (!YtRepo.userAuthCookie.contains("SAPISID")) return emptyList()
         val songs = if (q.isBlank()) {
             HomeCache.get().firstOrNull()?.songs.orEmpty()
         } else {

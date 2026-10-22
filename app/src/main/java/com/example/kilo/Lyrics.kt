@@ -1,5 +1,6 @@
 package com.example.kilo
 
+import android.content.Context
 import android.util.Log
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -23,38 +24,189 @@ import java.net.HttpURLConnection
 import java.net.URLEncoder
 import java.net.URL
 import kotlin.math.abs
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 
 data class LyricLine(val timeMs: Long, val text: String)
 
 /** Tries multiple lyric providers in order. Network work always runs off the caller's main thread. */
 object LyricsRepository {
     private const val TAG = "KiloLyrics"
+    private const val ORDER_KEY = "lyrics_provider_order"
+    data class Provider(val id: String, val title: String)
+    val providers = listOf(
+        Provider("betterlyrics", "Better Lyrics"),
+        Provider("paxsenix", "Paxsenix"),
+        Provider("youtube_music", "YouTube Music"),
+        Provider("lrclib", "LRCLIB"),
+        Provider("kugou", "KuGou"),
+        Provider("lyrics_ovh", "Lyrics.ovh")
+    )
     private val cache = java.util.concurrent.ConcurrentHashMap<String, List<LyricLine>>()
+
+    fun providerOrder(context: Context): List<String> {
+        val saved = context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
+            .getString(ORDER_KEY, null)?.split(',').orEmpty()
+        return (saved.filter { id -> providers.any { it.id == id } } + providers.map { it.id })
+            .distinct()
+    }
+
+    fun saveProviderOrder(context: Context, order: List<String>) {
+        val normalized = (order.filter { id -> providers.any { it.id == id } } + providers.map { it.id }).distinct()
+        context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE).edit()
+            .putString(ORDER_KEY, normalized.joinToString(",")).apply()
+        cache.clear()
+    }
 
     suspend fun find(song: SongItemClean): List<LyricLine> = withContext(Dispatchers.IO) {
         val key = "${song.title.trim().lowercase()}|${song.artist.trim().lowercase()}"
-        cache[key]?.let { return@withContext it }
-        // Prefer timestamped sources so the overlay can synchronize and seek. Each provider
-        // is isolated: timeouts, API changes, and no-match responses move on to the next one.
-        val syncedProviders = listOf<(SongItemClean) -> List<LyricLine>>(
-            ::findLrclib,
-            ::findKugou
+        cache[key]?.filter { it.timeMs >= 0L }?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
+        val providerFunctions: Map<String, (SongItemClean) -> List<LyricLine>> = mapOf(
+            "betterlyrics" to ::findBetterLyrics,
+            "paxsenix" to ::findPaxsenix,
+            "youtube_music" to YtRepo::fetchLyrics,
+            "lrclib" to ::findLrclib,
+            "kugou" to ::findKugou,
+            "lyrics_ovh" to ::findLyricsOvh
         )
-        var result = emptyList<LyricLine>()
-        for (provider in syncedProviders) {
-            result = runCatching { provider(song) }
-                .onFailure { Log.w(TAG, "Timed lyrics provider failed", it) }
+        for (id in providerOrderForLookup()) {
+            val provider = providerFunctions[id] ?: continue
+            val result = runCatching { provider(song) }
+                .onFailure { Log.w(TAG, "Lyrics provider $id failed", it) }
                 .getOrDefault(emptyList())
-            if (result.any { it.timeMs >= 0L }) break
-            result = emptyList()
+                .filter { it.timeMs >= 0L && it.text.isNotBlank() }
+            if (result.isNotEmpty()) {
+                cache[key] = result
+                return@withContext result
+            }
         }
-        if (result.isEmpty()) {
-            result = runCatching { findLyricsOvh(song) }
-                .onFailure { Log.w(TAG, "Plain lyrics fallback failed", it) }
-                .getOrDefault(emptyList())
+        emptyList()
+    }
+
+    @Volatile private var activeOrder: List<String>? = null
+
+    private fun providerOrderForLookup(): List<String> = activeOrder ?: providers.map { it.id }
+
+    /** Call from the settings screen and at app startup so the saved order controls lookup priority. */
+    fun loadProviderOrder(context: Context): List<String> = providerOrder(context).also { activeOrder = it }
+
+    fun updateProviderOrder(context: Context, order: List<String>) {
+        saveProviderOrder(context, order)
+        activeOrder = providerOrder(context)
+    }
+
+    private fun findBetterLyrics(song: SongItemClean): List<LyricLine> {
+        if (song.title.isBlank() || song.artist.isBlank()) return emptyList()
+        val query = "s=${enc(song.title)}&a=${enc(song.artist)}&al=${enc(song.album)}&d=${song.durationMs.coerceAtLeast(0L) / 1000}"
+        val response = request("https://api.betterlyrics.org/getLyrics?$query") as? JSONObject ?: return emptyList()
+        return parseTtml(response.optString("ttml").takeIf(String::isNotBlank) ?: response.optString("lyrics"))
+    }
+
+    private fun findPaxsenix(song: SongItemClean): List<LyricLine> {
+        if (song.title.isBlank()) return emptyList()
+        val query = enc(listOf(song.artist, song.title).filter(String::isNotBlank).joinToString(" - "))
+        // The public Lyrically API exposes Spotify search and lyrics routes; tolerate its
+        // evolving response wrappers and move on cleanly when the hosted service is unavailable.
+        val search = runCatching { request("https://lyrics.paxsenix.org/spotify/search?q=$query") }.getOrNull()
+            ?: runCatching { request("https://lyrics.paxsenix.org/spotify/search?query=$query") }.getOrNull()
+        val spotifyUrl = search?.let(::findSpotifyUrl)
+        val candidates = buildList {
+            add("https://lyrics.paxsenix.org/spotify/lyrics?query=$query")
+            add("https://lyrics.paxsenix.org/spotify/lyrics?q=$query")
+            if (spotifyUrl != null) add("https://lyrics.paxsenix.org/spotify/lyrics?url=${enc(spotifyUrl)}")
         }
-        if (result.isNotEmpty()) cache[key] = result
-        result
+        for (url in candidates) {
+            val payload = runCatching { request(url) as? JSONObject }.getOrNull() ?: continue
+            parsePaxLyrics(payload).takeIf { it.isNotEmpty() }?.let { return it }
+        }
+        return emptyList()
+    }
+
+    private fun findSpotifyUrl(root: Any): String? {
+        val nodes = mutableListOf<JSONObject>()
+        collectObjects(root, nodes)
+        for (node in nodes) {
+            val url = node.optJSONObject("external_urls")?.optString("spotify")
+                ?: node.optString("url").takeIf { it.contains("open.spotify.com/track/") }
+            if (!url.isNullOrBlank() && url.contains("open.spotify.com/track/")) return url
+            val id = node.optString("id")
+            if (id.matches(Regex("[A-Za-z0-9]{22}"))) return "https://open.spotify.com/track/$id"
+        }
+        return null
+    }
+
+    private fun collectObjects(value: Any?, out: MutableList<JSONObject>) {
+        when (value) {
+            is JSONObject -> {
+                out += value
+                val keys = value.keys()
+                while (keys.hasNext()) collectObjects(value.opt(keys.next()), out)
+            }
+            is org.json.JSONArray -> for (i in 0 until value.length()) collectObjects(value.opt(i), out)
+        }
+    }
+
+    private fun parsePaxLyrics(root: JSONObject): List<LyricLine> {
+        val lines = root.optJSONArray("lines")
+            ?: root.optJSONObject("data")?.optJSONArray("lines")
+            ?: root.optJSONObject("lyrics")?.optJSONArray("lines")
+        if (lines != null) {
+            return (0 until lines.length()).mapNotNull { i ->
+                val line = lines.optJSONObject(i) ?: return@mapNotNull null
+                val text = line.optString("words", line.optString("text")).trim()
+                val tag = line.optString("timeTag", line.optString("time")).trim()
+                val time = parseTimeTag(tag)
+                if (text.isBlank() || time == null) null else LyricLine(time, text)
+            }
+        }
+        val text = root.optString("lyrics").ifBlank { root.optJSONObject("data")?.optString("lyrics").orEmpty() }
+        return parse(text)
+    }
+
+    private fun parseTimeTag(value: String): Long? {
+        val parts = value.trim().split(':')
+        if (parts.size < 2) return value.toLongOrNull()
+        val seconds = parts.last().replace(',', '.').toDoubleOrNull() ?: return null
+        val minutes = parts[parts.lastIndex - 1].toLongOrNull() ?: return null
+        val hours = parts.getOrNull(parts.lastIndex - 2)?.toLongOrNull() ?: 0L
+        return ((hours * 3600 + minutes * 60) * 1000 + (seconds * 1000).toLong())
+    }
+
+    private fun parseTtml(ttml: String): List<LyricLine> {
+        if (ttml.isBlank()) return emptyList()
+        return runCatching {
+            val parser = XmlPullParserFactory.newInstance().newPullParser()
+            parser.setInput(ttml.reader())
+            val output = mutableListOf<LyricLine>()
+            var inParagraph = false
+            var startMs = -1L
+            var text = StringBuilder()
+            var event = parser.eventType
+            while (event != XmlPullParser.END_DOCUMENT) {
+                when (event) {
+                    XmlPullParser.START_TAG -> if (parser.name.equals("p", true)) {
+                        inParagraph = true
+                        startMs = parseTtmlTime(parser.getAttributeValue(null, "begin").orEmpty())
+                        text = StringBuilder()
+                    }
+                    XmlPullParser.TEXT, XmlPullParser.CDSECT -> if (inParagraph) text.append(parser.text)
+                    XmlPullParser.END_TAG -> if (parser.name.equals("p", true)) {
+                        val line = text.toString().replace(Regex("\\s+"), " ").trim()
+                        if (line.isNotBlank()) output += LyricLine(startMs, line)
+                        inParagraph = false
+                    }
+                }
+                event = parser.next()
+            }
+            output.sortedBy { it.timeMs }
+        }.onFailure { Log.w(TAG, "Could not parse Better Lyrics TTML", it) }.getOrDefault(emptyList())
+    }
+
+    private fun parseTtmlTime(value: String): Long {
+        val raw = value.trim()
+        if (raw.endsWith("ms")) return raw.removeSuffix("ms").toDoubleOrNull()?.toLong() ?: -1L
+        if (raw.endsWith("s") && !raw.contains(':')) return raw.removeSuffix("s").toDoubleOrNull()?.times(1000)?.toLong() ?: -1L
+        return parseTimeTag(raw) ?: -1L
     }
 
     private fun findLrclib(song: SongItemClean): List<LyricLine> {
