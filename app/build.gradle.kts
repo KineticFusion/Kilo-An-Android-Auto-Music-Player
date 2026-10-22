@@ -40,6 +40,14 @@ android {
     }
 }
 
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            output.outputFileName.set("Kilo-${output.versionName.get()}.apk")
+        }
+    }
+}
+
 
     dependencies {
         implementation(platform(libs.androidx.compose.bom))
