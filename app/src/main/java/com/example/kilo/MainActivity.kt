@@ -17,6 +17,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.Bundle
+import android.os.SystemClock
 import android.provider.DocumentsContract
 import android.provider.Settings
 import android.util.Log
@@ -57,6 +58,7 @@ import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -88,6 +90,7 @@ import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -100,6 +103,23 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import com.example.kilo.streaming.*
 import com.example.kilo.profile.*
+import com.example.kilo.search.SearchEnhancer
+import com.example.kilo.search.SearchAnalytics
+import com.example.kilo.ui.components.KiloCard
+import com.example.kilo.ui.components.KiloAlbumCard
+import com.example.kilo.ui.components.KiloButton
+import com.example.kilo.ui.components.KiloHeroCard
+import com.example.kilo.ui.components.KiloHeader
+import com.example.kilo.ui.components.KiloListItem
+import com.example.kilo.ui.components.KiloMoodCard
+import com.example.kilo.ui.components.KiloPlaylistCard
+import com.example.kilo.ui.components.KiloSection
+import com.example.kilo.ui.design.KiloTheme
+import com.example.kilo.ui.design.KiloThemeSpec
+import com.example.kilo.ui.layout.AdaptiveLayoutManager
+import com.example.kilo.ui.mood.KiloMoodUiEngine
+import com.example.kilo.androidauto.AndroidAutoHomeLayouts
+import com.example.kilo.ui.navigation.KiloNavigationSystem
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
@@ -411,6 +431,8 @@ fun moodDiscoveryQuery(mood: String, genre: String? = null): String {
         "commute" -> "upbeat commute pop music mix"
         "gaming" -> "gaming electronic phonk instrumental mix"
         "relax" -> "relaxing ambient acoustic chill music mix"
+        "rain drive" -> "rainy night drive alternative indie ambient electronic mix"
+        "coffee vibes" -> "coffee shop lofi jazz acoustic indie mix"
         "sleep" -> "sleep ambient piano calming instrumental mix"
         "party" -> "party dance pop playlist mix"
         "high energy" -> "high energy dance edm workout mix"
@@ -421,7 +443,9 @@ fun moodDiscoveryQuery(mood: String, genre: String? = null): String {
         else -> "${mood.trim()} music playlist mix"
     }
     val cleanGenre = genre?.trim().orEmpty()
-    return listOf(moodTerms, cleanGenre.takeIf(String::isNotBlank)).filterNotNull().joinToString(" ")
+    val profileTerms = SmartMoodEngine.queryModifiers(mood).joinToString(" ")
+    return listOf(moodTerms, profileTerms, cleanGenre.takeIf(String::isNotBlank))
+        .filterNotNull().distinct().joinToString(" ")
 }
 
 fun genreDiscoveryQuery(genre: String): String = "${genre.trim()} songs playlist mix"
@@ -549,7 +573,7 @@ private fun primaryCardShape(skin: SkinTheme): androidx.compose.ui.graphics.Shap
     RoundedCornerShape(listOf(30, 10, 18, 28, 40, 22, 12, 34, 16, 26, 38, 20, 14, 32, 24)[skin.ordinal].dp)
 
 private fun primaryBackdrop(skin: SkinTheme): Brush = when (skin.layoutFamily) {
-    0 -> Brush.radialGradient(listOf(skin.highlight.copy(alpha = 0.25f), Color(0xFF161322), Color(0xFF08090D)))
+    0 -> Brush.radialGradient(listOf(skin.highlight.copy(alpha = 0.38f), Color(0xFF1B1930), Color(0xFF08090D)))
     1 -> Brush.verticalGradient(listOf(Color(0xFF101613), Color(0xFF080A09), Color(0xFF050605)))
     2 -> Brush.verticalGradient(listOf(Color(0xFF291016), Color(0xFF120B10), Color(0xFF08090D)))
     3 -> Brush.verticalGradient(listOf(Color(0xFF2A111C), Color(0xFF171018), Color(0xFF09090D)))
@@ -557,7 +581,7 @@ private fun primaryBackdrop(skin: SkinTheme): Brush = when (skin.layoutFamily) {
 }
 
 private fun primaryPanelColor(skin: SkinTheme): Color = when (skin.layoutFamily) {
-    0 -> Color.White.copy(alpha = 0.075f)
+    0 -> Color.White.copy(alpha = 0.12f)
     1 -> Color(0xFF202923)
     2 -> Color(0xFF21151A)
     3 -> Color(0xFF24151B)
@@ -573,16 +597,7 @@ enum class OverlayTab {
     NONE, QUEUE, LYRICS, CODEC_INFO
 }
 
-private val AUTO_LAYOUT_PROFILES = listOf(
-    "Balanced" to "A little of everything, starting with your current listening.",
-    "Quick picks first" to "Put personal recommendations at the top.",
-    "Recently played first" to "Jump back into music you played lately.",
-    "Trending first" to "Lead with popular and newly discovered music.",
-    "Library first" to "Put liked songs and playlists before discovery."
-)
-val AUTO_LAYOUT_MODES = AUTO_LAYOUT_PROFILES.flatMapIndexed { profileIndex, profile ->
-    (2..6).map { shelfCount -> "${profileIndex + 1}|$shelfCount|${profile.first}" }
-}
+val AUTO_LAYOUT_MODES = AndroidAutoHomeLayouts.presets.map { it.id }
 private val LEGACY_AUTO_LAYOUT_MODES = listOf(
     "01 Classic Browse", "02 Album Focus", "03 Minimal Home", "04 Split Sections", "05 Queue First",
     "06 Search Focus", "07 Browse Home", "08 Category Groups", "09 Horizontal Shelves", "10 Artist Focus",
@@ -591,10 +606,17 @@ private val LEGACY_AUTO_LAYOUT_MODES = listOf(
     "21 Quick Actions", "22 Library First", "23 Artwork First", "24 Audio Controls", "25 Recommendations First"
 )
 private fun normalizeAutoLayoutMode(value: String?): String {
-    val currentIndex = AUTO_LAYOUT_MODES.indexOf(value)
-    if (currentIndex >= 0) return AUTO_LAYOUT_MODES[currentIndex]
+    if (value?.let { it in AUTO_LAYOUT_MODES } == true) return value
     val oldIndex = LEGACY_AUTO_LAYOUT_MODES.indexOf(value)
-    return AUTO_LAYOUT_MODES.getOrElse(oldIndex.coerceAtLeast(0)) { AUTO_LAYOUT_MODES.first() }
+    val legacyMatch = when {
+        oldIndex in setOf(2, 17) -> "minimal"
+        oldIndex in setOf(10, 15) -> "playlist_first"
+        oldIndex in setOf(21) -> "library_first"
+        oldIndex in setOf(18, 24) -> "discovery"
+        oldIndex in setOf(19) -> "mood_first"
+        else -> null
+    }
+    return legacyMatch ?: AUTO_LAYOUT_MODES.first()
 }
 
 val AUTO_MENU_TABS = listOf(
@@ -686,6 +708,8 @@ data class AppStateModel(
     ),
     val activeAccountId: String = "1",
     val selectedMood: String = "Discover",
+    val moodSuggestion: MoodSuggestion? = null,
+    val isChoosingMood: Boolean = false,
     val listenerProfile: ListenerProfile = ListenerProfile(),
     val showPersonalizationWizard: Boolean = false,
     val profileArtistSuggestions: List<ArtistItem> = emptyList(),
@@ -722,6 +746,7 @@ data class AppStateModel(
     val isScanningDownloads: Boolean = false,
     val homeShelves: List<HomeShelf> = emptyList(),
     val searchQuery: String = "",
+    val searchSuggestions: List<String> = emptyList(),
     val searchResults: List<SongItemClean> = emptyList(),
     val artistSearchResults: List<ArtistItem> = emptyList(),
     val activeArtist: ArtistItem? = null,
@@ -1115,38 +1140,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val player: ExoPlayer = PlayerHolder.get(application)
 
-    /** Clears KILO's pre-v2 local state exactly once for existing users, then shows setup again. */
-    private fun runFirstUpdateResetIfNeeded(application: Application): Boolean {
-        val completedSettings = application.getSharedPreferences("vybe_app_settings", Application.MODE_PRIVATE)
-        val marker = "kilo_v2_first_update_reset_done"
-        val wasSetupComplete = completedSettings.getBoolean(
-            "setup_complete",
-            completedSettings.getInt("setup_step", -1) >= 7
-        )
-        if (!wasSetupComplete || completedSettings.getBoolean(marker, false)) return false
-
-        // Keep downloaded files where the user stored them; clear only KILO-managed state.
-        application.getSharedPreferences("vybe_prefs", Application.MODE_PRIVATE).edit().clear().commit()
-        completedSettings.edit().clear().commit()
-        application.deleteDatabase("kilo_android_auto_browse.db")
-        runCatching { File(application.cacheDir, "vybe_audio").deleteRecursively() }
-        Favorites.clearForFirstUpdate()
-        PlayedSongHistory.clear()
-        HomeCache.set(emptyList())
-        YtRepo.userAuthCookie = ""
-        runCatching {
-            CookieManager.getInstance().removeAllCookies(null)
-            CookieManager.getInstance().flush()
-        }
-        completedSettings.edit()
-            .putBoolean(marker, true)
-            .putBoolean("setup_complete", false)
-            .putInt("setup_step", 0)
-            .putBoolean("personalization_pending", true)
-            .commit()
-        return true
-    }
-
     private val playbackListener = object : Player.Listener {
         override fun onPlaybackStateChanged(playbackState: Int) {
             val currentMediaId = player.currentMediaItem?.mediaId.orEmpty()
@@ -1277,7 +1270,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             Log.d("SeekBenchmark", "isPlaying=$isPlaying position=${player.currentPosition}ms")
             finishSeekMeasurementIfReady()
             _state.value = _state.value.copy(isPlaying = isPlaying)
-            if (isPlaying) prefetchNextStream(_state.value.currentIndex)
+            if (isPlaying) {
+                val activeSong = _state.value.activeSong
+                if (!activeSong.id.startsWith("radio:")) LyricsRepository.prefetch(activeSong)
+                prefetchNextStream(_state.value.currentIndex)
+            }
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -1318,7 +1315,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         LyricsRepository.loadProviderOrder(application)
         PlayedSongHistory.init(application)
         Favorites.init(application)
-        val firstUpdateReset = runFirstUpdateResetIfNeeded(application)
         Favorites.addListener(favoriteListener)
         SessionStore.init(application)
         FastStream.warmUp()
@@ -1339,6 +1335,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             selectedPlayerStyleId = preferences.getString("player_style_id", PLAYER_STYLE_PRESETS.first().id) ?: PLAYER_STYLE_PRESETS.first().id,
             customPlayerAccent = preferences.getString("custom_player_accent", "#FFFF795F")?.let(::parsePlayerColor) ?: Color(0xFFFF795F),
             selectedMood = preferences.getString("discovery_mood", "Discover") ?: "Discover",
+            moodSuggestion = preferences.getString("auto_mood_last", null)?.let { mood ->
+                MoodSuggestion(mood, preferences.getString("auto_mood_reason", "") ?: "")
+            },
             listenerProfile = ProfileEngine.load(preferences),
             showPersonalizationWizard = preferences.getBoolean(
                 "personalization_pending_${preferences.getString("active_account_id", "1") ?: "1"}",
@@ -1389,7 +1388,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         } catch (_: Exception) {
             ""
         }
-        if (!firstUpdateReset && existingCookies.contains("SAPISID")) {
+        if (existingCookies.contains("SAPISID")) {
             YtRepo.userAuthCookie = existingCookies
             val activeAccount = _state.value.accountsList.firstOrNull { it.id == _state.value.activeAccountId }
             if (activeAccount != null && activeAccount.cookie != existingCookies) {
@@ -1423,7 +1422,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         PlayedSongHistory.record(song.id)
                         PlayedSongHistory.recordSignal(song, "listen", pos.toFloat())
                     }
-                    if (_state.value.autoMixEnabled && remaining in 1L..1_500L && autoMixFadedSongId != songId) {
+                    val moodFadeWindowMs = SmartMoodEngine.profile(_state.value.selectedMood)?.crossfadeDurationMs ?: 1_500L
+                    if (_state.value.autoMixEnabled && remaining in 1L..moodFadeWindowMs && autoMixFadedSongId != songId) {
                         autoMixFadedSongId = songId
                         fadePlayerVolume(to = 0f, durationMs = remaining.coerceAtLeast(250L), songId = songId)
                     }
@@ -1469,7 +1469,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val playable = matches.filter { it.videoId.isNotBlank() || it.isDownloaded }
             val selected = playable.firstOrNull()
             if (selected != null) {
-                playSongFromShelf(selected, playable)
+                playSongFromShelf(selected, playable, selectionSource = "phone_search")
             } else {
                 Toast.makeText(getApplication(), "No matching song found", Toast.LENGTH_SHORT).show()
             }
@@ -1636,9 +1636,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
     fun onSearchQueryChanged(query: String) {
-        _state.value = _state.value.copy(searchQuery = query)
+        val cleanQuery = query.trim()
+        val suggestions = if (cleanQuery.isBlank()) SearchAnalytics.recentSearches() else SearchEnhancer.suggestions(cleanQuery)
+        _state.value = _state.value.copy(searchQuery = query, searchSuggestions = suggestions.take(6))
         searchJob?.cancel()
-        if (query.isBlank()) {
+        if (cleanQuery.isBlank()) {
             _state.value = _state.value.copy(
                 searchResults = emptyList(), communityPlaylistResults = emptyList(), artistSearchResults = emptyList(), isSearching = false
             )
@@ -1648,11 +1650,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             delay(250)
             _state.value = _state.value.copy(isSearching = true)
             val (results, playlists, artists) = coroutineScope {
-                val songsRequest = async(Dispatchers.IO) { YtRepo.searchSongs(query) }
-                val playlistsRequest = async(Dispatchers.IO) { YtRepo.searchCommunityPlaylists(query) }
-                val artistsRequest = async(Dispatchers.IO) { YtRepo.searchArtists(query) }
+                val songsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchSongs(cleanQuery) }.getOrDefault(emptyList()) }
+                val playlistsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchCommunityPlaylists(cleanQuery) }.getOrDefault(emptyList()) }
+                val artistsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchArtists(cleanQuery) }.getOrDefault(emptyList()) }
                 Triple(songsRequest.await(), playlistsRequest.await(), artistsRequest.await())
             }
+            if (_state.value.searchQuery.trim() != cleanQuery) return@launch
             val visibleResults = results.filter { !_state.value.filterMatureContent || !it.isExplicit }
             _state.value = _state.value.copy(
                 searchResults = visibleResults,
@@ -1660,9 +1663,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 artistSearchResults = artists,
                 isSearching = false
             )
+            SearchAnalytics.record(cleanQuery)
             results.take(3).forEach { song ->
                 LosslessSource.register(song)
                 song.videoId.takeIf(String::isNotBlank)?.let(::prefetchStream)
+            }
+
+            // Run the enhancement after production results are visible. The existing
+            // result set stays first and remains available if any supplemental query fails.
+            val queryVariants = SearchEnhancer.supplementalQueries(cleanQuery, visibleResults.map { it.title }).take(2)
+            if (queryVariants.isNotEmpty()) {
+                val supplemental = coroutineScope {
+                    queryVariants.map { variant ->
+                        async(Dispatchers.IO) { runCatching { YtRepo.searchSongs(variant) }.getOrDefault(emptyList()) }
+                    }.awaitAll().flatten()
+                }.filter { !_state.value.filterMatureContent || !it.isExplicit }
+                if (_state.value.searchQuery.trim() == cleanQuery && supplemental.isNotEmpty()) {
+                    val merged = SearchEnhancer.merge(
+                        _state.value.searchResults,
+                        supplemental,
+                        key = { it.videoId.ifBlank { it.id } }
+                    )
+                    _state.value = _state.value.copy(searchResults = merged)
+                    supplemental.take(3).forEach { song ->
+                        LosslessSource.register(song)
+                        song.videoId.takeIf(String::isNotBlank)?.let(::prefetchStream)
+                    }
+                }
             }
         }
     }
@@ -1714,14 +1741,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         reloadHome()
     }
 
-    fun playSongFromShelf(song: SongItemClean, shelfList: List<SongItemClean>) {
+    fun playSongFromShelf(
+        song: SongItemClean,
+        shelfList: List<SongItemClean>,
+        selectionSource: String? = null
+    ) {
         if (song.videoId.isEmpty() && song.albumBrowseId.isNotEmpty()) {
             viewModelScope.launch {
                 _state.value = _state.value.copy(isLoadingStream = true)
                 val tracks = withContext(Dispatchers.IO) { YtRepo.fetchAlbumTracks(song.albumBrowseId, song.artist) }
                 if (tracks.isNotEmpty()) {
                     _state.value = _state.value.copy(playlist = tracks, currentIndex = 0)
-                    loadTrack(0, autoPlay = true)
+                    loadTrack(0, autoPlay = true, selectionSource = selectionSource ?: "phone_album")
                 } else {
                     _state.value = _state.value.copy(isLoadingStream = false)
                     Toast.makeText(getApplication(), "Could not load ${song.title}", Toast.LENGTH_SHORT).show()
@@ -1735,7 +1766,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val tracks = withContext(Dispatchers.IO) { YtRepo.fetchPlaylistTracks(song.playlistId) }
                 if (tracks.isNotEmpty()) {
                     _state.value = _state.value.copy(playlist = tracks, currentIndex = 0)
-                    loadTrack(0, autoPlay = true)
+                    loadTrack(0, autoPlay = true, selectionSource = selectionSource ?: "phone_playlist")
                 } else {
                     _state.value = _state.value.copy(isLoadingStream = false)
                 }
@@ -1746,19 +1777,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         queue.forEach { LosslessSource.register(it) }
         val index = queue.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
         _state.value = _state.value.copy(playlist = queue, currentIndex = index)
-        loadTrack(index, autoPlay = true)
+        loadTrack(index, autoPlay = true, selectionSource = selectionSource)
     }
 
     fun loadTrack(
         index: Int,
         autoPlay: Boolean = true,
         startPositionMs: Long = 0L,
-        retryingEarlyEnd: Boolean = false
+        retryingEarlyEnd: Boolean = false,
+        selectionSource: String? = null
     ) {
         val list = _state.value.playlist
         if (list.isEmpty()) return
         val idx = (index + list.size) % list.size
         val song = list[idx]
+        val metricTrackId = song.videoId.ifBlank { song.id }
+        val profilerSource = selectionSource ?: when {
+            _state.value.currentScreen == ScreenNav.SEARCH -> "phone_search"
+            _state.value.currentScreen == ScreenNav.ARTIST_DETAIL && _state.value.selectedArtistAlbumTitle != null -> "phone_album"
+            _state.value.currentScreen == ScreenNav.LIBRARY -> "phone_playlist_or_library"
+            else -> "phone_" + _state.value.currentScreen.name.lowercase()
+        }
+        PlaybackPerformanceLayer.selected(metricTrackId, profilerSource)
+        PlaybackMetrics.onInitialLoading(metricTrackId)
         if (!retryingEarlyEnd) earlyEndRetries.remove(song.id)
 _state.value = _state.value.copy(
             currentIndex = idx,
@@ -1779,7 +1820,14 @@ _state.value = _state.value.copy(
                 player.getMediaItemAt(mediaIndex).mediaId == expectedId
             }
         if (queueAlreadyLoaded) {
+            val seekStartedAt = SystemClock.elapsedRealtime()
             player.seekTo(idx, startPositionMs)
+            PlaybackStartupMetrics.mediaItemsSet(
+                metricTrackId,
+                SystemClock.elapsedRealtime() - seekStartedAt,
+                operation = "queue_seek"
+            )
+            PlaybackStartupMetrics.mediaItemsBuilt(metricTrackId, 0L, list.size)
             player.volume = if (_state.value.autoMixEnabled) 0f else 1f
             if (autoPlay) player.play()
             if (autoPlay && _state.value.autoMixEnabled) {
@@ -1797,16 +1845,38 @@ _state.value = _state.value.copy(
         videoJob?.cancel()
         playJob = viewModelScope.launch {
             try {
+                val serviceStartedAt = SystemClock.elapsedRealtime()
                 startPlaybackService()
+                PlaybackStartupMetrics.serviceStartCall(
+                    metricTrackId,
+                    SystemClock.elapsedRealtime() - serviceStartedAt
+                )
+                val mediaItemStartedAt = SystemClock.elapsedRealtime()
                 val mediaItems = list.map { it.toMediaItem() }
+                PlaybackStartupMetrics.mediaItemsBuilt(
+                    metricTrackId,
+                    SystemClock.elapsedRealtime() - mediaItemStartedAt,
+                    mediaItems.size
+                )
+                val setItemsStartedAt = SystemClock.elapsedRealtime()
                 player.setMediaItems(mediaItems, idx, startPositionMs)
+                PlaybackStartupMetrics.mediaItemsSet(
+                    metricTrackId,
+                    SystemClock.elapsedRealtime() - setItemsStartedAt
+                )
                 if (_state.value.autoMixEnabled) {
                     player.volume = 0f
                     fadePlayerVolume(1f, 700L, song.id)
                 } else {
                     player.volume = 1f
                 }
+                PlaybackMetrics.onPlayerPrepare(metricTrackId, "phone_track_load")
+                val prepareStartedAt = SystemClock.elapsedRealtime()
                 player.prepare()
+                PlaybackStartupMetrics.prepareCall(
+                    metricTrackId,
+                    SystemClock.elapsedRealtime() - prepareStartedAt
+                )
                 if (autoPlay) player.play()
                 (LosslessSource.peek(song.videoId) ?: FastStream.peek(song.videoId))?.let { info ->
                     val updated = _state.value.playlist.map { if (it.id == song.id) it.copy(codecInfo = info.codec) else it }
@@ -2022,15 +2092,74 @@ _state.value = _state.value.copy(
         _state.value = _state.value.copy(displayName = name)
     }
 
-    fun setDiscoveryMood(value: String) {
+    fun setDiscoveryMood(value: String, refreshHome: Boolean = true) {
         val mood = value.trim().take(48).ifBlank { "Discover" }
         preferences.edit().putString("discovery_mood", mood).apply()
+        SmartMoodEngine.profile(mood)?.let { profile ->
+            preferences.edit()
+                .putString("active_mood_theme", profile.themePreset)
+                .putString("active_mood_android_auto_profile", profile.androidAutoProfile)
+                .putInt("active_mood_crossfade_ms", profile.crossfadeDurationMs.toInt())
+                .apply()
+            equalizerController.setPreferredProfile(profile.equalizerProfile)
+        }
         val accounts = _state.value.accountsList.map { account ->
             if (account.id == _state.value.activeAccountId) account.copy(favoriteGenre = mood) else account
         }
         persistAccounts(accounts, _state.value.activeAccountId)
         _state.value = _state.value.copy(selectedMood = mood, accountsList = accounts)
-        loadHome()
+        if (refreshHome) loadHome()
+    }
+
+    fun chooseMoodForMe() {
+        if (_state.value.isChoosingMood) return
+        _state.value = _state.value.copy(isChoosingMood = true)
+        viewModelScope.launch {
+            try {
+                val suggestion = withContext(Dispatchers.IO) {
+                    val temperature = MoodContext.currentTemperatureC(getApplication<Application>())
+                    suggestMoodForConditions(Calendar.getInstance().get(Calendar.HOUR_OF_DAY), temperature)
+                }
+                setDiscoveryMood(suggestion.mood, refreshHome = false)
+                val profile = _state.value.listenerProfile
+                val query = moodDiscoveryQuery(suggestion.mood, profile.favoriteGenres.firstOrNull())
+                val songs = withContext(Dispatchers.IO) {
+                    val candidates = YtRepo.searchSongs(query)
+                        .filter { it.videoId.isNotBlank() && (!_state.value.filterMatureContent || !it.isExplicit) }
+                        .distinctBy { it.videoId }
+                    SmartMoodEngine.rankSongs(
+                        candidates,
+                        suggestion.mood,
+                        PlayedSongHistory.ids(),
+                        Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet()
+                    )
+                }
+                preferences.edit()
+                    .putString("auto_mood_last", suggestion.mood)
+                    .putString("auto_mood_reason", suggestion.reason)
+                    .apply()
+                _state.value = _state.value.copy(
+                    moodSuggestion = suggestion,
+                    isChoosingMood = false,
+                    homeShelves = if (songs.isNotEmpty()) listOf(HomeShelf("${suggestion.mood} mix", songs, false)) + _state.value.homeShelves else _state.value.homeShelves,
+                    playlist = if (songs.isNotEmpty()) songs else _state.value.playlist,
+                    currentIndex = 0
+                )
+                if (songs.isNotEmpty()) {
+                    songs.take(4).forEach { song ->
+                        LosslessSource.register(song)
+                        song.videoId.takeIf(String::isNotBlank)?.let(::prefetchStream)
+                    }
+                    loadTrack(0, autoPlay = true)
+                } else {
+                    Toast.makeText(getApplication(), "Your ${suggestion.mood} mix is not available right now", Toast.LENGTH_SHORT).show()
+                }
+            } catch (error: Exception) {
+                Log.w("VybeVM", "Could not choose a contextual mood", error)
+                _state.value = _state.value.copy(isChoosingMood = false)
+                Toast.makeText(getApplication(), "Could not find a mood mix right now", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     fun openPersonalizationWizard() {
@@ -2051,14 +2180,14 @@ _state.value = _state.value.copy(
         )
         ProfileEngine.save(preferences, cleaned, _state.value.activeAccountId)
         val audioSnapshot = equalizerController.setPreferredProfile(cleaned.audioPreference)
-        preferences.edit().apply {
-            putBoolean("personalization_pending", false)
-            putBoolean("personalization_pending_${_state.value.activeAccountId}", false)
-            if (finishSetup) {
-                putBoolean("setup_complete", true)
-                putInt("setup_step", 11)
-            }
-        }.apply()
+        val setupEditor = preferences.edit()
+            .putBoolean("personalization_pending", false)
+            .putBoolean("personalization_pending_${_state.value.activeAccountId}", false)
+        if (finishSetup) {
+            setupEditor.putBoolean("setup_complete", true).putInt("setup_step", 11).commit()
+        } else {
+            setupEditor.apply()
+        }
         val activeMood = cleaned.favoriteMoods.firstOrNull() ?: cleaned.favoriteGenres.firstOrNull() ?: "Discover"
         preferences.edit().putString("discovery_mood", activeMood).apply()
         val accounts = _state.value.accountsList.map { account ->
@@ -3157,7 +3286,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            KiloAppTheme(viewModel) {
                 VybeRootApp(viewModel)
             }
         }
@@ -3176,6 +3305,19 @@ class MainActivity : ComponentActivity() {
             window.decorView.post { viewModel.playFromAssistantQuery(query) }
         }
     }
+}
+
+@Composable
+private fun KiloAppTheme(vm: MainViewModel, content: @Composable () -> Unit) {
+    val state by vm.state.collectAsState()
+    KiloTheme(
+        spec = KiloThemeSpec(
+            accent = state.activeSkin.highlight,
+            background = Color(0xFF090A0F),
+            surface = primaryPanelColor(state.activeSkin)
+        ),
+        content = content
+    )
 }
 
 @Composable
@@ -3255,8 +3397,8 @@ fun VybeRootApp(vm: MainViewModel) {
 
                 AnimatedVisibility(
                     visible = state.isFullScreenPlayerOpen,
-                    enter = if (state.uiCustomizations["reduceMotion"] == true || state.uiCustomizations["smoothMotion"] == false) fadeIn() else slideInVertically(initialOffsetY = { it }) + fadeIn(),
-                    exit = if (state.uiCustomizations["reduceMotion"] == true || state.uiCustomizations["smoothMotion"] == false) fadeOut() else slideOutVertically(targetOffsetY = { it }) + fadeOut()
+                    enter = KiloNavigationSystem.enter(state.uiCustomizations["reduceMotion"] == true || state.uiCustomizations["smoothMotion"] == false),
+                    exit = KiloNavigationSystem.exit(state.uiCustomizations["reduceMotion"] == true || state.uiCustomizations["smoothMotion"] == false)
                 ) {
                     BitchordFullScreenPlayer(state = state, vm = vm)
                 }
@@ -3548,24 +3690,34 @@ private fun SignInRequiredContent(vm: MainViewModel, skin: SkinTheme) {
                 "Connect YouTube Music to load regional recommendations, artists, albums and playlists. Your Offline Vault stays available for downloaded songs.",
                 color = Color.White.copy(alpha = 0.72f), fontSize = 14.sp, lineHeight = 20.sp, textAlign = TextAlign.Center
             )
-            Button(
-                onClick = { vm.openWebLogin() },
-                colors = ButtonDefaults.buttonColors(containerColor = accent),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Sign in to YouTube Music", color = Color.Black, fontWeight = FontWeight.ExtraBold)
-            }
+            KiloButton("Sign in to YouTube Music", modifier = Modifier.fillMaxWidth(), onClick = vm::openWebLogin)
             TextButton(onClick = { vm.setScreen(ScreenNav.OFFLINE) }) {
                 Text("Open Offline Vault", color = accent, fontWeight = FontWeight.Bold)
             }
         }
     }
 }
+private fun timeOfDayGreeting(hour: Int): String = when (hour) {
+    in 5..11 -> "Good morning"
+    in 12..16 -> "Good afternoon"
+    in 17..20 -> "Good evening"
+    else -> "Good night"
+}
+
 @Composable
 fun FreshFriendlyHomeScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val skin = state.activeSkin
     val accent = skin.highlight
+    var localHour by remember { mutableStateOf(Calendar.getInstance().get(Calendar.HOUR_OF_DAY)) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(60_000L)
+            localHour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+        }
+    }
+    val welcomeName = state.displayName.trim().ifBlank { "Listener" }
+    val welcomeMessage = "${timeOfDayGreeting(localHour)}, $welcomeName"
     val shelves = state.homeShelves.filterIndexed { index, _ ->
         if (index == 0) state.uiCustomizations["showQuickPicks"] != false
         else state.uiCustomizations["showCuratedShelves"] != false
@@ -3573,57 +3725,64 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
         shelf.copy(songs = shelf.songs.filterNot { it.id in state.notRecommendedIds })
     }.filter { it.songs.isNotEmpty() }
     val songs = shelves.flatMap { it.songs }.distinctBy { it.id }
+    val homeTabs = (listOf("All") + shelves.map { it.title }).distinct().take(7)
+    val activeHomeTab = state.activeHomeTab.takeIf { it in homeTabs } ?: "All"
     val featured = if (state.isPlaying) state.activeSong else songs.firstOrNull()
     val family = skin.layoutFamily
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val context = LocalContext.current
+    val moodLocationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        // Time-based suggestions still work if the listener declines location.
+        vm.chooseMoodForMe()
+    }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)),
         contentPadding = PaddingValues(bottom = 32.dp)
     ) {
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 18.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column {
-                    Text(
-                        when (family) {
-                            0 -> "KILO · GLASS EDITION"
-                            1 -> "GOOD ${if (Calendar.getInstance().get(Calendar.HOUR_OF_DAY) < 17) "AFTERNOON" else "EVENING"}"
-                            2 -> "VIBES FOR YOU"
-                            3 -> "LISTEN NOW"
-                            else -> "KILO WAVE"
-                        },
-                        color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.7.sp
-                    )
-                    Text(
-                        when (family) {
-                            0 -> "A softer sound space"
-                            1 -> "Hey, ${state.displayName.ifBlank { "Listener" }}"
-                            2 -> "Find your next vibe"
-                            3 -> "Made for your moments"
-                            else -> "Discover your sound"
-                        },
-                        color = Color.White, fontSize = if (family == 3) 30.sp else 25.sp, fontWeight = FontWeight.ExtraBold
-                    )
+            KiloHeader(
+                eyebrow = when (family) {
+                    0 -> "KILO · GLASS EDITION"
+                    1 -> "YOUR MUSIC, YOUR MOMENT"
+                    2 -> "VIBES FOR YOU"
+                    3 -> "LISTEN NOW"
+                    else -> "KILO WAVE"
+                },
+                title = welcomeMessage,
+                titleSize = if (family == 3) 30.sp else 25.sp,
+                trailingContent = {
+                    IconButton(
+                        onClick = { vm.setScreen(ScreenNav.SEARCH) },
+                        modifier = Modifier.size(46.dp).clip(CircleShape)
+                            .background(if (family == 0) Color.White.copy(alpha = 0.10f) else primaryPanelColor(skin))
+                            .then(if (family == 0) Modifier.border(1.dp, Color.White.copy(alpha = 0.14f), CircleShape) else Modifier)
+                    ) { Icon(Icons.Default.Search, contentDescription = "Search", tint = Color.White) }
                 }
-                IconButton(
-                    onClick = { vm.setScreen(ScreenNav.SEARCH) },
-                    modifier = Modifier.size(46.dp).clip(CircleShape)
-                        .background(if (family == 0) Color.White.copy(alpha = 0.10f) else primaryPanelColor(skin))
-                        .then(if (family == 0) Modifier.border(1.dp, Color.White.copy(alpha = 0.14f), CircleShape) else Modifier)
-                ) { Icon(Icons.Default.Search, contentDescription = "Search", tint = Color.White) }
-            }
+            )
+        }
+
+        if (featured != null) item(key = "primary_now_playing_hero") {
+            PrimaryStyleHeroCard(
+                song = featured,
+                skin = skin,
+                eyebrow = if (state.isPlaying) "NOW PLAYING" else "CONTINUE LISTENING",
+                onClick = {
+                    if (state.isPlaying) vm.setFullScreenPlayer(true)
+                    else vm.playSongFromShelf(featured, songs)
+                },
+                modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp)
+            )
         }
 
         item(key = "personalization_shortcuts") {
             Column(Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 6.dp)) {
-                Text("MOODS", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.2.sp, modifier = Modifier.padding(start = 20.dp, bottom = 3.dp))
-                LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                KiloSection("MOODS", accent = accent)
+                LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     items(PERSONALIZATION_MOODS) { mood ->
                         val selected = mood in state.listenerProfile.favoriteMoods || state.selectedMood == mood
-                        DiscoveryChoiceChip(mood, selected, accent) {
+                        val moodVisual = KiloMoodUiEngine.visualFor(mood, accent)
+                        KiloMoodCard(mood, selected, moodVisual.accent) {
                             if (state.selectedMood == mood) {
                                 vm.toggleProfileMood(mood)
                                 vm.setDiscoveryMood("Discover")
@@ -3634,7 +3793,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                         }
                     }
                 }
-                Text("GENRES", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.2.sp, modifier = Modifier.padding(start = 20.dp, top = 7.dp, bottom = 3.dp))
+                KiloSection("GENRES", accent = accent)
                 LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(PERSONALIZATION_GENRES) { genre ->
                         val selected = genre in state.listenerProfile.favoriteGenres || state.selectedMood == genre
@@ -3652,26 +3811,51 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
             }
         }
 
-        if (family == 0 || family == 3 || skin.ordinal == 11) {
-            if (featured != null) item {
-                PrimaryStyleHeroCard(
-                    song = featured,
-                    skin = skin,
-                    eyebrow = when (skin.ordinal) { 0, 4, 5 -> "YOUR DAILY SOUNDTRACK"; 11 -> "NIGHT DRIVE · CONTINUE LISTENING"; else -> "PICK UP WHERE YOU LEFT OFF" },
-                    onClick = {
-                        if (state.isPlaying) vm.setFullScreenPlayer(true)
-                        else vm.playSongFromShelf(featured, songs)
-                    },
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp)
-                )
+        item(key = "choose_mood_for_me") {
+            val selectedMoodName = state.selectedMood.takeIf { it != "Discover" } ?: state.moodSuggestion?.mood ?: "Discover"
+            val moodProfile = SmartMoodEngine.profile(selectedMoodName)
+            val moodAccent = moodProfile?.themeColorArgb?.let { Color(it) } ?: accent
+            KiloCard(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp),
+                shape = primaryCardShape(skin),
+                backgroundBrush = Brush.linearGradient(listOf(moodAccent.copy(alpha = 0.28f), primaryPanelColor(skin), primaryPanelColor(skin))),
+                borderBrush = Brush.linearGradient(listOf(moodAccent.copy(alpha = 0.46f), moodAccent.copy(alpha = 0.18f))),
+                contentPadding = 0.dp
+            ) {
+                Row(
+                    Modifier.fillMaxWidth().clickable {
+                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                            vm.chooseMoodForMe()
+                        } else {
+                            moodLocationPermission.launch(Manifest.permission.ACCESS_COARSE_LOCATION)
+                        }
+                    }.padding(horizontal = 16.dp, vertical = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(Icons.Filled.AutoAwesome, contentDescription = null, tint = moodAccent, modifier = Modifier.size(27.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Choose a mood for me", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                        val suggestion = state.moodSuggestion
+                        Text(
+                            when {
+                                suggestion != null && suggestion.mood == state.selectedMood -> "${suggestion.mood} · ${suggestion.reason}"
+                                moodProfile != null -> "${moodProfile.name} · ${moodProfile.themePreset} · energy ${moodProfile.energy} · discovery ${moodProfile.discovery}"
+                                else -> "A mix shaped by local time and nearby temperature"
+                            },
+                            color = Color.White.copy(alpha = 0.68f), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    if (state.isChoosingMood) CircularProgressIndicator(color = accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                    else Icon(Icons.Filled.ArrowForward, contentDescription = null, tint = moodAccent)
+                }
             }
         }
 
         if (shelves.isNotEmpty()) item {
-            val homeTabs = listOf("All") + shelves.map { it.title }.distinct()
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                 items(homeTabs) { label ->
-                    val selected = state.activeHomeTab == label
+                    val selected = activeHomeTab == label
                     val chipShape = if (family == 2) RoundedCornerShape(50) else primaryCardShape(skin)
                     Box(
                         Modifier.clip(chipShape).background(if (selected) accent.copy(alpha = 0.24f) else primaryPanelColor(skin))
@@ -3683,7 +3867,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
         }
 
         if (family == 1) {
-            val quickColumns = if (skin.ordinal == 8) 3 else 2
+            val quickColumns = AdaptiveLayoutManager.gridColumns(screenWidthDp, if (skin.ordinal == 8) 3 else 2)
             val quickSongs = (shelves.firstOrNull()?.songs.orEmpty() + songs).distinctBy { it.id }.take(quickColumns * 3)
             item {
                 Text("Your quick picks", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 20.dp, top = 8.dp, bottom = 10.dp))
@@ -3700,12 +3884,6 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
             }
         }
 
-        if (family == 4 && featured != null) item {
-            PrimaryWaveCard(featured, skin, onClick = {
-                if (state.isPlaying) vm.setFullScreenPlayer(true) else vm.playSongFromShelf(featured, songs)
-            }, modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp))
-        }
-
         if (shelves.isEmpty()) item {
             Box(Modifier.fillMaxWidth().height(210.dp), contentAlignment = Alignment.Center) {
                 Text(if (state.isSearching) "Finding music for you…" else "Your music feed will appear here", color = Color.White.copy(alpha = 0.65f))
@@ -3713,7 +3891,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
         }
 
         shelves.forEachIndexed { index, shelf ->
-            if (state.activeHomeTab == "All" || state.activeHomeTab == shelf.title) {
+            if (activeHomeTab == "All" || activeHomeTab == shelf.title) {
             val visibleSongs = shelf.songs.take(if (family == 1) 6 else 10)
             item(key = "primary_shelf_title_$index") {
                 Row(
@@ -3734,7 +3912,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                     BitchordSongRowItem(song, state.activeSong.id == song.id, { vm.playSongFromShelf(song, visibleSongs) }, vm)
                 }
             } else if (family == 1 || skin.ordinal == 13) {
-                val columns = if (skin.ordinal == 8) 3 else 2
+                val columns = AdaptiveLayoutManager.gridColumns(screenWidthDp, if (skin.ordinal == 8) 3 else 2)
                 visibleSongs.chunked(columns).forEachIndexed { rowIndex, rowSongs ->
                     item(key = "tile_shelf_${index}_$rowIndex") {
                         Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
@@ -3777,22 +3955,17 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
 
 @Composable
 private fun PrimaryStyleHeroCard(song: SongItemClean, skin: SkinTheme, eyebrow: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
-    val heroHeights = listOf(280, 276, 292, 355, 264, 300, 260, 276, 292, 310, 340, 320, 355, 334, 282)
-    Box(modifier.fillMaxWidth().height(heroHeights[skin.ordinal].dp).clip(primaryCardShape(skin)).clickable { onClick() }) {
+    KiloHeroCard(
+        title = song.title,
+        subtitle = song.artist,
+        eyebrow = eyebrow,
+        accent = skin.highlight,
+        modifier = modifier,
+        shape = primaryCardShape(skin),
+        glassFrame = skin.layoutFamily == 0,
+        onClick = onClick
+    ) {
         AsyncImage(song.coverUrl, contentDescription = song.title, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-        Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.05f), Color.Black.copy(alpha = 0.88f)))))
-        if (skin.layoutFamily == 0) {
-            Box(Modifier.fillMaxSize().padding(10.dp).clip(primaryCardShape(skin)).background(Color.White.copy(alpha = 0.06f)).border(1.dp, Color.White.copy(alpha = 0.19f), primaryCardShape(skin)))
-        }
-        Column(Modifier.align(Alignment.BottomStart).padding(20.dp)) {
-            Text(eyebrow, color = Color.White.copy(alpha = 0.76f), fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.4.sp)
-            Spacer(Modifier.height(5.dp))
-            Text(song.title, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(song.artist, color = Color.White.copy(alpha = 0.78f), fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-        Box(Modifier.align(Alignment.BottomEnd).padding(18.dp).size(48.dp).clip(CircleShape).background(skin.highlight), contentAlignment = Alignment.Center) {
-            Icon(Icons.Filled.PlayArrow, contentDescription = "Play ${song.title}", tint = Color.Black, modifier = Modifier.size(28.dp))
-        }
     }
 }
 
@@ -4317,36 +4490,14 @@ fun BitchordLargeQuickPickCard(song: SongItemClean, onClick: () -> Unit) {
 
 @Composable
 fun BitchordSquareAlbumCard(song: SongItemClean, onClick: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .width(150.dp)
-            .clickable { onClick() }
+    KiloAlbumCard(
+        title = song.title,
+        subtitle = song.artist,
+        width = 150.dp,
+        artworkSize = 150.dp,
+        onClick = onClick
     ) {
-        AsyncImage(
-            model = song.coverUrl,
-            contentDescription = song.title,
-            modifier = Modifier
-                .size(150.dp)
-                .clip(RoundedCornerShape(18.dp))
-                .background(Color(0xFF18181E)),
-            contentScale = ContentScale.Crop
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = song.title,
-            color = Color.White,
-            fontSize = 14.sp,
-            fontWeight = FontWeight.Bold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            text = song.artist,
-            color = Color.Gray,
-            fontSize = 12.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
+        AsyncImage(model = song.coverUrl, contentDescription = song.title, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
     }
 }
 
@@ -4674,7 +4825,15 @@ private fun PlayerArtworkContent(
     Box(
         modifier = modifier
             .clip(shape)
-            .background(Color.White.copy(alpha = 0.06f))
+            .background(
+                Brush.linearGradient(
+                    listOf(
+                        Color.White.copy(alpha = 0.19f),
+                        style.accent.copy(alpha = 0.08f),
+                        Color.White.copy(alpha = 0.035f)
+                    )
+                )
+            )
             .border(
                 width = 1.5.dp,
                 brush = Brush.verticalGradient(listOf(style.accent.copy(alpha = 0.72f), Color.White.copy(alpha = 0.10f))),
@@ -4794,7 +4953,22 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(50))
-                            .background(Color.White.copy(alpha = 0.14f))
+                            .background(
+                                Brush.linearGradient(
+                                    listOf(
+                                        Color.White.copy(alpha = 0.26f),
+                                        playerAccent.copy(alpha = 0.18f),
+                                        Color.White.copy(alpha = 0.07f)
+                                    )
+                                )
+                            )
+                            .border(
+                                1.dp,
+                                Brush.verticalGradient(
+                                    listOf(Color.White.copy(alpha = 0.72f), playerAccent.copy(alpha = 0.32f), Color.White.copy(alpha = 0.10f))
+                                ),
+                                RoundedCornerShape(50)
+                            )
                             .clickable {
                                 val skins = SkinTheme.values()
                                 val next = skins[(skins.indexOf(skin) + 1) % skins.size]
@@ -4905,7 +5079,38 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                     }
                 }
 
-                Column(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(
+                            if (skin.layoutFamily == 0) {
+                                val glassShape = RoundedCornerShape(30.dp)
+                                Modifier
+                                    .clip(glassShape)
+                                    .background(
+                                        Brush.linearGradient(
+                                            listOf(
+                                                Color.White.copy(alpha = 0.22f),
+                                                playerAccent.copy(alpha = 0.12f),
+                                                Color.White.copy(alpha = 0.055f)
+                                            )
+                                        )
+                                    )
+                                    .border(
+                                        1.dp,
+                                        Brush.verticalGradient(
+                                            listOf(
+                                                Color.White.copy(alpha = 0.76f),
+                                                playerAccent.copy(alpha = 0.36f),
+                                                Color.White.copy(alpha = 0.11f)
+                                            )
+                                        ),
+                                        glassShape
+                                    )
+                                    .padding(horizontal = 16.dp, vertical = 14.dp)
+                            } else Modifier
+                        )
+                ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -4984,7 +5189,20 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                             modifier = Modifier
                                 .size(if (custom["largeTransportControls"] == true) 78.dp else 68.dp)
                                 .clip(playerControlShape(playerStyle))
-                                .background(playerAccent)
+                                .background(
+                                    Brush.linearGradient(
+                                        if (skin.layoutFamily == 0) {
+                                            listOf(Color.White.copy(alpha = 0.96f), playerAccent, playerAccent.copy(alpha = 0.80f))
+                                        } else {
+                                            listOf(playerAccent, playerAccent.copy(alpha = 0.86f))
+                                        }
+                                    )
+                                )
+                                .border(
+                                    1.dp,
+                                    Color.White.copy(alpha = if (skin.layoutFamily == 0) 0.72f else 0.22f),
+                                    playerControlShape(playerStyle)
+                                )
                         ) {
                             Icon(
                                 imageVector = if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
@@ -5723,41 +5941,67 @@ private fun AppLayoutPreview(index: Int, accent: Color) {
 private fun AutoLayoutPreview(index: Int, accent: Color, modifier: Modifier = Modifier) {
     val shell = RoundedCornerShape(9.dp)
     val tile = RoundedCornerShape(if (index % 3 == 0) 8.dp else 3.dp)
-    Row(
-        modifier.fillMaxWidth().height(76.dp).clip(shell).background(Color(0xFF070B11)).border(1.dp, accent.copy(alpha = 0.3f), shell).padding(5.dp),
-        horizontalArrangement = Arrangement.spacedBy(5.dp)
+    Column(
+        modifier.fillMaxWidth().height(96.dp).clip(shell).background(Color(0xFF070B11))
+            .border(1.dp, accent.copy(alpha = 0.3f), shell).padding(5.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp)
     ) {
-        Column(Modifier.width(12.dp).fillMaxHeight(), verticalArrangement = Arrangement.SpaceEvenly, horizontalAlignment = Alignment.CenterHorizontally) {
-            repeat(3) { Box(Modifier.size(5.dp).clip(CircleShape).background(if (it == index % 3) accent else Color.White.copy(0.55f))) }
+        Row(Modifier.fillMaxWidth().height(4.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.width(15.dp).height(2.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.7f)))
+            Spacer(Modifier.width(4.dp))
+            Box(Modifier.width(8.dp).height(2.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.35f)))
+            Spacer(Modifier.weight(1f))
+            repeat(3) { Box(Modifier.padding(start = 2.dp).size(3.dp).clip(CircleShape).background(accent.copy(alpha = 0.9f))) }
         }
-        when (index) {
-            0, 1, 2, 3, 14, 15, 16, 17, 22 -> {
-                Row(Modifier.fillMaxSize().clip(tile).background(Color(0xFF111A25)).padding(5.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.fillMaxHeight().weight(if (index == 1 || index == 22) 1f else 0.72f).clip(tile).background(Brush.linearGradient(listOf(accent, Color(0xFF151D34), accent.copy(alpha = 0.38f)))))
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp), horizontalAlignment = Alignment.Start) {
-                        Box(Modifier.fillMaxWidth(0.78f).height(4.dp).clip(CircleShape).background(Color.White.copy(0.88f)))
-                        Box(Modifier.fillMaxWidth(0.42f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.4f)))
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) { repeat(3) { Box(Modifier.size(if (it == 1) 9.dp else 5.dp).clip(CircleShape).background(if (it == 1) accent else Color.White)) } }
+        Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+            Column(Modifier.width(12.dp).fillMaxHeight(), verticalArrangement = Arrangement.SpaceEvenly, horizontalAlignment = Alignment.CenterHorizontally) {
+                repeat(4) { Box(Modifier.size(if (it == index % 4) 6.dp else 5.dp).clip(CircleShape).background(if (it == index % 4) accent else Color.White.copy(0.55f))) }
+            }
+            when (index) {
+                0, 1, 2, 3 -> {
+                    Row(Modifier.fillMaxSize().clip(tile).background(Color(0xFF111A25)).padding(5.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Box(Modifier.fillMaxHeight().weight(if (index == 1) 1f else 0.72f).clip(tile).background(Brush.linearGradient(listOf(accent, Color(0xFF151D34), accent.copy(alpha = 0.38f)))))
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp), horizontalAlignment = Alignment.Start) {
+                            Box(Modifier.fillMaxWidth(0.78f).height(4.dp).clip(CircleShape).background(Color.White.copy(0.88f)))
+                            Box(Modifier.fillMaxWidth(0.42f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.4f)))
+                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) { repeat(3) { Box(Modifier.size(if (it == 1) 9.dp else 5.dp).clip(CircleShape).background(if (it == 1) accent else Color.White)) } }
+                        }
+                        if (index == 3) Box(Modifier.width(28.dp).fillMaxHeight().clip(tile).background(Color(0xFF192334)))
                     }
-                    if (index == 3 || index in 14..17) Box(Modifier.width(34.dp).fillMaxHeight().clip(tile).background(Color(0xFF192334)))
+                }
+                4, 5 -> {
+                    Column(Modifier.fillMaxSize().clip(tile).background(Color(0xFF101722)).padding(5.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                        if (index == 5) repeat(3) { Box(Modifier.fillMaxWidth(if (it == 1) 0.55f else 0.85f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.66f))) }
+                        else repeat(3) { i -> Row(Modifier.fillMaxWidth().weight(1f).clip(tile).background(Color(0xFF172130)).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) { Box(Modifier.size(10.dp).clip(tile).background(accent.copy(alpha = 0.8f - i * 0.12f))); Box(Modifier.fillMaxWidth(0.62f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.72f))) } }
+                    }
+                }
+                7, 8 -> {
+                    Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        repeat(2) { r -> Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) { repeat(3) { c -> Box(Modifier.weight(1f).fillMaxHeight().clip(tile).background(Brush.linearGradient(listOf(accent.copy(alpha = 0.75f - (r + c) * 0.1f), Color(0xFF111B28))))) } } }
+                    }
+                }
+                else -> {
+                    Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        repeat(3) { i -> Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(3.dp)) { Box(Modifier.fillMaxWidth().weight(1f).clip(tile).background(Brush.verticalGradient(listOf(accent.copy(alpha = 0.85f - i * 0.15f), Color(0xFF121A2A))))); Box(Modifier.fillMaxWidth(0.75f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.5f))) } }
+                    }
                 }
             }
-            4, 5, 9, 10, 11, 18, 21, 24 -> {
-                Column(Modifier.fillMaxSize().clip(tile).background(Color(0xFF101722)).padding(5.dp), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    if (index == 5) repeat(3) { Box(Modifier.fillMaxWidth(if (it == 1) 0.55f else 0.85f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.66f))) }
-                    else repeat(3) { i -> Row(Modifier.fillMaxWidth().weight(1f).clip(tile).background(Color(0xFF172130)).padding(horizontal = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) { Box(Modifier.size(10.dp).clip(tile).background(accent.copy(alpha = 0.8f - i * 0.12f))); Box(Modifier.fillMaxWidth(0.62f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.72f))) } }
-                }
+        }
+        Row(
+            Modifier.fillMaxWidth().height(17.dp).clip(RoundedCornerShape(5.dp))
+                .background(Color(0xFF111925)).padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Box(Modifier.size(11.dp).clip(RoundedCornerShape(3.dp)).background(Brush.linearGradient(listOf(accent, Color(0xFF17243A)))))
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Box(Modifier.fillMaxWidth(0.6f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.78f)))
+                Box(Modifier.fillMaxWidth(0.35f).height(2.dp).clip(CircleShape).background(Color.White.copy(0.38f)))
             }
-            7, 19, 20, 23 -> {
-                Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    repeat(2) { r -> Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) { repeat(3) { c -> Box(Modifier.weight(1f).fillMaxHeight().clip(tile).background(Brush.linearGradient(listOf(accent.copy(alpha = 0.75f - (r + c) * 0.1f), Color(0xFF111B28))))) } } }
-                }
-            }
-            else -> {
-                Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    repeat(3) { i -> Column(Modifier.weight(1f).fillMaxHeight(), verticalArrangement = Arrangement.spacedBy(3.dp)) { Box(Modifier.fillMaxWidth().weight(1f).clip(tile).background(Brush.verticalGradient(listOf(accent.copy(alpha = 0.85f - i * 0.15f), Color(0xFF121A2A))))); Box(Modifier.fillMaxWidth(0.75f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.5f))) } }
-                }
-            }
+            repeat(3) { i -> Box(Modifier.size(if (i == 1) 7.dp else 4.dp).clip(CircleShape).background(if (i == 1) Color.White else accent)) }
+        }
+        Row(Modifier.fillMaxWidth().height(3.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+            repeat(4) { i -> Box(Modifier.width(if (i == index % 4) 12.dp else 6.dp).height(2.dp).clip(CircleShape).background(if (i == index % 4) accent else Color.White.copy(0.25f))) }
         }
     }
 }
@@ -5765,7 +6009,14 @@ private fun AutoLayoutPreview(index: Int, accent: Color, modifier: Modifier = Mo
 @Composable
 fun AndroidAutoSettingsScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
+    val context = LocalContext.current
     val accent = state.activeSkin.highlight
+    var homePriority by remember {
+        mutableStateOf(AndroidAutoHomeLayouts.normalizePriority(
+            context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
+                .getString(AndroidAutoHomeLayouts.ORDER_PREFERENCE, null)
+        ))
+    }
     Column(
         modifier = Modifier.fillMaxSize().background(primaryBackdrop(state.activeSkin)).statusBarsPadding()
     ) {
@@ -5787,7 +6038,7 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
         ) {
             item {
             Text(
-                    "Choose a browse style and the number of shelves. There are 25 combinations: five styles with two to six shelves.",
+                    "Choose how KILO appears in your car. Android Auto keeps its driver-safe controls and applies the final card size and spacing.",
                     color = Color.White.copy(alpha = 0.65f), fontSize = 13.sp, lineHeight = 19.sp,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                 )
@@ -5811,33 +6062,72 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
                     )
                 }
             }
-            item { SettingsSectionHeader("ALL 25 LAYOUTS") }
+            item { SettingsSectionHeader("HOME LAYOUT") }
             item {
-                Text("Five browse styles, each with two to six shelves. Preview and choose any layout below.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(horizontal = 4.dp))
+                Text("Ten presets for different listening habits. The selected layout changes the Home browse tree only; playback and search stay on their existing paths.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(horizontal = 4.dp))
             }
-            val layoutChoices = AUTO_LAYOUT_PROFILES.flatMapIndexed { profileIndex, profile ->
-                (2..6).map { shelfCount ->
-                    Triple(profileIndex * 5 + shelfCount - 2, "${profileIndex + 1}|$shelfCount|${profile.first}", "${profile.first} · $shelfCount shelves")
-                }
-            }
-            layoutChoices.chunked(2).forEachIndexed { rowIndex, rowChoices ->
+            AndroidAutoHomeLayouts.presets.chunked(2).forEachIndexed { rowIndex, rowChoices ->
                 item(key = "auto_layout_row_$rowIndex") {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        rowChoices.forEach { (previewIndex, mode, title) ->
-                            val selected = state.autoLayoutMode == mode
+                        rowChoices.forEach { preset ->
+                            val previewIndex = AndroidAutoHomeLayouts.presets.indexOf(preset)
+                            val selected = state.autoLayoutMode == preset.id
                             Column(
                                 Modifier.weight(1f).clip(RoundedCornerShape(18.dp))
                                     .background(if (selected) accent.copy(alpha = 0.13f) else Color.White.copy(alpha = 0.035f))
                                     .border(1.dp, if (selected) accent.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.09f), RoundedCornerShape(18.dp))
-                                    .clickable { vm.setAutoLayoutMode(mode) }.padding(10.dp),
+                                    .clickable { vm.setAutoLayoutMode(preset.id) }.padding(10.dp),
                                 verticalArrangement = Arrangement.spacedBy(7.dp)
                             ) {
                                 AutoLayoutPreview(previewIndex, accent)
-                                Text(title, color = if (selected) Color.White else Color.White.copy(alpha = 0.8f), fontSize = 11.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, maxLines = 2, minLines = 2, overflow = TextOverflow.Ellipsis)
+                                Text(preset.name, color = if (selected) Color.White else Color.White.copy(alpha = 0.8f), fontSize = 11.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, maxLines = 2, minLines = 2, overflow = TextOverflow.Ellipsis)
+                                Text(preset.description, color = Color.White.copy(alpha = 0.56f), fontSize = 10.sp, lineHeight = 13.sp, maxLines = 2, minLines = 2, overflow = TextOverflow.Ellipsis)
                                 Text(if (selected) "Selected" else "Tap to use", color = if (selected) accent else Color.White.copy(alpha = 0.48f), fontSize = 10.sp)
                             }
                         }
                         if (rowChoices.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+            item { SettingsSectionHeader("HOME PRIORITY") }
+            item {
+                Text("Move the sections you use most toward the top. This order is applied within each layout.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(horizontal = 4.dp))
+            }
+            item {
+                SettingsGroupCard {
+                    homePriority.forEachIndexed { index, key ->
+                        val title = AndroidAutoHomeLayouts.priorityChoices.firstOrNull { it.first == key }?.second ?: key
+                        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Text("${index + 1}.", color = accent, fontWeight = FontWeight.Bold, modifier = Modifier.width(30.dp))
+                            Text(title, color = Color.White, modifier = Modifier.weight(1f))
+                            IconButton(
+                                onClick = {
+                                    val updated = homePriority.toMutableList().also {
+                                        val moved = it.removeAt(index)
+                                        it.add(index - 1, moved)
+                                    }
+                                    homePriority = updated
+                                    context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE).edit()
+                                        .putString(AndroidAutoHomeLayouts.ORDER_PREFERENCE, updated.joinToString(","))
+                                        .apply()
+                                },
+                                enabled = index > 0
+                            ) { Icon(Icons.Default.ArrowUpward, contentDescription = "Move $title up", tint = if (index > 0) accent else Color.Gray) }
+                            IconButton(
+                                onClick = {
+                                    val updated = homePriority.toMutableList().also {
+                                        val moved = it.removeAt(index)
+                                        it.add(index + 1, moved)
+                                    }
+                                    homePriority = updated
+                                    context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE).edit()
+                                        .putString(AndroidAutoHomeLayouts.ORDER_PREFERENCE, updated.joinToString(","))
+                                        .apply()
+                                },
+                                enabled = index < homePriority.lastIndex
+                            ) { Icon(Icons.Default.ArrowDownward, contentDescription = "Move $title down", tint = if (index < homePriority.lastIndex) accent else Color.Gray) }
+                        }
+                        if (index < homePriority.lastIndex) HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
                     }
                 }
             }
@@ -6047,11 +6337,20 @@ fun SettingsSectionHeader(title: String) {
 @Composable
 fun SettingsGroupCard(content: @Composable ColumnScope.() -> Unit) {
     val glass = LocalUiCustomizations.current["glassPanels"] != false
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(if (glass) Color(0xFF1C1829).copy(alpha = 0.82f) else Color(0xFF15121E)),
+    val skin = LocalPrimarySkin.current
+    val shape = RoundedCornerShape(20.dp)
+    val liquidGlass = glass && skin.layoutFamily == 0
+    KiloCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = shape,
+        containerColor = if (glass) Color(0xFF1C1829).copy(alpha = 0.82f) else Color(0xFF15121E),
+        backgroundBrush = if (liquidGlass) Brush.linearGradient(
+            listOf(Color.White.copy(alpha = 0.19f), skin.highlight.copy(alpha = 0.10f), Color.White.copy(alpha = 0.045f))
+        ) else null,
+        borderBrush = if (liquidGlass) Brush.verticalGradient(
+            listOf(Color.White.copy(alpha = 0.62f), skin.highlight.copy(alpha = 0.28f), Color.White.copy(alpha = 0.09f))
+        ) else null,
+        contentPadding = 0.dp,
         content = content
     )
 }
@@ -6065,40 +6364,27 @@ fun SettingsRowItem(
     trailingValue: String? = null,
     onClick: () -> Unit
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onClick() }
-            .padding(horizontal = 16.dp, vertical = 16.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(24.dp))
-        Spacer(modifier = Modifier.width(16.dp))
-        Column(modifier = Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium)
-                if (badgeText != null) {
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(Color(0xFF2C2C34))
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
-                    ) {
-                        Text(badgeText, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
-                    }
+    KiloListItem(
+        title = title,
+        subtitle = subtitle,
+        onClick = onClick,
+        leadingContent = { Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(24.dp)) },
+        titleContent = {
+            Text(title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (badgeText != null) {
+                Spacer(modifier = Modifier.width(8.dp))
+                Box(Modifier.clip(RoundedCornerShape(6.dp)).background(Color(0xFF2C2C34)).padding(horizontal = 6.dp, vertical = 2.dp)) {
+                    Text(badgeText, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
                 }
             }
-            if (subtitle != null) {
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(subtitle, color = Color.Gray, fontSize = 13.sp)
+        },
+        trailingContent = {
+            if (trailingValue != null) {
+                Text(trailingValue, color = Color.Gray, fontSize = 15.sp, modifier = Modifier.padding(end = 6.dp))
             }
+            Icon(Icons.Default.KeyboardArrowRight, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(20.dp))
         }
-        if (trailingValue != null) {
-            Text(trailingValue, color = Color.Gray, fontSize = 15.sp, modifier = Modifier.padding(end = 6.dp))
-        }
-        Icon(Icons.Default.KeyboardArrowRight, contentDescription = null, tint = Color.Gray, modifier = Modifier.size(20.dp))
-    }
+    )
 }
 
 @Composable
@@ -6181,6 +6467,42 @@ fun SearchScreen(vm: MainViewModel) {
             )
         )
 
+        KiloSection("QUICK FILTERS", accent = accent)
+        LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(SearchEnhancer.quickFilters()) { filter ->
+                val shape = RoundedCornerShape(50)
+                Box(
+                    Modifier.clip(shape).background(primaryPanelColor(skin))
+                        .border(1.dp, accent.copy(alpha = 0.35f), shape)
+                        .clickable {
+                            val applied = if (filter.queryTerm.startsWith("(")) {
+                                if (state.searchQuery.isBlank()) "${filter.label} songs" else "${state.searchQuery} ${filter.queryTerm}"
+                            } else if (state.searchQuery.isBlank()) filter.queryTerm else "${state.searchQuery} ${filter.queryTerm}"
+                            vm.onSearchQueryChanged(applied)
+                        }
+                        .padding(horizontal = 13.dp, vertical = 8.dp)
+                ) { Text(filter.label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+            }
+        }
+        if (state.searchSuggestions.isNotEmpty()) {
+            KiloSection("SUGGESTIONS", accent = accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(state.searchSuggestions) { suggestion ->
+                    val shape = RoundedCornerShape(50)
+                    Row(
+                        Modifier.clip(shape).background(Color.White.copy(alpha = 0.045f))
+                            .border(1.dp, Color.White.copy(alpha = 0.08f), shape)
+                            .clickable { vm.onSearchQueryChanged(suggestion) }
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(Icons.Default.History, contentDescription = null, tint = accent, modifier = Modifier.size(14.dp))
+                        Text(suggestion, color = Color.White.copy(alpha = 0.88f), fontSize = 11.sp, maxLines = 1)
+                    }
+                }
+            }
+        }
         Spacer(modifier = Modifier.height(12.dp))
 
         Row(
@@ -6333,22 +6655,15 @@ fun ArtistDetailScreen(vm: MainViewModel) {
 
 @Composable
 private fun CommunityPlaylistSearchRow(playlist: SongItemClean, onClick: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 20.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
+    KiloPlaylistCard(
+        title = playlist.title,
+        subtitle = playlist.artist.ifBlank { "Community playlist" },
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+        artworkSize = 64.dp,
+        onClick = onClick,
+        trailingContent = { Icon(Icons.Default.PlayArrow, contentDescription = "Play playlist", tint = Color.White) }
     ) {
-        AsyncImage(
-            model = playlist.coverUrl,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier.size(58.dp).clip(RoundedCornerShape(12.dp))
-        )
-        Spacer(Modifier.width(14.dp))
-        Column(Modifier.weight(1f)) {
-            Text(playlist.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(playlist.artist.ifBlank { "Community playlist" }, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        }
-        Icon(Icons.Default.PlayArrow, contentDescription = "Play playlist", tint = Color.White)
+        AsyncImage(model = playlist.coverUrl, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
     }
 }
 

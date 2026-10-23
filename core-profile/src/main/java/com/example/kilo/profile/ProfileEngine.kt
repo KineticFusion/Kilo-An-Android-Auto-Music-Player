@@ -149,5 +149,5 @@ val PERSONALIZATION_GENRES = listOf(
 
 val PERSONALIZATION_MOODS = listOf(
     "Focus", "Study", "Coding", "Workout", "Night Drive", "Road Trip", "Commute", "Gaming", "Relax",
-    "Sleep", "Party", "High Energy", "Happy", "Sad", "Romantic", "Nostalgic"
+    "Sleep", "Party", "High Energy", "Happy", "Sad", "Romantic", "Nostalgic", "Rain Drive", "Coffee Vibes"
 )

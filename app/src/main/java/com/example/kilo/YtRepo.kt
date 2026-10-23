@@ -93,6 +93,11 @@ object YtRepo {
         }
     }
 
+    /** Touching the repository runs its existing NewPipe initialization before cold playback. */
+    fun warmUp() {
+        Log.i(TAG, "resolverInitialized")
+    }
+
     fun refreshCookieFromWebView() {
         try {
             val cookies = CookieManager.getInstance().getCookie(ORIGIN) ?: ""

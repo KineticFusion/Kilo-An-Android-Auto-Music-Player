@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 11
-        versionName = "2.1.0"
+        versionCode = 14
+        versionName = "2.3.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -37,6 +37,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -57,8 +58,12 @@ androidComponents {
         implementation(libs.androidx.compose.ui.graphics)
         implementation(libs.androidx.compose.ui.tooling.preview)
         implementation(libs.androidx.core.ktx)
+        implementation("androidx.appcompat:appcompat:1.7.0")
         implementation(project(":core-streaming"))
         implementation(project(":core-profile"))
+        implementation(project(":core-search"))
+        implementation(project(":core-ui"))
+        implementation(project(":core-androidauto"))
         implementation(libs.androidx.lifecycle.runtime.ktx)
         implementation(libs.androidx.room.runtime)
         ksp(libs.androidx.room.compiler)

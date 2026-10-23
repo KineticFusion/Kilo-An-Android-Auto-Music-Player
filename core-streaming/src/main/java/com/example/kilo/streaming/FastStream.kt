@@ -260,7 +260,7 @@ object AudioCache {
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
     }
 
-    fun prefetch(ctx: Context, videoId: String, info: StreamInfo, bytes: Long = 1_048_576L) {
+    fun prefetch(ctx: Context, videoId: String, info: StreamInfo, bytes: Long = 1_048_576L): Throwable? =
         runCatching {
             val host = Uri.parse(info.url).host.orEmpty()
             val referer = if (host.endsWith("youtube.com") || host.endsWith("googlevideo.com")) {
@@ -273,15 +273,12 @@ object AudioCache {
             val source = dataSourceFactory(ctx, info.userAgent, info.requestHeaders + referer).createDataSource()
             val spec = DataSpec.Builder()
                 .setUri(Uri.parse(info.url))
-                // Cache spans are range-aware, so playback can reuse this prefix
-                // and fetch the remaining ranges when it needs to seek further.
                 .setKey(keyFor(videoId, info.url))
                 .setPosition(0)
                 .setLength(bytes)
                 .build()
             CacheWriter(source, spec, null, null).cache()
-        }
-    }
+        }.exceptionOrNull()
 }
 
 object ChunkedDownloader {

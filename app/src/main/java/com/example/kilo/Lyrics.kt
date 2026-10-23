@@ -1,6 +1,7 @@
 package com.example.kilo
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -18,6 +19,11 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -58,29 +64,140 @@ object LyricsRepository {
         cache.clear()
     }
 
-    suspend fun find(song: SongItemClean): List<LyricLine> = withContext(Dispatchers.IO) {
-        val key = "${song.title.trim().lowercase()}|${song.artist.trim().lowercase()}"
-        cache[key]?.filter { it.timeMs >= 0L }?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
-        val providerFunctions: Map<String, (SongItemClean) -> List<LyricLine>> = mapOf(
-            "betterlyrics" to ::findBetterLyrics,
-            "paxsenix" to ::findPaxsenix,
-            "youtube_music" to YtRepo::fetchLyrics,
-            "lrclib" to ::findLrclib,
-            "kugou" to ::findKugou,
-            "lyrics_ovh" to ::findLyricsOvh
-        )
-        for (id in providerOrderForLookup()) {
-            val provider = providerFunctions[id] ?: continue
-            val result = runCatching { provider(song) }
-                .onFailure { Log.w(TAG, "Lyrics provider $id failed", it) }
-                .getOrDefault(emptyList())
-                .filter { it.timeMs >= 0L && it.text.isNotBlank() }
-            if (result.isNotEmpty()) {
-                cache[key] = result
-                return@withContext result
-            }
+    private val lookupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val inFlight = java.util.concurrent.ConcurrentHashMap<String, Deferred<List<LyricLine>>>()
+
+    suspend fun find(song: SongItemClean): List<LyricLine> {
+        val key = cacheKey(song)
+        cache[key]?.filter { it.timeMs >= 0L }?.takeIf { it.isNotEmpty() }?.let { return it }
+        return lookup(song, key).await()
+    }
+
+    /** Starts a background lookup as soon as playback begins, so opening Lyrics is not the fetch trigger. */
+    fun prefetch(song: SongItemClean) {
+        val key = cacheKey(song)
+        if (cache[key]?.isNotEmpty() == true) return
+        lookup(song, key)
+    }
+
+    private fun cacheKey(song: SongItemClean) =
+        song.title.trim().lowercase() + "|" + song.artist.trim().lowercase()
+
+    private fun lookup(song: SongItemClean, key: String): Deferred<List<LyricLine>> {
+        inFlight[key]?.let { return it }
+        val created = lookupScope.async(start = CoroutineStart.LAZY) {
+            loadFromProviders(song, key)
         }
-        emptyList()
+        val existing = inFlight.putIfAbsent(key, created)
+        if (existing != null) {
+            created.cancel()
+            return existing
+        }
+        created.invokeOnCompletion { inFlight.remove(key, created) }
+        created.start()
+        return created
+    }
+
+    private suspend fun loadFromProviders(song: SongItemClean, key: String): List<LyricLine> =
+        withContext(Dispatchers.IO) {
+            cache[key]?.filter { it.timeMs >= 0L }?.takeIf { it.isNotEmpty() }?.let { return@withContext it }
+            val startedAt = SystemClock.elapsedRealtime()
+            val providerFunctions: Map<String, (SongItemClean) -> List<LyricLine>> = mapOf(
+                "betterlyrics" to ::findBetterLyrics,
+                "paxsenix" to ::findPaxsenix,
+                "youtube_music" to YtRepo::fetchLyrics,
+                "lrclib" to ::findLrclib,
+                "kugou" to ::findKugou,
+                "lyrics_ovh" to ::findLyricsOvh
+            )
+            var bestCandidate: List<LyricLine> = emptyList()
+            var bestProvider = ""
+            var bestScore = Long.MIN_VALUE
+            for (id in providerOrderForLookup()) {
+                val provider = providerFunctions[id] ?: continue
+                val providerStartedAt = SystemClock.elapsedRealtime()
+                val result = runCatching { provider(song) }
+                    .onFailure { Log.w(TAG, "Lyrics provider " + id + " failed", it) }
+                    .getOrDefault(emptyList())
+                    .filter { it.timeMs >= 0L && it.text.isNotBlank() }
+                val providerDuration = SystemClock.elapsedRealtime() - providerStartedAt
+                Log.d(
+                    TAG,
+                    "providerResult key=" + key.hashCode() +
+                        " provider=" + id +
+                        " durationMs=" + providerDuration +
+                        " lines=" + result.size +
+                        " firstLineMs=" + (result.firstOrNull()?.timeMs ?: -1L)
+                )
+                if (result.isNotEmpty()) {
+                    val score = candidateScore(song, result)
+                    if (score > bestScore) {
+                        bestCandidate = result
+                        bestProvider = id
+                        bestScore = score
+                    }
+                    if (hasCompleteOpening(song, result)) {
+                        cache[key] = result
+                        Log.i(
+                            TAG,
+                            "lyricsReady key=" + key.hashCode() +
+                                " provider=" + id +
+                                " totalDurationMs=" + (SystemClock.elapsedRealtime() - startedAt) +
+                                " lines=" + result.size +
+                                " firstLineMs=" + (result.firstOrNull()?.timeMs ?: -1L)
+                        )
+                        return@withContext result
+                    }
+                }
+            }
+            if (bestCandidate.isNotEmpty()) {
+                cache[key] = bestCandidate
+                Log.i(
+                    TAG,
+                    "lyricsReady key=" + key.hashCode() +
+                        " provider=" + bestProvider +
+                        " totalDurationMs=" + (SystemClock.elapsedRealtime() - startedAt) +
+                        " lines=" + bestCandidate.size +
+                        " firstLineMs=" + (bestCandidate.firstOrNull()?.timeMs ?: -1L) +
+                        " fallback=best_coverage"
+                )
+                return@withContext bestCandidate
+            }
+            Log.i(
+                TAG,
+                "lyricsNotFound key=" + key.hashCode() +
+                    " totalDurationMs=" + (SystemClock.elapsedRealtime() - startedAt)
+            )
+            emptyList()
+        }
+
+    private fun candidateScore(song: SongItemClean, lines: List<LyricLine>): Long {
+        val timed = lines.asSequence()
+            .filter { it.timeMs >= 0L && it.text.isNotBlank() }
+            .sortedBy { it.timeMs }
+            .toList()
+        if (timed.isEmpty()) return Long.MIN_VALUE
+        val duration = song.durationMs
+        val withinTrack = timed.filter { duration <= 0L || it.timeMs <= duration + 10_000L }
+        if (withinTrack.isEmpty()) return Long.MIN_VALUE
+        val firstMs = withinTrack.first().timeMs
+        val coveragePermille = if (duration > 0L) {
+            (withinTrack.last().timeMs * 1_000L / duration).coerceIn(0L, 1_000L)
+        } else 0L
+        return withinTrack.size * 100L + coveragePermille - firstMs / 10L
+    }
+
+    private fun hasCompleteOpening(song: SongItemClean, lines: List<LyricLine>): Boolean {
+        val timed = lines.asSequence()
+            .filter { it.timeMs >= 0L && it.text.isNotBlank() }
+            .sortedBy { it.timeMs }
+            .toList()
+        if (timed.isEmpty() || timed.first().timeMs > 15_000L) return false
+        val minimumLines = if (song.durationMs in 1L..180_000L) 4 else 8
+        val duration = song.durationMs
+        val lastLine = timed.last().timeMs
+        val minimumCoverage = if (duration > 0L) duration / 3L else 0L
+        return timed.size >= minimumLines && (duration <= 0L || lastLine >= minimumCoverage)
     }
 
     @Volatile private var activeOrder: List<String>? = null
@@ -304,7 +421,7 @@ fun SyncedLyricsOverlay(song: SongItemClean, positionMs: Long, onSeek: (Long) ->
     var lines by remember(song.id) { mutableStateOf<List<LyricLine>?>(null) }
     LaunchedEffect(song.id) { lines = LyricsRepository.find(song) }
     val timed = lines.orEmpty().any { it.timeMs >= 0L }
-    val current = if (timed) lines.orEmpty().indexOfLast { it.timeMs >= 0L && it.timeMs <= positionMs }.coerceAtLeast(0) else -1
+    val current = if (timed) lines.orEmpty().indexOfLast { it.timeMs >= 0L && it.timeMs <= positionMs } else -1
     val listState = rememberLazyListState()
     LaunchedEffect(current) { if (current >= 0) listState.animateScrollToItem(current) }
     when {

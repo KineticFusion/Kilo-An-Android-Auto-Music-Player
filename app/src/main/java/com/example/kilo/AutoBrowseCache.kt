@@ -12,6 +12,7 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import java.util.concurrent.ConcurrentHashMap
 import androidx.room.Transaction
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -72,6 +73,15 @@ abstract class AutoBrowseDatabase : RoomDatabase() {
             ).build().also { instance = it }
         }
     }
+}
+
+object BrowseTreeCache {
+    private val children = ConcurrentHashMap<String, List<MediaItem>>()
+    fun get(parentId: String): List<MediaItem> = children[parentId].orEmpty()
+    fun put(parentId: String, items: List<MediaItem>) {
+        if (items.isNotEmpty()) children[parentId] = items.toList()
+    }
+    fun invalidate(parentId: String) { children.remove(parentId) }
 }
 
 object AutoBrowseCache {

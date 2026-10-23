@@ -1,3 +1,21 @@
 <resources>
     <string name="app_name">Kilo</string>
+    <string name="language_title">App language</string>
+    <string name="language_subtitle">Choose the language used by KILO and Android Auto</string>
+    <string name="language_device">Follow device language</string>
+    <string name="language_english">English</string>
+    <string name="auto_like">Like</string>
+    <string name="auto_unlike">Unlike</string>
+    <string name="auto_queue_next">Queue next</string>
+    <string name="auto_close_app">Close app</string>
+    <string name="auto_lyrics">Lyrics</string>
+    <string name="player_video_mode">Video moments</string>
+    <string name="player_lyrics">Lyrics</string>
+    <string name="player_android_auto">Android Auto</string>
+    <string name="player_play_pause">Play or pause</string>
+    <string name="player_previous">Previous</string>
+    <string name="player_next">Next</string>
+    <string name="action_like">Like</string>
+    <string name="action_dislike">Dislike</string>
+    <string name="now_playing">Now playing</string>
 </resources>
