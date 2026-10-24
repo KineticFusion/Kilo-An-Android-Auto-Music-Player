@@ -144,17 +144,26 @@ class UpdateDownloader(context: Context) {
 }
 
 object UpdateInstaller {
+    fun canInstall(context: Context): Boolean {
+        val appContext = context.applicationContext
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.O || appContext.packageManager.canRequestPackageInstalls()
+    }
+
+    fun requestInstallPermission(context: Context): Boolean {
+        val appContext = context.applicationContext
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || canInstall(appContext)) return true
+        return runCatching {
+            appContext.startActivity(
+                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${appContext.packageName}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            true
+        }.getOrDefault(false)
+    }
+
     fun open(context: Context, apkUri: Uri): Boolean {
         val appContext = context.applicationContext
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !appContext.packageManager.canRequestPackageInstalls()) {
-            runCatching {
-                appContext.startActivity(
-                    Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${appContext.packageName}"))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
-            }
-            return false
-        }
+        if (!canInstall(appContext)) return false
         return runCatching {
             appContext.startActivity(
                 Intent(Intent.ACTION_VIEW)

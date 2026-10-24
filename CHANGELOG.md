@@ -1,3 +1,14 @@
+# KILO 2.5.5 Hotfix
+
+## What's fixed
+
+- Fixed update notices remaining after the downloaded version was installed.
+- Update checks run in the background and show the same status on Home and in Settings.
+- Downloading an update now opens Android's installer automatically after verification.
+- Returning from Android's install permission settings resumes the installation flow.
+
+---
+
 # KILO 2.5.1
 
 ## What's new

@@ -120,6 +120,7 @@ import com.example.kilo.timemachine.TimeCapsule
 import com.example.kilo.timemachine.TimeMachine
 import com.example.kilo.updates.UpdateDownloadPhase
 import com.example.kilo.updates.UpdateDownloader
+import com.example.kilo.updates.UpdateCenter
 import com.example.kilo.updates.UpdateInstaller
 import com.example.kilo.search.SearchEnhancer
 import com.example.kilo.search.SearchAnalytics
@@ -422,6 +423,10 @@ private data class CompanionFeatureSnapshot(
 private const val PENDING_UPDATE_DOWNLOAD_ID = "pending_update_download_id"
 private const val PENDING_UPDATE_VERSION = "pending_update_version"
 private const val PENDING_UPDATE_SHA256 = "pending_update_sha256"
+private const val PENDING_UPDATE_AWAITING_PERMISSION = "pending_update_awaiting_permission"
+private const val PENDING_UPDATE_INSTALLER_STARTED = "pending_update_installer_started"
+private const val LAST_UPDATE_CHECK_AT = "last_update_check_at"
+private const val UPDATE_CHECK_INTERVAL_MS = 6L * 60L * 60L * 1000L
 
 private data class RegionalArtistPicks(val label: String, val artists: List<String>)
 
@@ -870,6 +875,7 @@ data class AppStateModel(
     val updateDownloadProgress: Int? = null,
     val isDownloadingUpdate: Boolean = false,
     val downloadedUpdateUri: String? = null,
+    val updateInstallerStarted: Boolean = false,
     val companionSongs: List<SongItemClean> = emptyList(),
     val journeyPreviews: List<JourneyPreview> = emptyList(),
     val soundDna: SoundDNASnapshot? = null,
@@ -1505,6 +1511,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         loadHome()
         if (_state.value.downloadDirectoryUri != null) scanDownloadedFolder(showMessage = false)
+
+        viewModelScope.launch {
+            delay(1_200L)
+            checkForUpdatesIfDue()
+        }
 
         viewModelScope.launch {
             while (true) {
@@ -2964,6 +2975,7 @@ _state.value = _state.value.copy(
                 runCatching { GitHubUpdateChecker.check(BuildConfig.VERSION_NAME) }
             }
             result.onSuccess { release ->
+                preferences.edit().putLong(LAST_UPDATE_CHECK_AT, System.currentTimeMillis()).apply()
                 _state.value = _state.value.copy(
                     isCheckingForUpdates = false,
                     updateAvailable = release.isUpdateAvailable && !release.apkUrl.isNullOrBlank(),
@@ -2989,6 +3001,12 @@ _state.value = _state.value.copy(
         }
     }
 
+    private fun checkForUpdatesIfDue() {
+        val lastCheck = preferences.getLong(LAST_UPDATE_CHECK_AT, 0L)
+        val now = System.currentTimeMillis()
+        if (lastCheck == 0L || now >= lastCheck + UPDATE_CHECK_INTERVAL_MS) checkForUpdates()
+    }
+
     fun downloadUpdate() {
         val current = _state.value
         if (!current.updateAvailable || current.latestApkUrl.isBlank() || current.isDownloadingUpdate) return
@@ -3003,7 +3021,7 @@ _state.value = _state.value.copy(
                     .putString(PENDING_UPDATE_VERSION, current.updateVersionName)
                     .putString(PENDING_UPDATE_SHA256, current.latestApkSha256)
                     .apply()
-                observeUpdateDownload(id, current.latestApkSha256)
+                observeUpdateDownload(id, current.latestApkSha256, launchInstallerWhenComplete = true)
             }.onFailure { error ->
                 _state.value = _state.value.copy(
                     isDownloadingUpdate = false,
@@ -3016,20 +3034,42 @@ _state.value = _state.value.copy(
     private fun restorePendingUpdateDownload() {
         val id = preferences.getLong(PENDING_UPDATE_DOWNLOAD_ID, -1L)
         if (id <= 0L) return
+        val version = preferences.getString(PENDING_UPDATE_VERSION, "").orEmpty()
+        if (version.isNotBlank() && UpdateCenter.compareVersions(BuildConfig.VERSION_NAME, version) >= 0) {
+            clearPendingUpdatePreferences()
+            _state.value = _state.value.copy(
+                updateAvailable = false,
+                isDownloadingUpdate = false,
+                updateDownloadId = null,
+                updateDownloadProgress = null,
+                downloadedUpdateUri = null,
+                updateInstallerStarted = false,
+                updateCheckMessage = "You’re up to date · KILO ${BuildConfig.VERSION_NAME}"
+            )
+            viewModelScope.launch(Dispatchers.IO) { updateDownloader.remove(id) }
+            return
+        }
+        // If Android closed KILO while its installer was open, leave the completed
+        // download available for an explicit retry instead of reopening the installer.
+        val installerWasStarted = preferences.getBoolean(PENDING_UPDATE_INSTALLER_STARTED, false)
+        preferences.edit().remove(PENDING_UPDATE_INSTALLER_STARTED).apply()
         viewModelScope.launch {
             val progress = withContext(Dispatchers.IO) { updateDownloader.query(id) }
             if (progress == null || progress.phase == UpdateDownloadPhase.FAILED) {
-                preferences.edit().remove(PENDING_UPDATE_DOWNLOAD_ID).remove(PENDING_UPDATE_VERSION).remove(PENDING_UPDATE_SHA256).apply()
+                clearPendingUpdatePreferences()
                 return@launch
             }
-            val version = preferences.getString(PENDING_UPDATE_VERSION, "").orEmpty()
             val sha256 = preferences.getString(PENDING_UPDATE_SHA256, null)
             _state.value = _state.value.copy(updateVersionName = version, latestApkSha256 = sha256)
-            observeUpdateDownload(id, sha256)
+            observeUpdateDownload(id, sha256, launchInstallerWhenComplete = !installerWasStarted)
         }
     }
 
-    private fun observeUpdateDownload(downloadId: Long, expectedSha256: String?) {
+    private fun observeUpdateDownload(
+        downloadId: Long,
+        expectedSha256: String?,
+        launchInstallerWhenComplete: Boolean
+    ) {
         updateDownloadJob?.cancel()
         _state.value = _state.value.copy(
             updateDownloadId = downloadId,
@@ -3042,7 +3082,7 @@ _state.value = _state.value.copy(
             while (isActive) {
                 val progress = withContext(Dispatchers.IO) { updateDownloader.query(downloadId) }
                 if (progress == null) {
-                    preferences.edit().remove(PENDING_UPDATE_DOWNLOAD_ID).remove(PENDING_UPDATE_VERSION).remove(PENDING_UPDATE_SHA256).apply()
+                    clearPendingUpdatePreferences()
                     _state.value = _state.value.copy(isDownloadingUpdate = false, updateCheckMessage = "Couldn’t read the update download.")
                     return@launch
                 }
@@ -3060,7 +3100,7 @@ _state.value = _state.value.copy(
                         }
                         if (!verified.second || verified.third == null) {
                             withContext(Dispatchers.IO) { updateDownloader.remove(downloadId) }
-                            preferences.edit().remove(PENDING_UPDATE_DOWNLOAD_ID).remove(PENDING_UPDATE_VERSION).remove(PENDING_UPDATE_SHA256).apply()
+                            clearPendingUpdatePreferences()
                             _state.value = _state.value.copy(
                                 isDownloadingUpdate = false,
                                 updateDownloadId = null,
@@ -3072,13 +3112,18 @@ _state.value = _state.value.copy(
                             _state.value = _state.value.copy(
                                 isDownloadingUpdate = false,
                                 downloadedUpdateUri = verified.third.toString(),
-                                updateCheckMessage = "KILO ${_state.value.updateVersionName} is downloaded and ready to install."
+                                updateCheckMessage = if (launchInstallerWhenComplete) {
+                                    "KILO ${_state.value.updateVersionName} downloaded · opening Android installer…"
+                                } else {
+                                    "KILO ${_state.value.updateVersionName} is downloaded. Tap Continue install to reopen Android’s installer."
+                                }
                             )
+                            if (launchInstallerWhenComplete) installDownloadedUpdate()
                         }
                         return@launch
                     }
                     UpdateDownloadPhase.FAILED -> {
-                        preferences.edit().remove(PENDING_UPDATE_DOWNLOAD_ID).remove(PENDING_UPDATE_VERSION).remove(PENDING_UPDATE_SHA256).apply()
+                        clearPendingUpdatePreferences()
                         _state.value = _state.value.copy(
                             isDownloadingUpdate = false,
                             updateCheckMessage = "The update download failed. Check your connection and try again."
@@ -3092,10 +3137,82 @@ _state.value = _state.value.copy(
     }
 
     fun installDownloadedUpdate() {
+        val app = getApplication<Application>()
         val uri = _state.value.downloadedUpdateUri?.let(Uri::parse) ?: return
-        if (!UpdateInstaller.open(getApplication(), uri)) {
-            _state.value = _state.value.copy(updateCheckMessage = "Allow KILO to install updates, then tap Install update again.")
+        if (!UpdateInstaller.canInstall(app)) {
+            preferences.edit().putBoolean(PENDING_UPDATE_AWAITING_PERMISSION, true).apply()
+            _state.value = _state.value.copy(updateCheckMessage = "Allow KILO to install apps, then return here. The installer will open automatically.")
+            if (!UpdateInstaller.requestInstallPermission(app)) {
+                preferences.edit().remove(PENDING_UPDATE_AWAITING_PERMISSION).apply()
+                _state.value = _state.value.copy(updateCheckMessage = "Couldn’t open Android’s install permission settings. Try Continue install again.")
+            }
+            return
         }
+        preferences.edit()
+            .remove(PENDING_UPDATE_AWAITING_PERMISSION)
+            .putBoolean(PENDING_UPDATE_INSTALLER_STARTED, true)
+            .apply()
+        if (UpdateInstaller.open(app, uri)) {
+            _state.value = _state.value.copy(
+                updateInstallerStarted = true,
+                updateCheckMessage = "Android’s installer is open. Confirm the update there to finish."
+            )
+        } else {
+            preferences.edit().remove(PENDING_UPDATE_INSTALLER_STARTED).apply()
+            _state.value = _state.value.copy(
+                updateInstallerStarted = false,
+                updateCheckMessage = "Couldn’t open Android’s installer. Tap Continue install to try again."
+            )
+        }
+    }
+
+    fun onAppResumed() {
+        val pendingVersion = preferences.getString(PENDING_UPDATE_VERSION, "").orEmpty()
+        val pendingId = preferences.getLong(PENDING_UPDATE_DOWNLOAD_ID, -1L)
+        if (pendingVersion.isNotBlank() && UpdateCenter.compareVersions(BuildConfig.VERSION_NAME, pendingVersion) >= 0) {
+            clearPendingUpdatePreferences()
+            updateDownloadJob?.cancel()
+            _state.value = _state.value.copy(
+                updateAvailable = false,
+                isDownloadingUpdate = false,
+                updateDownloadId = null,
+                updateDownloadProgress = null,
+                downloadedUpdateUri = null,
+                updateInstallerStarted = false,
+                updateCheckMessage = "You’re up to date · KILO ${BuildConfig.VERSION_NAME}"
+            )
+            if (pendingId > 0L) viewModelScope.launch(Dispatchers.IO) { updateDownloader.remove(pendingId) }
+            checkForUpdates()
+            return
+        }
+
+        if (preferences.getBoolean(PENDING_UPDATE_AWAITING_PERMISSION, false)) {
+            preferences.edit().remove(PENDING_UPDATE_AWAITING_PERMISSION).apply()
+            if (UpdateInstaller.canInstall(getApplication<Application>())) {
+                installDownloadedUpdate()
+            } else {
+                _state.value = _state.value.copy(updateCheckMessage = "Allow KILO to install apps, then tap Continue install.")
+            }
+            return
+        }
+
+        if (_state.value.updateInstallerStarted || preferences.getBoolean(PENDING_UPDATE_INSTALLER_STARTED, false)) {
+            preferences.edit().remove(PENDING_UPDATE_INSTALLER_STARTED).apply()
+            _state.value = _state.value.copy(
+                updateInstallerStarted = false,
+                updateCheckMessage = "The installer was closed before KILO updated. Tap Continue install to try again."
+            )
+        }
+    }
+
+    private fun clearPendingUpdatePreferences() {
+        preferences.edit()
+            .remove(PENDING_UPDATE_DOWNLOAD_ID)
+            .remove(PENDING_UPDATE_VERSION)
+            .remove(PENDING_UPDATE_SHA256)
+            .remove(PENDING_UPDATE_INSTALLER_STARTED)
+            .remove(PENDING_UPDATE_AWAITING_PERMISSION)
+            .apply()
     }
 
     fun openSystemEqualizer() {
@@ -3683,6 +3800,11 @@ class MainActivity : ComponentActivity() {
         handleAssistantVoiceIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        viewModel.onAppResumed()
+    }
+
     private fun handleAssistantVoiceIntent(intent: Intent?) {
         val query = intent?.getStringExtra("query")?.trim().orEmpty()
         if (query.isNotEmpty()) {
@@ -4186,19 +4308,12 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                         Icon(Icons.Filled.SystemUpdate, contentDescription = null, tint = accent, modifier = Modifier.size(25.dp))
                         Column(Modifier.weight(1f)) {
                             Text("KILO ${state.updateVersionName}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
-                            Text(
-                                when {
-                                    state.downloadedUpdateUri != null -> "Downloaded and ready to install"
-                                    state.isDownloadingUpdate -> "Downloading update · ${state.updateDownloadProgress ?: 0}%"
-                                    else -> "Update available"
-                                },
-                                color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp
-                            )
+                            Text(state.updateCheckMessage, color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp)
                         }
                         when {
-                            state.downloadedUpdateUri != null -> Button(onClick = vm::installDownloadedUpdate) { Text("Install") }
+                            state.downloadedUpdateUri != null && !state.updateInstallerStarted -> Button(onClick = vm::installDownloadedUpdate) { Text("Continue install") }
                             state.isDownloadingUpdate -> CircularProgressIndicator(color = accent, modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
-                            state.updateAvailable -> Button(onClick = vm::downloadUpdate) { Text("Download") }
+                            state.updateAvailable && state.downloadedUpdateUri == null -> Button(onClick = vm::downloadUpdate) { Text("Download") }
                         }
                     }
                     if (state.isDownloadingUpdate) {
@@ -6240,10 +6355,12 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
                 if (state.isDownloadingUpdate) {
                     Text("Downloading…", color = accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
-                if (state.downloadedUpdateUri != null) {
-                    Button(onClick = vm::installDownloadedUpdate) { Text("Install update") }
-                } else if (state.updateAvailable && !state.isDownloadingUpdate) {
+                if (state.downloadedUpdateUri != null && !state.updateInstallerStarted) {
+                    Button(onClick = vm::installDownloadedUpdate) { Text("Continue install") }
+                } else if (state.updateAvailable && !state.isDownloadingUpdate && state.downloadedUpdateUri == null) {
                     Button(onClick = vm::downloadUpdate) { Text("Download update") }
+                } else if (state.updateInstallerStarted) {
+                    Text("Follow Android’s installer to complete the update.", color = accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
