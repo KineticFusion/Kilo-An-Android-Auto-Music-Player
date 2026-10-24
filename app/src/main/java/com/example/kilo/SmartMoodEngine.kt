@@ -47,8 +47,15 @@ object SmartMoodEngine {
     }
 
     /** Retains provider ranking while biasing the queue toward familiar or undiscovered tracks. */
-    fun rankSongs(songs: List<SongItemClean>, mood: String, playedIds: Set<String> = emptySet(), likedIds: Set<String> = emptySet()): List<SongItemClean> {
+    fun rankSongs(
+        songs: List<SongItemClean>,
+        mood: String,
+        playedIds: Set<String> = emptySet(),
+        likedIds: Set<String> = emptySet(),
+        preferredArtists: Set<String> = emptySet()
+    ): List<SongItemClean> {
         val profile = profile(mood) ?: return songs
+        val artistPreferences = preferredArtists.map { it.trim().lowercase(Locale.ROOT) }.filter(String::isNotBlank)
         return songs.withIndex().sortedByDescending { row ->
             val song = row.value
             val keys = listOf(song.id, song.videoId)
@@ -56,8 +63,9 @@ object SmartMoodEngine {
             val liked = keys.any { it.isNotBlank() && it in likedIds }
             val words = "${song.title} ${song.artist} ${song.album}".lowercase()
             val genreMatches = profile.genres.count { words.contains(it.lowercase()) }
+            val artistMatches = artistPreferences.count { song.artist.lowercase(Locale.ROOT).contains(it) }
             (if (played) profile.familiarity * 0.008 + profile.replayBias * 0.004 else profile.discovery * 0.012) +
-                (if (liked) profile.familiarity * 0.008 else 0.0) + genreMatches * 0.18 - row.index * 0.0001
+                (if (liked) profile.familiarity * 0.008 else 0.0) + genreMatches * 0.18 + artistMatches * 2.5 - row.index * 0.0001
         }.map { it.value }
     }
 

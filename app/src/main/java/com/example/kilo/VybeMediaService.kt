@@ -74,6 +74,7 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Calendar
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
@@ -1385,6 +1386,12 @@ class VybeMediaService : MediaLibraryService() {
         val result = when (parentId) {
             ROOT -> carRootItems()
             TAB_HOME -> carHomeItems()
+            "journeys:home" -> listOf(
+                moodCard("Night Drive", "🌃 Night Drive Journey", "A familiar night mix, shaped by your artists"),
+                moodCard("Road Trip", "🛣️ Road Trip Journey", "A longer mix shaped by your listening"),
+                moodCard("Commute", "🚗 Commute Journey", "A quick mix for the drive"),
+                moodCard("Discover", "✨ Discovery Journey", "Fresh picks from KILO")
+            )
             TAB_SEARCH -> listOf(
                 moodCard("Night Drive", "🌃 Night Drive", "Quick mood pick"),
                 moodCard("Workout", "💪 Workout", "Quick mood pick"),
@@ -1687,6 +1694,15 @@ class VybeMediaService : MediaLibraryService() {
         return saved?.takeIf { SmartMoodEngine.profile(it) != null } ?: carMoodSuggestion().mood
     }
 
+    private fun personalizedMoodQuery(mood: String, profile: ListenerProfile): String {
+        val preferredArtist = (profile.followedArtists + Favorites.songs().map { it.artist } + PlayedSongHistory.recommendationArtists())
+            .asSequence().map(String::trim).filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }.firstOrNull()
+        return listOf(
+            moodDiscoveryQuery(mood, profile.favoriteGenres.firstOrNull()),
+            preferredArtist?.let { "similar to $it" }
+        ).filterNotNull().joinToString(" ")
+    }
+
     private fun carRootItems(): List<MediaItem> {
         // Hydrate the Android Auto catalog in the background as soon as the car opens KILO.
         carHomeShelves()
@@ -1843,7 +1859,7 @@ class VybeMediaService : MediaLibraryService() {
         val activeMood = prefs.getString("discovery_mood", null)
             ?.takeIf { SmartMoodEngine.profile(it) != null } ?: suggestion.mood
         val lastMood = prefs.getString("auto_mood_last", null)?.takeIf(String::isNotBlank)
-        return AndroidAutoHomeLayouts.orderedSections(layoutId, savedOrder).map { section ->
+        val layoutItems = AndroidAutoHomeLayouts.orderedSections(layoutId, savedOrder).map { section ->
             when (section) {
                 "continue" -> continueListeningTile()
                 "mood_hub" -> carTile(TAB_MOODS, "Set My Mood", "Choose a mood for your drive", AndroidAutoR.drawable.ic_auto_mood)
@@ -1888,6 +1904,8 @@ class VybeMediaService : MediaLibraryService() {
                 else -> folderItem(TAB_MOODS, "Set My Mood", "Choose a mood for your drive")
             }
         }
+        return (layoutItems + carTile("journeys:home", "Music Journeys", "Night Drive · Road Trip · Commute · Discovery", AndroidAutoR.drawable.ic_auto_mood))
+            .distinctBy { it.mediaId }
     }
 
     private fun localLibrarySongs(): List<SongItemClean> = runCatching {
@@ -1906,6 +1924,12 @@ class VybeMediaService : MediaLibraryService() {
     private fun childrenOf(parentId: String): List<MediaItem> = when {
         parentId == ROOT -> carRootItems()
         parentId == TAB_HOME -> carHomeItems()
+        parentId == "journeys:home" -> listOf(
+            moodCard("Night Drive", "🌃 Night Drive Journey", "A familiar night mix, shaped by your artists"),
+            moodCard("Road Trip", "🛣️ Road Trip Journey", "A longer mix shaped by your listening"),
+            moodCard("Commute", "🚗 Commute Journey", "A quick mix for the drive"),
+            moodCard("Discover", "✨ Discovery Journey", "Fresh picks from KILO")
+        )
         parentId == "home:radio_mood" -> childrenOf("moodradio:${Uri.encode(activeCarMood())}")
         parentId == "home:radio_discovery" -> childrenOf("moodradio:Discovery")
         parentId == "home:radio_hidden" -> childrenOf("moodradio:Hidden Gems")
@@ -1973,8 +1997,9 @@ class VybeMediaService : MediaLibraryService() {
             val mood = Uri.decode(parentId.removePrefix("moodradio:"))
             val profile = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE))
             if (SmartMoodEngine.profile(mood) != null) applyCarMoodSelection(mood)
-            val songs = YtRepo.searchSongs(moodDiscoveryQuery(mood, profile.favoriteGenres.firstOrNull()))
-            songItems(SmartMoodEngine.rankSongs(songs, mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet()))
+            val songs = YtRepo.searchSongs(personalizedMoodQuery(mood, profile))
+            songItems(SmartMoodEngine.rankSongs(songs, mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet(),
+                (profile.followedArtists + Favorites.songs().map { it.artist }).toSet()))
         }
         parentId.startsWith("genre:") -> {
             val genre = Uri.decode(parentId.removePrefix("genre:"))
@@ -1984,9 +2009,9 @@ class VybeMediaService : MediaLibraryService() {
             val suggestion = carMoodSuggestion()
             applyCarMoodSelection(suggestion.mood, suggestion.reason)
             val profile = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE))
-            val genre = profile.favoriteGenres.firstOrNull()
-            val songs = YtRepo.searchSongs(moodDiscoveryQuery(suggestion.mood, genre))
-            songItems(SmartMoodEngine.rankSongs(songs, suggestion.mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet()))
+            val songs = YtRepo.searchSongs(personalizedMoodQuery(suggestion.mood, profile))
+            songItems(SmartMoodEngine.rankSongs(songs, suggestion.mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet(),
+                (profile.followedArtists + Favorites.songs().map { it.artist }).toSet()))
         }
         parentId.startsWith("mood:") -> {
             val requestedMood = Uri.decode(parentId.removePrefix("mood:"))
@@ -1996,9 +2021,9 @@ class VybeMediaService : MediaLibraryService() {
             } else requestedMood
             applyCarMoodSelection(mood)
             val profile = ProfileEngine.load(prefs)
-            val genre = profile.favoriteGenres.firstOrNull()
-            val candidates = filterMoodTitleMatches(YtRepo.searchSongs(moodDiscoveryQuery(mood, genre)), mood)
-            songItems(SmartMoodEngine.rankSongs(candidates, mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet()))
+            val candidates = filterMoodTitleMatches(YtRepo.searchSongs(personalizedMoodQuery(mood, profile)), mood)
+            songItems(SmartMoodEngine.rankSongs(candidates, mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet(),
+                (profile.followedArtists + Favorites.songs().map { it.artist }).toSet()))
         }
         parentId.startsWith("artist:") -> songItems(YtRepo.searchSongs("songs by ${Uri.decode(parentId.removePrefix("artist:"))}"))
         parentId == TAB_RADIO_FAVORITES -> radioMediaItems(RadioStationStore.load(this, "radio_favorites"))

@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 14
-        versionName = "2.3.0"
+        versionCode = 16
+        versionName = "2.5.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -64,6 +64,12 @@ androidComponents {
         implementation(project(":core-search"))
         implementation(project(":core-ui"))
         implementation(project(":core-androidauto"))
+        implementation(project(":core-companion"))
+        implementation(project(":core-journeys"))
+        implementation(project(":core-sounddna"))
+        implementation(project(":core-discoveryradar"))
+        implementation(project(":core-timemachine"))
+        implementation(project(":core-updates"))
         implementation(libs.androidx.lifecycle.runtime.ktx)
         implementation(libs.androidx.room.runtime)
         ksp(libs.androidx.room.compiler)

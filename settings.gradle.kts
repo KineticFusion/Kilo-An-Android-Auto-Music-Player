@@ -24,4 +24,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Kilo"
-include(":app", ":core-streaming", ":core-profile", ":core-search", ":core-ui", ":core-androidauto")
+include(":app", ":core-streaming", ":core-profile", ":core-search", ":core-ui", ":core-androidauto", ":core-companion", ":core-journeys", ":core-sounddna", ":core-discoveryradar", ":core-timemachine", ":core-updates")

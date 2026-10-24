@@ -14,7 +14,8 @@ data class ListenerProfile(
     val favoriteMoods: Set<String> = emptySet(),
     val discoveryLevel: String = "Balanced",
     val audioPreference: String = "Balanced",
-    val androidAutoUsage: String = "Sometimes"
+    val androidAutoUsage: String = "Sometimes",
+    val favoriteLanguages: Set<String> = emptySet()
 )
 
 /** Local-only profile storage and recommendation context for KILO's existing app architecture. */
@@ -37,9 +38,10 @@ object ProfileEngine {
         }
         val json = JSONObject(serialized ?: "{}")
         ListenerProfile(
-            favoriteGenres = json.optJSONArray("genres").toStringSet().take(1).toSet(),
+            favoriteGenres = json.optJSONArray("genres").toStringSet(),
             followedArtists = json.optJSONArray("artists").toStringList(),
-            favoriteMoods = json.optJSONArray("moods").toStringSet().take(1).toSet(),
+            favoriteMoods = json.optJSONArray("moods").toStringSet(),
+            favoriteLanguages = json.optJSONArray("languages").toStringSet(),
             discoveryLevel = json.optString("discovery", "Balanced"),
             audioPreference = json.optString("audio", "Balanced"),
             androidAutoUsage = json.optString("androidAuto", "Sometimes")
@@ -52,9 +54,10 @@ object ProfileEngine {
         profileId: String = activeProfileId(preferences)
     ) {
         val json = JSONObject()
-            .put("genres", JSONArray(profile.favoriteGenres.sorted().take(1)))
+            .put("genres", JSONArray(profile.favoriteGenres.sorted()))
             .put("artists", JSONArray(profile.followedArtists.map(String::trim).filter(String::isNotBlank).distinct()))
-            .put("moods", JSONArray(profile.favoriteMoods.sorted().take(1)))
+            .put("moods", JSONArray(profile.favoriteMoods.sorted()))
+            .put("languages", JSONArray(profile.favoriteLanguages.sorted()))
             .put("discovery", profile.discoveryLevel)
             .put("audio", profile.audioPreference)
             .put("androidAuto", profile.androidAutoUsage)
@@ -83,8 +86,9 @@ object ProfileEngine {
             values.forEach { value -> xml.startTag("", "item"); xml.text(value); xml.endTag("", "item") }
             xml.endTag("", tag)
         }
-        values("genres", profile.favoriteGenres.sorted().take(1))
-        values("moods", profile.favoriteMoods.sorted().take(1))
+        values("genres", profile.favoriteGenres.sorted())
+        values("moods", profile.favoriteMoods.sorted())
+        values("languages", profile.favoriteLanguages.sorted())
         values("artists", profile.followedArtists.map(String::trim).filter(String::isNotBlank).distinct().take(50))
         fun value(tag: String, text: String) {
             xml.startTag("", tag); xml.text(text); xml.endTag("", tag)
@@ -102,6 +106,7 @@ object ProfileEngine {
         parser.setInput(StringReader(serialized))
         val genres = linkedSetOf<String>()
         val moods = linkedSetOf<String>()
+        val languages = linkedSetOf<String>()
         val artists = mutableListOf<String>()
         var discovery = "Balanced"
         var audio = "Balanced"
@@ -113,12 +118,13 @@ object ProfileEngine {
             if (event == XmlPullParser.START_TAG) {
                 when (parser.name) {
                     "kiloProfile" -> rootFound = true
-                    "genres", "moods", "artists" -> section = parser.name
+                    "genres", "moods", "artists", "languages" -> section = parser.name
                     "item" -> {
                         val value = parser.nextText().trim()
                         when (section) {
-                            "genres" -> if (genres.isEmpty() && value.isNotBlank()) genres += value
-                            "moods" -> if (moods.isEmpty() && value.isNotBlank()) moods += value
+                            "genres" -> if (value.isNotBlank() && genres.size < 128) genres += value
+                            "moods" -> if (value.isNotBlank() && moods.size < 128) moods += value
+                            "languages" -> if (value.isNotBlank() && languages.size < 128) languages += value
                             "artists" -> if (value.isNotBlank() && artists.size < 50) artists += value
                         }
                     }
@@ -132,7 +138,7 @@ object ProfileEngine {
             event = parser.next()
         }
         require(rootFound) { "Not a KILO profile XML file" }
-        ListenerProfile(genres, artists.distinct().take(50), moods, discovery, audio, androidAuto)
+        ListenerProfile(genres, artists.distinct().take(50), moods, discovery, audio, androidAuto, languages)
     }.getOrNull()
 
     private fun JSONArray?.toStringList(): List<String> = this?.let { array ->
@@ -143,11 +149,37 @@ object ProfileEngine {
 }
 
 val PERSONALIZATION_GENRES = listOf(
-    "Hip-Hop", "Rap", "Trap", "EDM", "Rock", "Metal", "Alternative", "Pop", "Jazz", "Classical",
-    "Lofi", "Phonk", "Synthwave", "Country", "K-Pop"
+    "Hip-Hop", "Rap", "Trap", "Drill", "Boom Bap", "R&B", "Soul", "Neo Soul", "EDM", "House",
+    "Deep House", "Tech House", "Techno", "Trance", "Hardstyle", "Dubstep", "Drum & Bass", "Synthwave",
+    "Retrowave", "Phonk", "Electronic", "Ambient", "Lofi", "Jazz", "Smooth Jazz", "Blues", "Classical",
+    "Orchestral", "Instrumental", "Acoustic", "Rock", "Alternative Rock", "Hard Rock", "Metal",
+    "Progressive Metal", "Pop", "Indie Pop", "Indie Rock", "Country", "Folk", "Soundtracks", "Anime",
+    "Movie Scores", "K-Pop", "J-Pop", "C-Pop", "Afrobeats", "Reggaeton", "Latin Pop", "Punjabi",
+    "Bollywood", "Tamil", "Telugu", "Kannada", "Malayalam", "Marathi", "Gujarati", "Bengali", "Urdu",
+    "Arabic", "French Pop", "German Rock", "Russian Pop", "World Music", "Hindu Devotional", "Bhajans",
+    "Aarti", "Mantras", "Kirtans", "Vedic Chants", "Carnatic Devotional", "Tamil Devotional",
+    "Telugu Devotional", "Kannada Devotional", "Malayalam Devotional", "Marathi Devotional",
+    "Gujarati Devotional", "Punjabi Devotional", "Sai Bhajans", "Krishna Bhajans", "Shiva Bhajans",
+    "Hanuman Bhajans", "Devi Songs", "Islamic Nasheeds", "Qawwali", "Sufi", "Christian Worship",
+    "Christian Gospel", "Church Choir", "Catholic Hymns", "Sikh Gurbani", "Shabad Kirtan",
+    "Buddhist Chants", "Tibetan Chants", "Jain Devotional", "Spiritual Instrumentals"
 )
 
 val PERSONALIZATION_MOODS = listOf(
-    "Focus", "Study", "Coding", "Workout", "Night Drive", "Road Trip", "Commute", "Gaming", "Relax",
-    "Sleep", "Party", "High Energy", "Happy", "Sad", "Romantic", "Nostalgic", "Rain Drive", "Coffee Vibes"
+    "Focus", "Study", "Coding", "Deep Work", "Productivity", "Reading", "Creative Mode", "Coffee Shop",
+    "Workout", "Running", "Beast Mode", "High Energy", "Adrenaline Rush", "Cycling", "Gym Session",
+    "Night Drive", "Commute", "Road Trip", "Sunrise Drive", "Midnight Cruise", "Rain Drive", "Summer Drive",
+    "Mountain Drive", "Coastal Drive", "City Cruise", "Gaming", "Relax", "Nature", "Beach Day", "Coffee Vibes",
+    "Dreamscape", "Late Night Chill", "Healing", "Meditation", "Sleep", "Happy", "Feel Good", "Romantic",
+    "Heartbreak", "Sad", "Nostalgic", "Reflective", "Hopeful", "Party", "Dance", "Celebration", "Karaoke",
+    "Festival", "Weekend Vibes", "Movie Scores", "Instrumental", "Retro", "Vinyl Vibes", "Anime Music",
+    "Sci-Fi Vibes", "Discover", "Hidden Gems", "World Music", "Radio Surfing", "Trending", "Rising Artists",
+    "Similar To Me", "Devotional", "Morning Prayer", "Mantras & Chants", "Spiritual Healing"
+)
+
+val PERSONALIZATION_LANGUAGES = listOf(
+    "English", "Hindi", "Tamil", "Telugu", "Kannada", "Malayalam", "Bengali", "Punjabi", "Marathi", "Gujarati",
+    "Urdu", "Arabic", "Sanskrit", "Odia", "Assamese", "Nepali", "Sinhala", "Korean", "Japanese", "Chinese",
+    "Spanish", "French", "German", "Portuguese", "Italian", "Russian", "Turkish", "Indonesian", "Thai", "Vietnamese",
+    "Persian", "Hebrew", "Swahili", "Yoruba", "Nigerian Pidgin", "Dutch", "Greek", "Polish", "Ukrainian", "Filipino"
 )

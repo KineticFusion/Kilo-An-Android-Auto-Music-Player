@@ -23,7 +23,7 @@ object AndroidAutoUiModule {
     const val PLAYABLE_HINT = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT"
     private val moodArtworkCache = ConcurrentHashMap<String, ByteArray>()
     private val gridParentIds = setOf(
-        "root", "tab_home", "tab_search", "tab_radio", "tab_library", "tab_browse",
+        "root", "tab_home", "tab_search", "tab_radio", "tab_library", "tab_browse", "journeys:home",
         "tab_moods", "tab_genres", "tab_profile_artists", "tab_albums", "tab_playlists"
     )
 

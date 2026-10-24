@@ -40,6 +40,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -103,6 +105,22 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import com.example.kilo.streaming.*
 import com.example.kilo.profile.*
+import com.example.kilo.companion.CompanionContext
+import com.example.kilo.companion.CompanionProfile
+import com.example.kilo.companion.CompanionTrack
+import com.example.kilo.companion.ListeningEvent
+import com.example.kilo.journeys.JourneyEngine
+import com.example.kilo.journeys.JourneyPreview
+import com.example.kilo.discoveryradar.DiscoveryRadar
+import com.example.kilo.discoveryradar.MoodRecommendationRanker
+import com.example.kilo.discoveryradar.RadarSection
+import com.example.kilo.sounddna.SoundDNAEngine
+import com.example.kilo.sounddna.SoundDNASnapshot
+import com.example.kilo.timemachine.TimeCapsule
+import com.example.kilo.timemachine.TimeMachine
+import com.example.kilo.updates.UpdateDownloadPhase
+import com.example.kilo.updates.UpdateDownloader
+import com.example.kilo.updates.UpdateInstaller
 import com.example.kilo.search.SearchEnhancer
 import com.example.kilo.search.SearchAnalytics
 import com.example.kilo.ui.components.KiloCard
@@ -299,6 +317,36 @@ internal object PlayedSongHistory {
         database?.writableDatabase?.insert("discovery_interactions", null, values)
     }
 
+    @Synchronized
+    fun listeningEvents(limit: Int = 500): List<ListeningEvent> = runCatching {
+        val events = mutableListOf<ListeningEvent>()
+        database?.readableDatabase?.rawQuery(
+            "SELECT song_id, title, artist, `action`, value, event_at FROM discovery_interactions ORDER BY event_at DESC LIMIT ?",
+            arrayOf(limit.coerceIn(1, 1000).toString())
+        )?.use { cursor ->
+            val idColumn = cursor.getColumnIndexOrThrow("song_id")
+            val titleColumn = cursor.getColumnIndexOrThrow("title")
+            val artistColumn = cursor.getColumnIndexOrThrow("artist")
+            val actionColumn = cursor.getColumnIndexOrThrow("action")
+            val valueColumn = cursor.getColumnIndexOrThrow("value")
+            val timeColumn = cursor.getColumnIndexOrThrow("event_at")
+            while (cursor.moveToNext()) {
+                val trackId = cursor.getString(idColumn).orEmpty()
+                if (trackId.isBlank() || trackId.startsWith("search:")) continue
+                val action = cursor.getString(actionColumn).orEmpty()
+                events += ListeningEvent(
+                    trackId = trackId,
+                    title = cursor.getString(titleColumn).orEmpty(),
+                    artist = cursor.getString(artistColumn).orEmpty(),
+                    atMs = cursor.getLong(timeColumn),
+                    listenedMs = cursor.getFloat(valueColumn).toLong().coerceAtLeast(0L),
+                    action = action
+                )
+            }
+        }
+        events.asReversed()
+    }.getOrDefault(emptyList())
+
     fun recordSearch(query: String) {
         val clean = query.trim().take(180)
         if (clean.isBlank()) return
@@ -362,6 +410,18 @@ data class SongItemClean(
 
 data class HomeShelf(val title: String, val songs: List<SongItemClean>, val isList: Boolean)
 data class ArtistItem(val id: String, val name: String, val subtitle: String, val coverUrl: String)
+
+private data class CompanionFeatureSnapshot(
+    val songs: List<SongItemClean>,
+    val journeys: List<JourneyPreview>,
+    val soundDna: SoundDNASnapshot,
+    val radar: List<RadarSection>,
+    val capsules: List<TimeCapsule>
+)
+
+private const val PENDING_UPDATE_DOWNLOAD_ID = "pending_update_download_id"
+private const val PENDING_UPDATE_VERSION = "pending_update_version"
+private const val PENDING_UPDATE_SHA256 = "pending_update_sha256"
 
 private data class RegionalArtistPicks(val label: String, val artists: List<String>)
 
@@ -541,6 +601,24 @@ private fun parsePlayerColor(hex: String): Color? = runCatching {
 }.getOrNull()
 
 private fun playerColorHex(color: Color): String = "#%06X".format(color.toArgb() and 0xFFFFFF)
+
+private fun loadCustomPlayerAccent(preferences: android.content.SharedPreferences): Color {
+    val savedAccent = preferences.all["custom_player_accent"]
+    val fallback = Color(0xFFFF795F)
+    val color = when (savedAccent) {
+        is String -> parsePlayerColor(savedAccent) ?: fallback
+        is Int -> Color(savedAccent)
+        is Long -> Color(savedAccent.toInt())
+        else -> fallback
+    }
+
+    // Older builds stored this preference as an ARGB integer. Normalize it once
+    // so future launches can safely read the current string representation.
+    if (savedAccent != null && savedAccent !is String) {
+        preferences.edit().putString("custom_player_accent", playerColorHex(color)).apply()
+    }
+    return color
+}
 
 private fun playerArtworkShape(style: PlayerStylePreset): androidx.compose.ui.graphics.Shape = RoundedCornerShape(style.cornerRadius.dp)
 
@@ -783,7 +861,20 @@ data class AppStateModel(
     val latestReleaseUrl: String = "",
     val latestApkUrl: String = "",
     val latestReleaseTitle: String = "",
+    val latestReleaseNotes: String = "",
+    val latestApkSha256: String? = null,
+    val latestApkSizeBytes: Long = 0L,
     val updateAvailable: Boolean = false,
+    val updateVersionName: String = "",
+    val updateDownloadId: Long? = null,
+    val updateDownloadProgress: Int? = null,
+    val isDownloadingUpdate: Boolean = false,
+    val downloadedUpdateUri: String? = null,
+    val companionSongs: List<SongItemClean> = emptyList(),
+    val journeyPreviews: List<JourneyPreview> = emptyList(),
+    val soundDna: SoundDNASnapshot? = null,
+    val discoveryRadarSections: List<RadarSection> = emptyList(),
+    val timeCapsules: List<TimeCapsule> = emptyList(),
     val currentScreen: ScreenNav = ScreenNav.HOME
 ) {
     val activeSong: SongItemClean
@@ -1119,6 +1210,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val favoriteListener: () -> Unit = {
         _state.value = _state.value.copy(favoriteIds = Favorites.ids())
+        refreshCompanionFeatures()
     }
 
     private var searchJob: Job? = null
@@ -1134,6 +1226,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingSeekWasPlaying = false
     private var pendingSeekDiscontinuity = false
     private var homeLoadGeneration = 0
+    private var companionFeatureGeneration = 0
+    private var companionFeatureJob: Job? = null
+    private var updateDownloadJob: Job? = null
+    private val updateDownloader by lazy { UpdateDownloader(getApplication<Application>()) }
     private val earlyEndRetries = mutableSetOf<String>()
     private var advertisedAudioEffectSessionId = C.AUDIO_SESSION_ID_UNSET
     private val signaledListenIds = mutableSetOf<String>()
@@ -1159,6 +1255,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val ended = _state.value.activeSong
                 PlayedSongHistory.recordSignal(ended, "complete")
                 PlayedSongHistory.record(ended.id)
+                refreshCompanionFeatures()
             }
             if (playbackState == Player.STATE_READY && player.playWhenReady && player.volume < 0.99f) {
                 // Auto Mix fades can be interrupted by a track change. Recover the
@@ -1333,7 +1430,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             downloadedSongs = loadDownloadedSongs(),
             uiCustomizations = savedCustomizations,
             selectedPlayerStyleId = preferences.getString("player_style_id", PLAYER_STYLE_PRESETS.first().id) ?: PLAYER_STYLE_PRESETS.first().id,
-            customPlayerAccent = preferences.getString("custom_player_accent", "#FFFF795F")?.let(::parsePlayerColor) ?: Color(0xFFFF795F),
+            customPlayerAccent = loadCustomPlayerAccent(preferences),
             selectedMood = preferences.getString("discovery_mood", "Discover") ?: "Discover",
             moodSuggestion = preferences.getString("auto_mood_last", null)?.let { mood ->
                 MoodSuggestion(mood, preferences.getString("auto_mood_reason", "") ?: "")
@@ -1369,6 +1466,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val savedRegion = preferences.getString("music_region_code", "AUTO") ?: "AUTO"
         YtRepo.setRegionCode(savedRegion)
         _state.value = _state.value.copy(musicRegionCode = savedRegion)
+
+        restorePendingUpdateDownload()
 
         try {
             NewPipe.init(
@@ -1421,6 +1520,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         val song = _state.value.activeSong
                         PlayedSongHistory.record(song.id)
                         PlayedSongHistory.recordSignal(song, "listen", pos.toFloat())
+                        refreshCompanionFeatures()
                     }
                     val moodFadeWindowMs = SmartMoodEngine.profile(_state.value.selectedMood)?.crossfadeDurationMs ?: 1_500L
                     if (_state.value.autoMixEnabled && remaining in 1L..moodFadeWindowMs && autoMixFadedSongId != songId) {
@@ -1483,7 +1583,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val launchNumber = preferences.getInt("home_launch_number", 0) + 1
             preferences.edit().putInt("home_launch_number", launchNumber).apply()
             val profile = _state.value.listenerProfile
-            val baseInterests = (Favorites.songs() + PlayedSongHistory.recommendationArtists().map { artist ->
+            val signalArtists = withContext(Dispatchers.IO) { PlayedSongHistory.recommendationArtists() }
+            val baseInterests = (Favorites.songs() + signalArtists.map { artist ->
                 SongItemClean(id = "artist:$artist", title = "", artist = artist, album = "", coverUrl = "")
             } + profile.followedArtists.map { artist ->
                 SongItemClean(id = "followed:$artist", title = "", artist = artist, album = "", coverUrl = "")
@@ -1525,7 +1626,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val loadResult = coroutineScope {
                 val homeTask = async(Dispatchers.IO) { YtRepo.fetchHomeCatalog() }
                 val historyTask = async(Dispatchers.IO) {
-                    Triple(PlayedSongHistory.ids(), PlayedSongHistory.discoveredIds(), PlayedSongHistory.discoveredButUnplayed())
+                    val history = Triple(PlayedSongHistory.ids(), PlayedSongHistory.discoveredIds(), PlayedSongHistory.discoveredButUnplayed())
+                    history to PlayedSongHistory.listeningEvents()
                 }
                 val completeTask = async(Dispatchers.IO) { PlayedSongHistory.isHomeCatalogComplete() }
                 val similarTask = async(Dispatchers.IO) {
@@ -1550,13 +1652,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             val fetched = loadResult.first
             if (generation != homeLoadGeneration) return@launch
-            val historyState = loadResult.second.first
+            val (historyState, recentEvents) = loadResult.second.first
             val playedBefore = historyState.first
             val discoveredBefore = historyState.second
             val dormantDiscovered = historyState.third
             val alreadyComplete = loadResult.second.second
-            val similarResults = loadResult.third.first
-            val freshResults = loadResult.third.second
+            val rawSimilarResults = loadResult.third.first
+            val rawFreshResults = loadResult.third.second
+            val recommendationMood = activeMood ?: activeGenre ?: profile.favoriteMoods.firstOrNull() ?: "Discover"
+            val recommendationState = _state.value
+            val (similarResults, freshResults) = withContext(Dispatchers.Default) {
+                val recommendationProfile = CompanionFeatureAdapter.profile(
+                    profile,
+                    recommendationState.favoriteIds,
+                    recommendationState.downloadedSongs.mapTo(mutableSetOf()) { it.id }
+                )
+                fun personalize(candidates: List<SongItemClean>): List<SongItemClean> {
+                    if (candidates.isEmpty()) return candidates
+                    val candidateTracks = CompanionFeatureAdapter.tracks(
+                        candidates, recentEvents, recommendationState.favoriteIds,
+                        recommendationState.downloadedSongs.mapTo(mutableSetOf()) { it.id }
+                    )
+                    val positions = MoodRecommendationRanker.rank(
+                        candidateTracks, recommendationMood, recommendationProfile, recentEvents, candidates.size
+                    ).mapIndexed { index, track -> track.id to index }.toMap()
+                    return candidates.withIndex()
+                        .sortedWith(compareBy<IndexedValue<SongItemClean>> { positions[it.value.id] ?: Int.MAX_VALUE }.thenBy { it.index })
+                        .map { it.value }
+                }
+                personalize(rawSimilarResults) to personalize(rawFreshResults)
+            }
             val blockedIds = playedBefore + _state.value.notRecommendedIds
             fun acceptable(song: SongItemClean) = song.videoId.isNotBlank() && song.id !in blockedIds &&
                 (!_state.value.filterMatureContent || !song.isExplicit)
@@ -1629,10 +1754,85 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 currentIndex = 0,
                 isSearching = false
             )
+            refreshCompanionFeatures(
+                candidateSongs = all + homeSongs + dormantDiscovered + _state.value.downloadedSongs,
+                events = recentEvents
+            )
             all.take(4).forEach { song ->
                 LosslessSource.register(song)
                 song.videoId.takeIf(String::isNotBlank)?.let(::prefetchStream)
             }
+        }
+    }
+    private fun refreshCompanionFeatures(
+        candidateSongs: List<SongItemClean>? = null,
+        events: List<ListeningEvent>? = null
+    ) {
+        companionFeatureJob?.cancel()
+        val generation = ++companionFeatureGeneration
+        val current = _state.value
+        val catalog = (candidateSongs ?: (
+            current.homeShelves.flatMap { it.songs } + current.playlist + current.downloadedSongs +
+                current.quickPicks + current.searchResults
+            ))
+            .asSequence()
+            .filter { it.id.isNotBlank() && it.videoId.isNotBlank() }
+            .distinctBy { it.id }
+            .take(300)
+            .toList()
+        if (catalog.isEmpty()) {
+            _state.value = current.copy(
+                companionSongs = emptyList(),
+                journeyPreviews = emptyList(),
+                soundDna = null,
+                discoveryRadarSections = emptyList(),
+                timeCapsules = emptyList()
+            )
+            return
+        }
+
+        companionFeatureJob = viewModelScope.launch {
+            val rawListeningEvents = events ?: withContext(Dispatchers.IO) {
+                PlayedSongHistory.listeningEvents()
+            }
+            val listeningEvents = rawListeningEvents.map { event ->
+                if (event.language.isBlank()) event.copy(language = CompanionFeatureAdapter.languageOf(event.title)) else event
+            }
+            val stateForFeatures = _state.value
+            val likedIds = stateForFeatures.favoriteIds
+            val downloadedIds = stateForFeatures.downloadedSongs.mapTo(mutableSetOf()) { it.id }
+            val profile = CompanionFeatureAdapter.profile(
+                stateForFeatures.listenerProfile,
+                likedIds,
+                downloadedIds
+            )
+            val snapshot = withContext(Dispatchers.Default) {
+                runCatching {
+                    val tracks = CompanionFeatureAdapter.tracks(catalog, listeningEvents, likedIds, downloadedIds)
+                    val calendar = Calendar.getInstance()
+                    val context = CompanionContext(
+                        hourOfDay = calendar.get(Calendar.HOUR_OF_DAY),
+                        recentMoods = listeningEvents.asReversed().asSequence()
+                            .map { it.mood }.filter(String::isNotBlank).take(8).toList(),
+                        activeMood = stateForFeatures.selectedMood
+                    )
+                    CompanionFeatureSnapshot(
+                        songs = catalog,
+                        journeys = JourneyEngine.previews(tracks, profile, context, limit = 6),
+                        soundDna = SoundDNAEngine.analyze(listeningEvents, profile),
+                        radar = DiscoveryRadar.build(tracks, listeningEvents, profile, perSection = 8),
+                        capsules = TimeMachine.capsules(listeningEvents)
+                    )
+                }.onFailure { Log.w("KiloCompanion", "Could not refresh local music insights", it) }.getOrNull()
+            }
+            if (generation != companionFeatureGeneration || snapshot == null) return@launch
+            _state.value = _state.value.copy(
+                companionSongs = snapshot.songs,
+                journeyPreviews = snapshot.journeys,
+                soundDna = snapshot.soundDna,
+                discoveryRadarSections = snapshot.radar,
+                timeCapsules = snapshot.capsules
+            )
         }
     }
     fun onSearchQueryChanged(query: String) {
@@ -2122,7 +2322,13 @@ _state.value = _state.value.copy(
                 }
                 setDiscoveryMood(suggestion.mood, refreshHome = false)
                 val profile = _state.value.listenerProfile
-                val query = moodDiscoveryQuery(suggestion.mood, profile.favoriteGenres.firstOrNull())
+                val preferredArtists = (profile.followedArtists + Favorites.songs().map { it.artist } +
+                    withContext(Dispatchers.IO) { PlayedSongHistory.recommendationArtists() })
+                    .map(String::trim).filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }.take(4)
+                val query = listOf(
+                    moodDiscoveryQuery(suggestion.mood, profile.favoriteGenres.firstOrNull()),
+                    preferredArtists.firstOrNull()?.let { "songs by $it" }
+                ).filterNotNull().joinToString(" ")
                 val songs = withContext(Dispatchers.IO) {
                     val candidates = YtRepo.searchSongs(query)
                         .filter { it.videoId.isNotBlank() && (!_state.value.filterMatureContent || !it.isExplicit) }
@@ -2131,7 +2337,8 @@ _state.value = _state.value.copy(
                         candidates,
                         suggestion.mood,
                         PlayedSongHistory.ids(),
-                        Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet()
+                        Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet(),
+                        preferredArtists.toSet()
                     )
                 }
                 preferences.edit()
@@ -2170,14 +2377,20 @@ _state.value = _state.value.copy(
         preferences.edit().putBoolean("personalization_pending", false)
             .putBoolean("personalization_pending_${_state.value.activeAccountId}", false).apply()
         _state.value = _state.value.copy(showPersonalizationWizard = false)
+        loadHome()
     }
 
     fun saveListenerProfile(profile: ListenerProfile, finishSetup: Boolean = false) {
         val cleaned = profile.copy(
-            favoriteGenres = profile.favoriteGenres.intersect(PERSONALIZATION_GENRES.toSet()).take(1).toSet(),
+            favoriteGenres = profile.favoriteGenres.intersect(PERSONALIZATION_GENRES.toSet()).take(128).toSet(),
             followedArtists = profile.followedArtists.map(String::trim).filter(String::isNotBlank).distinct().take(50),
-            favoriteMoods = profile.favoriteMoods.intersect(PERSONALIZATION_MOODS.toSet()).take(1).toSet()
+            favoriteMoods = profile.favoriteMoods.intersect(PERSONALIZATION_MOODS.toSet()).take(128).toSet(),
+            favoriteLanguages = profile.favoriteLanguages.intersect(PERSONALIZATION_LANGUAGES.toSet()).take(40).toSet()
         )
+        if (finishSetup && (cleaned.favoriteGenres.size < 3 || cleaned.favoriteMoods.size < 3)) {
+            Toast.makeText(getApplication(), "Choose at least 3 genres and 3 moods to finish setup.", Toast.LENGTH_LONG).show()
+            return
+        }
         ProfileEngine.save(preferences, cleaned, _state.value.activeAccountId)
         val audioSnapshot = equalizerController.setPreferredProfile(cleaned.audioPreference)
         val setupEditor = preferences.edit()
@@ -2209,21 +2422,33 @@ _state.value = _state.value.copy(
     }
 
     fun toggleProfileGenre(genre: String) {
+        if (genre !in PERSONALIZATION_GENRES) return
         val current = _state.value.listenerProfile
-        val genres = if (genre in current.favoriteGenres) emptySet() else setOf(genre)
+        val genres = if (genre in current.favoriteGenres) current.favoriteGenres - genre else current.favoriteGenres + genre
         val profile = current.copy(favoriteGenres = genres)
         ProfileEngine.save(preferences, profile, _state.value.activeAccountId)
         _state.value = _state.value.copy(listenerProfile = profile)
-        loadHome()
+        if (_state.value.isSetupComplete && !_state.value.showPersonalizationWizard) loadHome()
     }
 
     fun toggleProfileMood(mood: String) {
+        if (mood !in PERSONALIZATION_MOODS) return
         val current = _state.value.listenerProfile
-        val moods = if (mood in current.favoriteMoods) emptySet() else setOf(mood)
+        val moods = if (mood in current.favoriteMoods) current.favoriteMoods - mood else current.favoriteMoods + mood
         val profile = current.copy(favoriteMoods = moods)
         ProfileEngine.save(preferences, profile, _state.value.activeAccountId)
         _state.value = _state.value.copy(listenerProfile = profile)
-        loadHome()
+        if (_state.value.isSetupComplete && !_state.value.showPersonalizationWizard) loadHome()
+    }
+
+    fun toggleProfileLanguage(language: String) {
+        if (language !in PERSONALIZATION_LANGUAGES) return
+        val current = _state.value.listenerProfile
+        val languages = if (language in current.favoriteLanguages) current.favoriteLanguages - language else current.favoriteLanguages + language
+        val profile = current.copy(favoriteLanguages = languages)
+        ProfileEngine.save(preferences, profile, _state.value.activeAccountId)
+        _state.value = _state.value.copy(listenerProfile = profile)
+        if (_state.value.isSetupComplete && !_state.value.showPersonalizationWizard) loadHome()
     }
 
     fun searchProfileArtists(query: String) {
@@ -2460,12 +2685,55 @@ _state.value = _state.value.copy(
     }
 
     fun completeSetupStep(nextStep: Int) {
+        val state = _state.value
+        if (nextStep > 7 && state.setupStep == 7 && state.listenerProfile.favoriteGenres.size < 3) {
+            Toast.makeText(getApplication(), "Choose at least 3 genres to continue.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (nextStep > 9 && state.setupStep == 9 && state.listenerProfile.favoriteMoods.size < 3) {
+            Toast.makeText(getApplication(), "Choose at least 3 moods to continue.", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (nextStep >= 11) {
-            saveListenerProfile(_state.value.listenerProfile, finishSetup = true)
+            if (state.listenerProfile.favoriteGenres.size < 3 || state.listenerProfile.favoriteMoods.size < 3) {
+                Toast.makeText(getApplication(), "Choose at least 3 genres and 3 moods first.", Toast.LENGTH_LONG).show()
+                return
+            }
+            saveListenerProfile(state.listenerProfile, finishSetup = true)
         } else if (nextStep >= 0) {
             preferences.edit().putInt("setup_step", nextStep).apply()
-            _state.value = _state.value.copy(setupStep = nextStep)
+            _state.value = state.copy(setupStep = nextStep)
         }
+    }
+
+    fun playJourney(journeyId: String) {
+        val preview = _state.value.journeyPreviews.firstOrNull { it.id == journeyId } ?: return
+        playCachedTrackIds(preview.trackIds, preview.title, "phone_journey")
+    }
+
+    fun playTimeCapsule(capsuleId: String) {
+        val capsule = _state.value.timeCapsules.firstOrNull { it.id == capsuleId } ?: return
+        playCachedTrackIds(capsule.trackIds, capsule.title, "phone_time_machine")
+    }
+
+    fun playDiscoveryTrack(trackId: String, sectionTitle: String) {
+        val current = _state.value
+        val queue = current.discoveryRadarSections.firstOrNull { sectionTitle == it.title }
+            ?.tracks?.map { it.id } ?: listOf(trackId)
+        playCachedTrackIds(listOf(trackId) + queue, sectionTitle, "phone_discovery_radar")
+    }
+
+    private fun playCachedTrackIds(trackIds: List<String>, label: String, source: String) {
+        val current = _state.value
+        val songsById = current.companionSongs.associateBy { it.id }
+        val queue = trackIds.distinct().mapNotNull(songsById::get)
+            .filter { it.videoId.isNotBlank() }
+        val first = queue.firstOrNull()
+        if (first == null) {
+            Toast.makeText(getApplication(), "No playable tracks are cached for " + label, Toast.LENGTH_SHORT).show()
+            return
+        }
+        playSongFromShelf(first, queue, selectionSource = source)
     }
 
     fun selectHomeCategory(category: String) {
@@ -2677,40 +2945,143 @@ _state.value = _state.value.copy(
 
     fun checkForUpdates() {
         if (_state.value.isCheckingForUpdates) return
+        _state.value = _state.value.copy(isCheckingForUpdates = true, updateCheckMessage = "Checking for updates…")
         viewModelScope.launch {
-            _state.value = _state.value.copy(isCheckingForUpdates = true, updateCheckMessage = "Checking GitHub releases…")
-            val result = runCatching {
-                withContext(Dispatchers.IO) {
-                    val installedVersion = getApplication<Application>().packageManager
-                        .getPackageInfo(getApplication<Application>().packageName, 0).versionName ?: "0"
-                    GitHubUpdateChecker.check(installedVersion)
-                }
+            val result = withContext(Dispatchers.IO) {
+                runCatching { GitHubUpdateChecker.check(BuildConfig.VERSION_NAME) }
             }
             result.onSuccess { release ->
                 _state.value = _state.value.copy(
                     isCheckingForUpdates = false,
-                    updateAvailable = release.isUpdateAvailable,
-                    updateCheckMessage = if (release.isUpdateAvailable) "${release.title} is available" else "You’re on the latest release (${release.tagName}).",
+                    updateAvailable = release.isUpdateAvailable && !release.apkUrl.isNullOrBlank(),
+                    updateVersionName = release.tagName,
                     latestReleaseUrl = release.releaseUrl,
                     latestApkUrl = release.apkUrl.orEmpty(),
-                    latestReleaseTitle = release.title
+                    latestReleaseTitle = release.tagName,
+                    latestReleaseNotes = release.notes,
+                    latestApkSha256 = release.sha256Digest,
+                    latestApkSizeBytes = release.apkSizeBytes,
+                    updateCheckMessage = when {
+                        release.isUpdateAvailable && !release.apkUrl.isNullOrBlank() -> "KILO ${release.tagName} is available."
+                        release.isUpdateAvailable -> "KILO ${release.tagName} is available, but its APK is missing."
+                        else -> "You’re up to date · KILO ${BuildConfig.VERSION_NAME}"
+                    }
                 )
             }.onFailure { error ->
                 _state.value = _state.value.copy(
                     isCheckingForUpdates = false,
-                    updateCheckMessage = "Couldn’t check GitHub: ${error.localizedMessage ?: "connection failed"}"
+                    updateCheckMessage = "Couldn’t check for updates: ${error.localizedMessage ?: "connection failed"}"
                 )
             }
         }
     }
 
-    fun openReleaseUrl(url: String) {
-        if (url.isBlank()) return
-        runCatching {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            getApplication<Application>().startActivity(intent)
-        }.onFailure {
-            Toast.makeText(getApplication<Application>(), "Could not open GitHub release", Toast.LENGTH_SHORT).show()
+    fun downloadUpdate() {
+        val current = _state.value
+        if (!current.updateAvailable || current.latestApkUrl.isBlank() || current.isDownloadingUpdate) return
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    updateDownloader.enqueue(current.latestApkUrl, current.updateVersionName)
+                }
+            }.onSuccess { id ->
+                preferences.edit()
+                    .putLong(PENDING_UPDATE_DOWNLOAD_ID, id)
+                    .putString(PENDING_UPDATE_VERSION, current.updateVersionName)
+                    .putString(PENDING_UPDATE_SHA256, current.latestApkSha256)
+                    .apply()
+                observeUpdateDownload(id, current.latestApkSha256)
+            }.onFailure { error ->
+                _state.value = _state.value.copy(
+                    isDownloadingUpdate = false,
+                    updateCheckMessage = "Couldn’t download KILO ${current.updateVersionName}: ${error.localizedMessage ?: "download failed"}"
+                )
+            }
+        }
+    }
+
+    private fun restorePendingUpdateDownload() {
+        val id = preferences.getLong(PENDING_UPDATE_DOWNLOAD_ID, -1L)
+        if (id <= 0L) return
+        viewModelScope.launch {
+            val progress = withContext(Dispatchers.IO) { updateDownloader.query(id) }
+            if (progress == null || progress.phase == UpdateDownloadPhase.FAILED) {
+                preferences.edit().remove(PENDING_UPDATE_DOWNLOAD_ID).remove(PENDING_UPDATE_VERSION).remove(PENDING_UPDATE_SHA256).apply()
+                return@launch
+            }
+            val version = preferences.getString(PENDING_UPDATE_VERSION, "").orEmpty()
+            val sha256 = preferences.getString(PENDING_UPDATE_SHA256, null)
+            _state.value = _state.value.copy(updateVersionName = version, latestApkSha256 = sha256)
+            observeUpdateDownload(id, sha256)
+        }
+    }
+
+    private fun observeUpdateDownload(downloadId: Long, expectedSha256: String?) {
+        updateDownloadJob?.cancel()
+        _state.value = _state.value.copy(
+            updateDownloadId = downloadId,
+            isDownloadingUpdate = true,
+            updateDownloadProgress = 0,
+            downloadedUpdateUri = null,
+            updateCheckMessage = "Downloading KILO ${_state.value.updateVersionName}…"
+        )
+        updateDownloadJob = viewModelScope.launch {
+            while (isActive) {
+                val progress = withContext(Dispatchers.IO) { updateDownloader.query(downloadId) }
+                if (progress == null) {
+                    preferences.edit().remove(PENDING_UPDATE_DOWNLOAD_ID).remove(PENDING_UPDATE_VERSION).remove(PENDING_UPDATE_SHA256).apply()
+                    _state.value = _state.value.copy(isDownloadingUpdate = false, updateCheckMessage = "Couldn’t read the update download.")
+                    return@launch
+                }
+                _state.value = _state.value.copy(
+                    updateDownloadProgress = progress.percent,
+                    isDownloadingUpdate = progress.phase != UpdateDownloadPhase.COMPLETE && progress.phase != UpdateDownloadPhase.FAILED
+                )
+                when (progress.phase) {
+                    UpdateDownloadPhase.COMPLETE -> {
+                        val verified = withContext(Dispatchers.IO) {
+                            val actual = updateDownloader.sha256(downloadId)
+                            val matches = expectedSha256.isNullOrBlank() || actual.equals(expectedSha256, ignoreCase = true)
+                            val uri = if (matches) updateDownloader.downloadedUri(downloadId) else null
+                            Triple(actual, matches, uri)
+                        }
+                        if (!verified.second || verified.third == null) {
+                            withContext(Dispatchers.IO) { updateDownloader.remove(downloadId) }
+                            preferences.edit().remove(PENDING_UPDATE_DOWNLOAD_ID).remove(PENDING_UPDATE_VERSION).remove(PENDING_UPDATE_SHA256).apply()
+                            _state.value = _state.value.copy(
+                                isDownloadingUpdate = false,
+                                updateDownloadId = null,
+                                updateDownloadProgress = null,
+                                downloadedUpdateUri = null,
+                                updateCheckMessage = "The downloaded update failed verification. Check for updates and try again."
+                            )
+                        } else {
+                            _state.value = _state.value.copy(
+                                isDownloadingUpdate = false,
+                                downloadedUpdateUri = verified.third.toString(),
+                                updateCheckMessage = "KILO ${_state.value.updateVersionName} is downloaded and ready to install."
+                            )
+                        }
+                        return@launch
+                    }
+                    UpdateDownloadPhase.FAILED -> {
+                        preferences.edit().remove(PENDING_UPDATE_DOWNLOAD_ID).remove(PENDING_UPDATE_VERSION).remove(PENDING_UPDATE_SHA256).apply()
+                        _state.value = _state.value.copy(
+                            isDownloadingUpdate = false,
+                            updateCheckMessage = "The update download failed. Check your connection and try again."
+                        )
+                        return@launch
+                    }
+                    else -> delay(700L)
+                }
+            }
+        }
+    }
+
+    fun installDownloadedUpdate() {
+        val uri = _state.value.downloadedUpdateUri?.let(Uri::parse) ?: return
+        if (!UpdateInstaller.open(getApplication(), uri)) {
+            _state.value = _state.value.copy(updateCheckMessage = "Allow KILO to install updates, then tap Install update again.")
         }
     }
 
@@ -3434,6 +3805,7 @@ fun VybeRootApp(vm: MainViewModel) {
 @Composable
 private fun PersonalizationWizardDialog(vm: MainViewModel) {
     val state by vm.state.collectAsState()
+    val context = LocalContext.current
     val profile = state.listenerProfile
     var step by remember { mutableIntStateOf(0) }
     var artistQuery by remember { mutableStateOf("") }
@@ -3455,14 +3827,14 @@ private fun PersonalizationWizardDialog(vm: MainViewModel) {
                 Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
                     when (step) {
                         0 -> {
-                            Text("Choose genres you enjoy", color = Color.White, fontWeight = FontWeight.Bold)
+                            Text("Choose at least 3 genres you enjoy", color = Color.White, fontWeight = FontWeight.Bold)
                             ProfileChoiceGrid(PERSONALIZATION_GENRES, profile.favoriteGenres, state.activeSkin.highlight, vm::toggleProfileGenre)
                         }
                         1 -> {
                             ProfileArtistPicker(vm, state, artistQuery) { artistQuery = it }
                         }
                         2 -> {
-                            Text("Pick moods for different moments", color = Color.White, fontWeight = FontWeight.Bold)
+                            Text("Pick at least 3 moods for different moments", color = Color.White, fontWeight = FontWeight.Bold)
                             ProfileChoiceGrid(PERSONALIZATION_MOODS, profile.favoriteMoods, state.activeSkin.highlight, vm::toggleProfileMood)
                         }
                         else -> {
@@ -3470,6 +3842,9 @@ private fun PersonalizationWizardDialog(vm: MainViewModel) {
                             ProfileSingleChoice("Discovery", listOf("Conservative", "Balanced", "Explorer", "Adventurer"), profile.discoveryLevel) { vm.setProfileChoices(discovery = it) }
                             ProfileSingleChoice("Audio preference", listOf("Balanced", "Bass Lover", "Audiophile", "Vocal Focus", "Podcast", "Custom"), profile.audioPreference) { vm.setProfileChoices(audio = it) }
                             ProfileSingleChoice("Android Auto", listOf("Often", "Sometimes", "Never"), profile.androidAutoUsage) { vm.setProfileChoices(androidAuto = it) }
+                            Text("Favorite languages", color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
+                            ProfileChoiceGrid(PERSONALIZATION_LANGUAGES, profile.favoriteLanguages, state.activeSkin.highlight,
+                                vm::toggleProfileLanguage, minimumRequired = 0)
                             Text("KILO keeps this profile on your device. It shapes Home, recommendations, radio and Android Auto.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(top = 8.dp))
                         }
                     }
@@ -3479,7 +3854,16 @@ private fun PersonalizationWizardDialog(vm: MainViewModel) {
                     Spacer(Modifier.weight(1f))
                     if (step > 0) OutlinedButton(onClick = { step-- }) { Text("Back") }
                     Button(
-                        onClick = { if (step < 3) step++ else vm.saveListenerProfile(profile) },
+                        onClick = {
+                            when {
+                                step == 0 && profile.favoriteGenres.size < 3 ->
+                                    Toast.makeText(context, "Choose at least 3 genres to continue.", Toast.LENGTH_SHORT).show()
+                                step == 2 && profile.favoriteMoods.size < 3 ->
+                                    Toast.makeText(context, "Choose at least 3 moods to continue.", Toast.LENGTH_SHORT).show()
+                                step < 3 -> step++
+                                else -> vm.saveListenerProfile(profile)
+                            }
+                        },
                         colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight)
                     ) { Text(if (step < 3) "Continue" else "Finish", color = Color.Black, fontWeight = FontWeight.Bold) }
                 }
@@ -3535,27 +3919,40 @@ private fun ProfileArtistPick(name: String, selected: Boolean, accent: Color, on
 }
 
 @Composable
-private fun ProfileChoiceGrid(options: List<String>, selected: Set<String>, accent: Color, onToggle: (String) -> Unit) {
-    Column(Modifier.fillMaxWidth().padding(top = 10.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
-        options.chunked(3).forEach { row ->
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                row.forEach { value ->
-                    val isSelected = value in selected
-                    Row(
-                        modifier = Modifier.weight(1f).heightIn(min = 44.dp)
-                            .clip(RoundedCornerShape(15.dp))
-                            .background(if (isSelected) accent.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.045f))
-                            .border(1.dp, if (isSelected) accent.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.08f), RoundedCornerShape(15.dp))
-                            .clickable { onToggle(value) }
-                            .padding(horizontal = 10.dp, vertical = 9.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        Text(value, fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
-                            color = if (isSelected) Color.White else Color.White.copy(alpha = 0.78f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    }
+private fun ProfileChoiceGrid(
+    options: List<String>,
+    selected: Set<String>,
+    accent: Color,
+    onToggle: (String) -> Unit,
+    minimumRequired: Int = 3
+) {
+    Column(Modifier.fillMaxWidth().padding(top = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            if (minimumRequired > 0) "${selected.size} selected · choose at least $minimumRequired" else "${selected.size} selected",
+            color = accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold
+        )
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(3),
+            modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp),
+            contentPadding = PaddingValues(vertical = 3.dp),
+            horizontalArrangement = Arrangement.spacedBy(7.dp),
+            verticalArrangement = Arrangement.spacedBy(7.dp)
+        ) {
+            items(options.size, key = { options[it] }) { index ->
+                val value = options[index]
+                val isSelected = value in selected
+                Box(
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp)
+                        .clip(RoundedCornerShape(15.dp))
+                        .background(if (isSelected) accent.copy(alpha = 0.2f) else Color.White.copy(alpha = 0.045f))
+                        .border(1.dp, if (isSelected) accent.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.08f), RoundedCornerShape(15.dp))
+                        .clickable { onToggle(value) }
+                        .padding(horizontal = 8.dp, vertical = 9.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(value, fontSize = 11.sp, fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                        color = if (isSelected) Color.White else Color.White.copy(alpha = 0.78f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
-                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
             }
         }
     }
@@ -3725,6 +4122,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
         shelf.copy(songs = shelf.songs.filterNot { it.id in state.notRecommendedIds })
     }.filter { it.songs.isNotEmpty() }
     val songs = shelves.flatMap { it.songs }.distinctBy { it.id }
+    val companionSongsById = remember(state.companionSongs) { state.companionSongs.associateBy { it.id } }
     val homeTabs = (listOf("All") + shelves.map { it.title }).distinct().take(7)
     val activeHomeTab = state.activeHomeTab.takeIf { it in homeTabs } ?: "All"
     val featured = if (state.isPlaying) state.activeSong else songs.firstOrNull()
@@ -3760,6 +4158,44 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                     ) { Icon(Icons.Default.Search, contentDescription = "Search", tint = Color.White) }
                 }
             )
+        }
+
+        if (state.updateAvailable || state.isDownloadingUpdate || state.downloadedUpdateUri != null) {
+            item(key = "update_available_banner") {
+                KiloCard(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp),
+                    shape = primaryCardShape(skin),
+                    backgroundBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.34f), primaryPanelColor(skin), primaryPanelColor(skin))),
+                    borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.7f), accent.copy(alpha = 0.18f))),
+                    contentPadding = 16.dp
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Icon(Icons.Filled.SystemUpdate, contentDescription = null, tint = accent, modifier = Modifier.size(25.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text("KILO ${state.updateVersionName}", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+                            Text(
+                                when {
+                                    state.downloadedUpdateUri != null -> "Downloaded and ready to install"
+                                    state.isDownloadingUpdate -> "Downloading update · ${state.updateDownloadProgress ?: 0}%"
+                                    else -> "Update available"
+                                },
+                                color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp
+                            )
+                        }
+                        when {
+                            state.downloadedUpdateUri != null -> Button(onClick = vm::installDownloadedUpdate) { Text("Install") }
+                            state.isDownloadingUpdate -> CircularProgressIndicator(color = accent, modifier = Modifier.size(22.dp), strokeWidth = 2.dp)
+                            state.updateAvailable -> Button(onClick = vm::downloadUpdate) { Text("Download") }
+                        }
+                    }
+                    if (state.isDownloadingUpdate) {
+                        Spacer(Modifier.height(10.dp))
+                        Box(Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(50)).background(Color.White.copy(alpha = 0.12f))) {
+                            Box(Modifier.fillMaxWidth((state.updateDownloadProgress ?: 0).coerceIn(0, 100) / 100f).fillMaxHeight().background(accent))
+                        }
+                    }
+                }
+            }
         }
 
         if (featured != null) item(key = "primary_now_playing_hero") {
@@ -3930,6 +4366,97 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                     }
                 }
             }
+            }
+        }
+
+        state.soundDna?.let { dna ->
+            item(key = "v250_sound_dna") {
+                KiloSection("MY SOUND DNA", accent = accent)
+                KiloCard(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 4.dp),
+                    shape = primaryCardShape(skin),
+                    backgroundBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.24f), primaryPanelColor(skin))),
+                    borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.45f), Color.White.copy(alpha = 0.06f))),
+                    contentPadding = 16.dp
+                ) {
+                    Text(dna.personality, color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        listOfNotNull(dna.topGenres.take(3).takeIf { it.isNotEmpty() }?.joinToString(), dna.topArtists.take(3).takeIf { it.isNotEmpty() }?.joinToString())
+                            .joinToString(" · ").ifBlank { "Your listening profile is taking shape" },
+                        color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 5.dp)
+                    )
+                    Text(
+                        "Discovery ${dna.discoveryScore}%  ·  Replays ${dna.replayScore}%  ·  ${dna.tracksAnalyzed} listening signals",
+                        color = accent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 9.dp)
+                    )
+                }
+            }
+        }
+
+        if (state.journeyPreviews.isNotEmpty()) item(key = "v250_music_journeys") {
+            KiloSection("MUSIC JOURNEYS", accent = accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(state.journeyPreviews, key = { it.id }) { journey ->
+                    val journeyAccent = Color(journey.accentArgb.toInt())
+                    KiloCard(
+                        modifier = Modifier.width(236.dp).clickable { vm.playJourney(journey.id) },
+                        shape = RoundedCornerShape(22.dp),
+                        backgroundBrush = Brush.linearGradient(listOf(journeyAccent.copy(alpha = 0.44f), primaryPanelColor(skin))),
+                        borderBrush = Brush.linearGradient(listOf(journeyAccent.copy(alpha = 0.55f), Color.White.copy(alpha = 0.06f))),
+                        contentPadding = 15.dp
+                    ) {
+                        Icon(Icons.Filled.Explore, contentDescription = null, tint = journeyAccent, modifier = Modifier.size(23.dp))
+                        Text(journey.title, color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 10.dp))
+                        Text(journey.subtitle, color = Color.White.copy(alpha = 0.72f), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(top = 4.dp))
+                        Text("${journey.trackIds.size} tracks · ${journey.relevance}% match", color = journeyAccent, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(top = 10.dp))
+                    }
+                }
+            }
+        }
+
+        state.discoveryRadarSections.forEach { section ->
+            val radarSongs = section.tracks.mapNotNull { companionSongsById[it.id] }.take(8)
+            if (radarSongs.isNotEmpty()) item(key = "v250_radar_${section.id}") {
+                Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 4.dp), verticalAlignment = Alignment.Bottom,
+                    horizontalArrangement = Arrangement.SpaceBetween) {
+                    Column(Modifier.weight(1f)) {
+                        Text("DISCOVERY RADAR", color = accent, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.2.sp)
+                        Text(section.title, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold)
+                        Text(section.description, color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                LazyRow(contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(11.dp)) {
+                    items(radarSongs, key = { "radar_${section.id}_${it.id}" }) { song ->
+                        PrimaryArtworkTile(song, skin, family) { vm.playDiscoveryTrack(song.id, section.title) }
+                    }
+                }
+            }
+        }
+
+        if (state.timeCapsules.isNotEmpty()) item(key = "v250_time_machine") {
+            KiloSection("TIME MACHINE", accent = accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                items(state.timeCapsules, key = { it.id }) { capsule ->
+                    KiloCard(
+                        modifier = Modifier.width(205.dp).clickable { vm.playTimeCapsule(capsule.id) },
+                        shape = primaryCardShape(skin),
+                        backgroundBrush = Brush.linearGradient(listOf(Color(0xFF536EA8).copy(alpha = 0.42f), primaryPanelColor(skin))),
+                        borderBrush = Brush.linearGradient(listOf(Color(0xFF96B9FF).copy(alpha = 0.36f), Color.White.copy(alpha = 0.05f))),
+                        contentPadding = 14.dp
+                    ) {
+                        Icon(Icons.Filled.History, contentDescription = null, tint = Color(0xFF9ABEFF), modifier = Modifier.size(22.dp))
+                        Text(capsule.title, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1,
+                            modifier = Modifier.padding(top = 8.dp))
+                        Text("${capsule.listenCount} listening moments · ${capsule.trackIds.size} tracks", color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp,
+                            modifier = Modifier.padding(top = 4.dp))
+                        Text(capsule.topArtists.take(2).joinToString().ifBlank { capsule.topMoods.take(2).joinToString() }, color = Color(0xFF9ABEFF),
+                            fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(top = 8.dp))
+                    }
+                }
             }
         }
 
@@ -5659,29 +6186,51 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
 
         SettingsSectionHeader("APP UPDATES")
         SettingsGroupCard {
+            Text("Current version · ${BuildConfig.VERSION_NAME}", color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp,
+                modifier = Modifier.padding(start = 16.dp, top = 12.dp, end = 16.dp))
             Text(
                 state.updateCheckMessage,
                 color = if (state.updateAvailable) accent else Color.White.copy(alpha = 0.68f),
                 fontSize = 13.sp,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
             )
+            if (state.updateAvailable) {
+                Text("KILO ${state.updateVersionName} · ${if (state.latestApkSizeBytes > 0L) String.format(Locale.ROOT, "%.1f MB", state.latestApkSizeBytes / (1024f * 1024f)) else "APK size unavailable"}",
+                    color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp))
+                if (state.latestReleaseNotes.isNotBlank()) {
+                    Text(state.latestReleaseNotes.trim(), color = Color.White.copy(alpha = 0.68f), fontSize = 11.sp, maxLines = 5,
+                        overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                }
+            }
+            if (state.isDownloadingUpdate) {
+                LinearProgressIndicator(
+                    progress = { (state.updateDownloadProgress ?: 0).coerceIn(0, 100) / 100f },
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                    color = accent,
+                    trackColor = Color.White.copy(alpha = 0.12f)
+                )
+                Text("${state.updateDownloadProgress ?: 0}% downloaded", color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp,
+                    modifier = Modifier.padding(start = 16.dp, top = 6.dp))
+            }
             Row(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Button(onClick = vm::checkForUpdates, enabled = !state.isCheckingForUpdates) {
+                Button(onClick = vm::checkForUpdates, enabled = !state.isCheckingForUpdates && !state.isDownloadingUpdate) {
                     if (state.isCheckingForUpdates) {
                         CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                         Spacer(Modifier.width(8.dp))
                     }
-                    Text(if (state.isCheckingForUpdates) "Checking…" else "Check GitHub")
+                    Text(if (state.isCheckingForUpdates) "Checking…" else "Check for updates")
                 }
-                if (state.latestReleaseUrl.isNotBlank()) {
-                    TextButton(onClick = { vm.openReleaseUrl(state.latestReleaseUrl) }) { Text("View release") }
+                if (state.isDownloadingUpdate) {
+                    Text("Downloading…", color = accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
-                if (state.latestApkUrl.isNotBlank()) {
-                    TextButton(onClick = { vm.openReleaseUrl(state.latestApkUrl) }) { Text("Get APK") }
+                if (state.downloadedUpdateUri != null) {
+                    Button(onClick = vm::installDownloadedUpdate) { Text("Install update") }
+                } else if (state.updateAvailable && !state.isDownloadingUpdate) {
+                    Button(onClick = vm::downloadUpdate) { Text("Download update") }
                 }
             }
         }
@@ -6852,7 +7401,7 @@ fun BitChordWebViewLoginDialog(
                 ) {
                     Column {
                         Text("Sign in to YouTube Music", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                        Text("VYBE Direct Session Sync", color = Color(0xFFFF7043), fontSize = 11.sp)
+                    Text("KILO Direct Session Sync", color = Color(0xFFFF7043), fontSize = 11.sp)
                     }
                     TextButton(onClick = onDismiss) {
                         Text("Close", color = Color.White)
@@ -6967,7 +7516,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     BitchordWaveLogo(modifier = Modifier.size(28.dp))
-                    Text("VYBE SETUP", color = Color.White, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
+                    Text("KILO SETUP", color = Color.White, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
                 }
                 Text("Step ${state.setupStep + 1}/11", color = state.activeSkin.highlight, fontWeight = FontWeight.Bold)
             }
@@ -7095,7 +7644,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                     6 -> WizardStepContent("7. Personalize your listening", "Choose genres, artists and moods next. You can change these later in Settings.") {
                         Icon(Icons.Default.CheckCircle, contentDescription = null, tint = state.activeSkin.highlight, modifier = Modifier.size(64.dp))
                     }
-                    7 -> WizardStepContent("8. Choose your genres", "Pick the styles you want KILO to use for your Home shelves and recommendations.") {
+                    7 -> WizardStepContent("8. Choose your genres", "Choose at least three. Your picks shape recommendations and mixes.") {
                         ProfileChoiceGrid(PERSONALIZATION_GENRES, state.listenerProfile.favoriteGenres, state.activeSkin.highlight, vm::toggleProfileGenre)
                     }
                     8 -> WizardStepContent("9. Follow artists", "Browse popular worldwide and regional artists, or search YouTube Music.") {
@@ -7103,7 +7652,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                             ProfileArtistPicker(vm, state, setupArtistQuery) { setupArtistQuery = it }
                         }
                     }
-                    9 -> WizardStepContent("10. Pick your moods", "Choose moods for Home, mixes and Android Auto.") {
+                    9 -> WizardStepContent("10. Pick your moods", "Choose at least three. Your picks guide mood mixes and discovery.") {
                         ProfileChoiceGrid(PERSONALIZATION_MOODS, state.listenerProfile.favoriteMoods, state.activeSkin.highlight, vm::toggleProfileMood)
                     }
                     10 -> WizardStepContent("11. Tune your listening", "These preferences shape recommendations and sound on this device.") {
@@ -7111,6 +7660,9 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                             ProfileSingleChoice("Discovery", listOf("Conservative", "Balanced", "Explorer", "Adventurer"), state.listenerProfile.discoveryLevel) { vm.setProfileChoices(discovery = it) }
                             ProfileSingleChoice("Audio preference", listOf("Balanced", "Bass Lover", "Audiophile", "Vocal Focus", "Podcast", "Custom"), state.listenerProfile.audioPreference) { vm.setProfileChoices(audio = it) }
                             ProfileSingleChoice("Android Auto", listOf("Often", "Sometimes", "Never"), state.listenerProfile.androidAutoUsage) { vm.setProfileChoices(androidAuto = it) }
+                            Text("Favorite languages", color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp))
+                            ProfileChoiceGrid(PERSONALIZATION_LANGUAGES, state.listenerProfile.favoriteLanguages, state.activeSkin.highlight,
+                                vm::toggleProfileLanguage, minimumRequired = 0)
                         }
                     }
                 }
