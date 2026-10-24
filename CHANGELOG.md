@@ -1,3 +1,17 @@
+# KILO 2.5.1
+
+## What's new
+
+- Reduced first-run setup to three steps: welcome, optional YouTube Music sign-in, and start listening.
+- Deferred personalization, themes, audio preferences, downloads, and device music access until users choose to configure or use them.
+- Preserved playback intent through audio-focus interruptions so stream-error recovery can resume automatically.
+- Kept the playback Wi-Fi lock active during temporary buffering to help prevent background network stalls from interrupting a song.
+- Kept the existing playback engine, stream cache, startup diagnostics, retry recovery, and Android Auto browse architecture.
+- Limited the loading indicator to an initial track load or recovery; it no longer reappears for ordinary buffering during active playback.
+- Updated the launcher icon with KILO's simplified gradient K mark.
+
+---
+
 # KILO 2.1.0
 
 ## What's new

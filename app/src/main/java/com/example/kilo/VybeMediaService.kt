@@ -553,7 +553,18 @@ object PlayerHolder {
 
         p.addListener(object : Player.Listener {
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-                lastPlayIntent = playWhenReady
+                // Audio focus can temporarily clear playWhenReady while the
+                // listener is still expecting playback to resume. Preserve that
+                // intent so a stream retry does not leave the track paused.
+                if (reason != Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS) {
+                    lastPlayIntent = playWhenReady
+                }
+                Log.i(
+                    "KiloPlayback",
+                    "playWhenReadyChanged id=${p.currentMediaItem?.mediaId.orEmpty()} " +
+                        "value=$playWhenReady reason=$reason lastIntent=$lastPlayIntent state=${p.playbackState} " +
+                        "suppression=${p.playbackSuppressionReason} positionMs=${p.currentPosition}"
+                )
                 PlaybackStartupMetrics.playerState(
                     p.currentMediaItem?.mediaId, p.playbackState, playWhenReady, p.isPlaying
                 )
@@ -625,6 +636,14 @@ object PlayerHolder {
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
+                Log.i(
+                    "KiloPlayback",
+                    "isPlayingChanged id=${p.currentMediaItem?.mediaId.orEmpty()} " +
+                        "isPlaying=$isPlaying playWhenReady=${p.playWhenReady} " +
+                        "state=${p.playbackState} suppression=${p.playbackSuppressionReason} " +
+                        "positionMs=${p.currentPosition} " +
+                        "bufferedMs=${(p.bufferedPosition - p.currentPosition).coerceAtLeast(0L)}"
+                )
                 PlaybackStartupMetrics.playerState(
                     p.currentMediaItem?.mediaId, p.playbackState, p.playWhenReady, isPlaying
                 )
@@ -935,14 +954,35 @@ class VybeMediaService : MediaLibraryService() {
         }
         override fun onPlaybackStateChanged(playbackState: Int) {
             postPlaybackNotification()
-            val isPlaying = session?.player?.isPlaying == true
-            if (isPlaying && wifiLock?.isHeld == false) wifiLock?.acquire()
-            else if (!isPlaying && wifiLock?.isHeld == true) wifiLock?.release()
+            session?.player?.let(::updatePlaybackWifiLock)
         }
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             postPlaybackNotification()
-            if (isPlaying && wifiLock?.isHeld == false) wifiLock?.acquire()
-            else if (!isPlaying && wifiLock?.isHeld == true) wifiLock?.release()
+            session?.player?.let(::updatePlaybackWifiLock)
+        }
+        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+            session?.player?.let(::updatePlaybackWifiLock)
+        }
+    }
+
+    /** Keep Wi-Fi awake while a requested network stream is buffering between packets. */
+    private fun updatePlaybackWifiLock(player: Player) {
+        val lock = wifiLock ?: return
+        val shouldHold = player.playWhenReady &&
+            player.mediaItemCount > 0 &&
+            player.playbackState != Player.STATE_IDLE &&
+            player.playbackState != Player.STATE_ENDED &&
+            player.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE
+        runCatching {
+            if (shouldHold && !lock.isHeld) {
+                lock.acquire()
+                Log.d(TAG, "Playback Wi-Fi lock acquired state=${player.playbackState}")
+            } else if (!shouldHold && lock.isHeld) {
+                lock.release()
+                Log.d(TAG, "Playback Wi-Fi lock released state=${player.playbackState} playWhenReady=${player.playWhenReady}")
+            }
+        }.onFailure { error ->
+            Log.w(TAG, "Could not update playback Wi-Fi lock", error)
         }
     }
 
@@ -996,8 +1036,10 @@ class VybeMediaService : MediaLibraryService() {
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
         @Suppress("DEPRECATION")
         wifiLock = wifiManager.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KiloPlaybackWifiLock")
+            .apply { setReferenceCounted(false) }
         
         player.addListener(layoutListener)
+        updatePlaybackWifiLock(player)
         Favorites.addListener(favListener)
         getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
             .registerOnSharedPreferenceChangeListener(carBrowsePreferenceListener)

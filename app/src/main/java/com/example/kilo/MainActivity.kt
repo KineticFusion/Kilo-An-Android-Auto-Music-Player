@@ -1248,7 +1248,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     "playWhenReady=${player.playWhenReady} isPlaying=${player.isPlaying}"
             )
             _state.value = _state.value.copy(
-                isLoadingStream = playbackState == Player.STATE_BUFFERING && player.playWhenReady,
+                // Keep the indicator for an explicit initial load/recovery only. A later
+                // rebuffer during active playback should not make it appear again.
+                isLoadingStream = _state.value.isLoadingStream &&
+                    playbackState != Player.STATE_READY && playbackState != Player.STATE_ENDED,
                 isPlaying = player.isPlaying
             )
             if (playbackState == Player.STATE_ENDED) {
@@ -1425,7 +1428,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 "setup_complete",
                 preferences.getInt("setup_step", -1) >= 7
             ),
-            setupStep = preferences.getInt("setup_step", 0),
+            setupStep = preferences.getInt("setup_step", 0).coerceIn(0, 2),
             downloadDirectoryUri = preferences.getString("download_directory_uri", null),
             downloadedSongs = loadDownloadedSongs(),
             uiCustomizations = savedCustomizations,
@@ -2685,25 +2688,35 @@ _state.value = _state.value.copy(
     }
 
     fun completeSetupStep(nextStep: Int) {
-        val state = _state.value
-        if (nextStep > 7 && state.setupStep == 7 && state.listenerProfile.favoriteGenres.size < 3) {
-            Toast.makeText(getApplication(), "Choose at least 3 genres to continue.", Toast.LENGTH_SHORT).show()
+        if (nextStep >= 3) {
+            finishQuickStart()
             return
         }
-        if (nextStep > 9 && state.setupStep == 9 && state.listenerProfile.favoriteMoods.size < 3) {
-            Toast.makeText(getApplication(), "Choose at least 3 moods to continue.", Toast.LENGTH_SHORT).show()
-            return
-        }
-        if (nextStep >= 11) {
-            if (state.listenerProfile.favoriteGenres.size < 3 || state.listenerProfile.favoriteMoods.size < 3) {
-                Toast.makeText(getApplication(), "Choose at least 3 genres and 3 moods first.", Toast.LENGTH_LONG).show()
-                return
-            }
-            saveListenerProfile(state.listenerProfile, finishSetup = true)
-        } else if (nextStep >= 0) {
-            preferences.edit().putInt("setup_step", nextStep).apply()
-            _state.value = state.copy(setupStep = nextStep)
-        }
+        if (nextStep < 0) return
+        val step = nextStep.coerceIn(0, 2)
+        preferences.edit().putInt("setup_step", step).apply()
+        _state.value = _state.value.copy(setupStep = step)
+    }
+
+    private fun finishQuickStart() {
+        val current = _state.value
+        val activeMood = current.selectedMood.takeIf { it.isNotBlank() } ?: "Discover"
+        ProfileEngine.save(preferences, current.listenerProfile, current.activeAccountId)
+        preferences.edit()
+            .putBoolean("setup_complete", true)
+            .putInt("setup_step", 11)
+            .putBoolean("personalization_pending", false)
+            .putBoolean("personalization_pending_${current.activeAccountId}", false)
+            .putString("discovery_mood", activeMood)
+            .apply()
+        _state.value = current.copy(
+            isSetupComplete = true,
+            setupStep = 11,
+            currentScreen = ScreenNav.HOME,
+            selectedMood = activeMood,
+            showPersonalizationWizard = false
+        )
+        loadHome()
     }
 
     fun playJourney(journeyId: String) {
@@ -7449,56 +7462,6 @@ private fun musicRegionOptions(): List<Pair<String, String>> =
 @Composable
 fun BitChordSetupWizard(vm: MainViewModel) {
     val state by vm.state.collectAsState()
-    val context = LocalContext.current
-    var setupArtistQuery by remember { mutableStateOf("") }
-    val audioPermission = remember {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            Manifest.permission.READ_MEDIA_AUDIO
-        } else {
-            Manifest.permission.READ_EXTERNAL_STORAGE
-        }
-    }
-    val notifPermission = remember {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            Manifest.permission.POST_NOTIFICATIONS
-        } else ""
-    }
-    var audioPermissionGranted by remember {
-        mutableStateOf(context.checkSelfPermission(audioPermission) == PackageManager.PERMISSION_GRANTED)
-    }
-    var notifPermissionGranted by remember {
-        mutableStateOf(
-            notifPermission.isEmpty() || context.checkSelfPermission(notifPermission) == PackageManager.PERMISSION_GRANTED
-        )
-    }
-
-    val permissionActivity = context as? ComponentActivity
-    DisposableEffect(permissionActivity, audioPermission, notifPermission) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                audioPermissionGranted = permissionActivity?.checkSelfPermission(audioPermission) == PackageManager.PERMISSION_GRANTED
-                if (notifPermission.isNotEmpty()) {
-                    notifPermissionGranted = permissionActivity?.checkSelfPermission(notifPermission) == PackageManager.PERMISSION_GRANTED
-                }
-            }
-        }
-        permissionActivity?.lifecycle?.addObserver(observer)
-        onDispose { permissionActivity?.lifecycle?.removeObserver(observer) }
-    }
-
-    val audioLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        audioPermissionGranted = granted
-    }
-    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        notifPermissionGranted = granted
-    }
-    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) {
-        vm.setDownloadDirectory(it)
-    }
-    var wizardRegionMenuExpanded by remember { mutableStateOf(false) }
-    val selectedFolder = state.downloadDirectoryUri?.let { value ->
-        runCatching { DocumentsContract.getTreeDocumentId(Uri.parse(value)).substringAfterLast(':') }.getOrNull()
-    }?.takeIf { it.isNotBlank() } ?: "No folder selected yet"
 
     Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF0A0B10)) {
         Column(
@@ -7516,9 +7479,13 @@ fun BitChordSetupWizard(vm: MainViewModel) {
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     BitchordWaveLogo(modifier = Modifier.size(28.dp))
-                    Text("KILO SETUP", color = Color.White, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
+                    Text("KILO QUICK START", color = Color.White, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp)
                 }
-                Text("Step ${state.setupStep + 1}/11", color = state.activeSkin.highlight, fontWeight = FontWeight.Bold)
+                Text(
+                    "Step " + (state.setupStep + 1) + " of 3",
+                    color = state.activeSkin.highlight,
+                    fontWeight = FontWeight.Bold
+                )
             }
 
             Box(
@@ -7526,143 +7493,79 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                 contentAlignment = Alignment.Center
             ) {
                 when (state.setupStep) {
-                    0 -> WizardStepContent("1. Permissions & Notifications", "Allow audio access, live playback notifications (with Pause & Close controls), and choose a download folder.") {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            OutlinedTextField(
-                                value = state.displayName,
-                                onValueChange = vm::setDisplayName,
-                                label = { Text("Your name") },
-                                singleLine = true
+                    0 -> WizardStepContent(
+                        "Welcome to KILO",
+                        "Start listening in a few quick steps. You can personalize KILO later in Settings."
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            BitchordWaveLogo(modifier = Modifier.size(76.dp))
+                            Text(
+                                "Moods, themes, audio preferences, downloads and other setup are optional.",
+                                color = Color.White.copy(alpha = 0.72f),
+                                textAlign = TextAlign.Center
                             )
-                            Button(
-                                onClick = { audioLauncher.launch(audioPermission) },
-                                colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight),
-                                modifier = Modifier.fillMaxWidth()
+                        }
+                    }
+
+                    1 -> WizardStepContent(
+                        "Choose your source",
+                        "You can browse public music immediately. Sign in only if you want your personal YouTube Music library and mixes."
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(18.dp))
+                                    .background(state.activeSkin.highlight.copy(alpha = 0.15f))
+                                    .border(1.dp, state.activeSkin.highlight.copy(alpha = 0.8f), RoundedCornerShape(18.dp))
+                                    .padding(18.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                Text(
-                                    if (audioPermissionGranted) "✓ Audio Permission Granted" else "Grant Audio Permission",
-                                    color = Color.Black,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                Text("Public music", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                                Text("Browse without signing in. Ready to use now.", color = Color.White.copy(alpha = 0.72f))
                             }
-                            if (notifPermission.isNotEmpty()) {
-                                Button(
-                                    onClick = { notifLauncher.launch(notifPermission) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight),
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(
-                                        if (notifPermissionGranted) "✓ Notification Permission Granted" else "Allow Playback Notifications",
-                                        color = Color.Black,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                            OutlinedButton(onClick = { folderPicker.launch(null) }, modifier = Modifier.fillMaxWidth()) {
-                                Icon(Icons.Default.Folder, contentDescription = null)
-                                Spacer(Modifier.width(8.dp))
-                                Text("Choose Download Folder")
-                            }
-                            Text(selectedFolder, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp, textAlign = TextAlign.Center)
-                        }
-                    }
-                    1 -> WizardStepContent("2. Connect YouTube Music", "Browse public music without signing in. Connect an account for your personal mixes, library and playlists.") {
-                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            Button(
-                                onClick = { vm.openWebLogin() },
-                                colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(if (state.isLoggedIn) "✓ Connected to YouTube Music" else "Sign in to YouTube Music", color = Color.Black, fontWeight = FontWeight.Bold)
-                            }
-                            Text("Music country / region", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
-                            Box {
-                                OutlinedButton(onClick = { wizardRegionMenuExpanded = true }, modifier = Modifier.fillMaxWidth()) {
-                                    Text(musicRegionOptions().firstOrNull { it.first == state.musicRegionCode }?.second ?: state.musicRegionCode, color = Color.White)
-                                }
-                                DropdownMenu(expanded = wizardRegionMenuExpanded, onDismissRequest = { wizardRegionMenuExpanded = false }) {
-                                    musicRegionOptions().forEach { (code, label) ->
-                                        DropdownMenuItem(
-                                            text = { Text(label) },
-                                            onClick = { wizardRegionMenuExpanded = false; vm.setMusicRegion(code) },
-                                            trailingIcon = if (state.musicRegionCode == code) ({ Icon(Icons.Default.Check, contentDescription = null) }) else null
-                                        )
-                                    }
-                                }
-                            }
-                            Text("Auto follows your device locale. You can change this any time in Settings.", color = Color.White.copy(alpha = 0.65f), fontSize = 12.sp)
-                        }
-                    }
-                    2 -> WizardStepContent("3. Instant Parallel Streaming", "FastStream races ANDROID_VR and iOS InnerTube clients simultaneously so tracks start in under a second.") {
-                        Text("Parallel Stream Engine + 256MB Byte Prefetch Active", color = state.activeSkin.highlight, fontWeight = FontWeight.Bold)
-                    }
-                    3 -> WizardStepContent("4. Choose your app layout", "Pick one of 15 complete looks. You can change it any time in Settings.") {
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.heightIn(max = 250.dp).verticalScroll(rememberScrollState())) {
-                            SkinTheme.values().toList().chunked(3).forEach { rowSkins ->
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    rowSkins.forEach { skin ->
-                                        val selected = state.activeSkin == skin
-                                        Column(
-                                            modifier = Modifier.weight(1f).heightIn(min = 52.dp)
-                                                .clip(primaryCardShape(skin))
-                                                .background(if (selected) skin.highlight.copy(alpha = 0.24f) else Color(0xFF16161C))
-                                                .border(1.dp, if (selected) skin.highlight else Color.White.copy(alpha = 0.07f), primaryCardShape(skin))
-                                                .clickable { vm.setSkin(skin) }.padding(horizontal = 7.dp, vertical = 6.dp),
-                                            verticalArrangement = Arrangement.Center
-                                        ) {
-                                            Text(skin.title, color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            Text(if (selected) "Selected" else "${skin.title} look", color = skin.highlight.copy(alpha = 0.85f), fontSize = 7.sp, maxLines = 1)
-                                        }
-                                    }
-                                    repeat(3 - rowSkins.size) { Spacer(Modifier.weight(1f)) }
-                                }
-                            }
-                        }
-                    }
-                    4 -> WizardStepContent("5. Android Auto Dashboard", "Select which shelves appear on your car screen.") {
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            for (menu in AUTO_MENU_TABS) {
-                                val active = state.selectedAutoMenus.contains(menu)
-                                Row(
+                            if (state.isLoggedIn) {
+                                Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(Color(0xFF16161C))
-                                        .clickable { vm.toggleAutoMenu(menu) }
-                                        .padding(12.dp),
-                                    horizontalArrangement = Arrangement.SpaceBetween
+                                        .clip(RoundedCornerShape(18.dp))
+                                        .background(Color.White.copy(alpha = 0.06f))
+                                        .padding(18.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
                                 ) {
-                                    Text(menu, color = Color.White)
-                                    Checkbox(checked = active, onCheckedChange = { vm.toggleAutoMenu(menu) })
+                                    Text("YouTube Music connected", color = Color.White, fontWeight = FontWeight.Bold)
+                                    Text("Your account library and mixes are available.", color = Color.White.copy(alpha = 0.72f))
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = vm::openWebLogin,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White)
+                                ) {
+                                    Text("Connect YouTube Music (optional)")
                                 }
                             }
                         }
                     }
-                    5 -> WizardStepContent("6. Local-First Privacy", "All cached streams, favorites, and offline songs stay strictly on your phone.") {
-                        Text("Zero telemetry • Direct InnerTube streams.", color = Color.White.copy(0.7f))
-                    }
-                    6 -> WizardStepContent("7. Personalize your listening", "Choose genres, artists and moods next. You can change these later in Settings.") {
-                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = state.activeSkin.highlight, modifier = Modifier.size(64.dp))
-                    }
-                    7 -> WizardStepContent("8. Choose your genres", "Choose at least three. Your picks shape recommendations and mixes.") {
-                        ProfileChoiceGrid(PERSONALIZATION_GENRES, state.listenerProfile.favoriteGenres, state.activeSkin.highlight, vm::toggleProfileGenre)
-                    }
-                    8 -> WizardStepContent("9. Follow artists", "Browse popular worldwide and regional artists, or search YouTube Music.") {
-                        Column(Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
-                            ProfileArtistPicker(vm, state, setupArtistQuery) { setupArtistQuery = it }
-                        }
-                    }
-                    9 -> WizardStepContent("10. Pick your moods", "Choose at least three. Your picks guide mood mixes and discovery.") {
-                        ProfileChoiceGrid(PERSONALIZATION_MOODS, state.listenerProfile.favoriteMoods, state.activeSkin.highlight, vm::toggleProfileMood)
-                    }
-                    10 -> WizardStepContent("11. Tune your listening", "These preferences shape recommendations and sound on this device.") {
-                        Column(Modifier.fillMaxWidth().heightIn(max = 360.dp).verticalScroll(rememberScrollState())) {
-                            ProfileSingleChoice("Discovery", listOf("Conservative", "Balanced", "Explorer", "Adventurer"), state.listenerProfile.discoveryLevel) { vm.setProfileChoices(discovery = it) }
-                            ProfileSingleChoice("Audio preference", listOf("Balanced", "Bass Lover", "Audiophile", "Vocal Focus", "Podcast", "Custom"), state.listenerProfile.audioPreference) { vm.setProfileChoices(audio = it) }
-                            ProfileSingleChoice("Android Auto", listOf("Often", "Sometimes", "Never"), state.listenerProfile.androidAutoUsage) { vm.setProfileChoices(androidAuto = it) }
-                            Text("Favorite languages", color = Color.White, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(top = 12.dp))
-                            ProfileChoiceGrid(PERSONALIZATION_LANGUAGES, state.listenerProfile.favoriteLanguages, state.activeSkin.highlight,
-                                vm::toggleProfileLanguage, minimumRequired = 0)
+
+                    else -> WizardStepContent(
+                        "You're ready to listen",
+                        "Your setup is complete. Start with public music now, and add personal preferences whenever you want."
+                    ) {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Text("• No account is required to browse music.", color = Color.White.copy(alpha = 0.82f))
+                            Text("• Sign-in, downloads and device music access can be set up when you use them.", color = Color.White.copy(alpha = 0.82f))
+                            Text("• Moods, genres, themes and audio preferences are available in Settings → Personalization.", color = Color.White.copy(alpha = 0.82f))
                         }
                     }
                 }
@@ -7687,13 +7590,16 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                     modifier = Modifier.weight(if (state.setupStep > 0) 1f else 2f),
                     colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight)
                 ) {
-                    Text(if (state.setupStep == 10) "Launch KILO" else "Continue", color = Color.Black, fontWeight = FontWeight.ExtraBold)
+                    Text(
+                        if (state.setupStep >= 2) "Start listening" else "Continue",
+                        color = Color.Black,
+                        fontWeight = FontWeight.ExtraBold
+                    )
                 }
             }
         }
     }
 }
-
 @Composable
 fun WizardStepContent(title: String, desc: String, content: @Composable () -> Unit) {
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
