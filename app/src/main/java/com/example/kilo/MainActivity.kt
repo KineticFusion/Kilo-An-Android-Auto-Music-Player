@@ -3092,31 +3092,68 @@ _state.value = _state.value.copy(
         _state.value = _state.value.copy(equalizerSnapshot = equalizerController.applyPreset(index))
     }
 
+    @Suppress("DEPRECATION")
+    private fun installedVersionName(): String {
+        val app = getApplication<Application>()
+        return runCatching { app.packageManager.getPackageInfo(app.packageName, 0).versionName }
+            .getOrNull()
+            ?.takeIf(String::isNotBlank)
+            ?: BuildConfig.VERSION_NAME
+    }
+
     fun checkForUpdates() {
         if (_state.value.isCheckingForUpdates) return
         _state.value = _state.value.copy(isCheckingForUpdates = true, updateCheckMessage = "Checking for updates…")
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) {
-                runCatching { GitHubUpdateChecker.check(BuildConfig.VERSION_NAME) }
+                val installedVersion = installedVersionName()
+                runCatching { GitHubUpdateChecker.check(installedVersion) to installedVersion }
             }
-            result.onSuccess { release ->
+            result.onSuccess { (release, installedVersion) ->
                 preferences.edit().putLong(LAST_UPDATE_CHECK_AT, System.currentTimeMillis()).apply()
-                _state.value = _state.value.copy(
-                    isCheckingForUpdates = false,
-                    updateAvailable = release.isUpdateAvailable && !release.apkUrl.isNullOrBlank(),
-                    updateVersionName = release.tagName,
-                    latestReleaseUrl = release.releaseUrl,
-                    latestApkUrl = release.apkUrl.orEmpty(),
-                    latestReleaseTitle = release.tagName,
-                    latestReleaseNotes = release.notes,
-                    latestApkSha256 = release.sha256Digest,
-                    latestApkSizeBytes = release.apkSizeBytes,
-                    updateCheckMessage = when {
-                        release.isUpdateAvailable && !release.apkUrl.isNullOrBlank() -> "KILO ${release.tagName} is available."
-                        release.isUpdateAvailable -> "KILO ${release.tagName} is available, but its APK is missing."
-                        else -> "You’re up to date · KILO ${BuildConfig.VERSION_NAME}"
+                if (!release.isUpdateAvailable) {
+                    val completedDownloadId = preferences.getLong(PENDING_UPDATE_DOWNLOAD_ID, -1L)
+                    clearPendingUpdatePreferences()
+                    updateDownloadJob?.cancel()
+                    _state.value = _state.value.copy(
+                        isCheckingForUpdates = false,
+                        updateAvailable = false,
+                        updateVersionName = release.tagName,
+                        latestReleaseUrl = release.releaseUrl,
+                        latestApkUrl = release.apkUrl.orEmpty(),
+                        latestReleaseTitle = release.tagName,
+                        latestReleaseNotes = release.notes,
+                        latestApkSha256 = release.sha256Digest,
+                        latestApkSizeBytes = release.apkSizeBytes,
+                        updateDownloadId = null,
+                        updateDownloadProgress = null,
+                        isDownloadingUpdate = false,
+                        downloadedUpdateUri = null,
+                        updateInstallerStarted = false,
+                        updateCheckMessage = "You’re up to date · KILO ${installedVersion}"
+                    )
+                    if (completedDownloadId > 0L) {
+                        viewModelScope.launch(Dispatchers.IO) { updateDownloader.remove(completedDownloadId) }
                     }
-                )
+                } else {
+                    val hasApk = !release.apkUrl.isNullOrBlank()
+                    _state.value = _state.value.copy(
+                        isCheckingForUpdates = false,
+                        updateAvailable = hasApk,
+                        updateVersionName = release.tagName,
+                        latestReleaseUrl = release.releaseUrl,
+                        latestApkUrl = release.apkUrl.orEmpty(),
+                        latestReleaseTitle = release.tagName,
+                        latestReleaseNotes = release.notes,
+                        latestApkSha256 = release.sha256Digest,
+                        latestApkSizeBytes = release.apkSizeBytes,
+                        updateCheckMessage = if (hasApk) {
+                            "KILO ${release.tagName} is available."
+                        } else {
+                            "KILO ${release.tagName} is available, but its APK is missing."
+                        }
+                    )
+                }
             }.onFailure { error ->
                 _state.value = _state.value.copy(
                     isCheckingForUpdates = false,
@@ -3292,41 +3329,55 @@ _state.value = _state.value.copy(
     }
 
     fun onAppResumed() {
-        val pendingVersion = preferences.getString(PENDING_UPDATE_VERSION, "").orEmpty()
-        val pendingId = preferences.getLong(PENDING_UPDATE_DOWNLOAD_ID, -1L)
-        if (pendingVersion.isNotBlank() && UpdateCenter.compareVersions(BuildConfig.VERSION_NAME, pendingVersion) >= 0) {
-            clearPendingUpdatePreferences()
-            updateDownloadJob?.cancel()
-            _state.value = _state.value.copy(
-                updateAvailable = false,
-                isDownloadingUpdate = false,
-                updateDownloadId = null,
-                updateDownloadProgress = null,
-                downloadedUpdateUri = null,
-                updateInstallerStarted = false,
-                updateCheckMessage = "You’re up to date · KILO ${BuildConfig.VERSION_NAME}"
-            )
-            if (pendingId > 0L) viewModelScope.launch(Dispatchers.IO) { updateDownloader.remove(pendingId) }
-            checkForUpdates()
-            return
-        }
+        viewModelScope.launch {
+            // PackageManager reflects the installed APK even if this process still has
+            // BuildConfig values from before the package installer replaced it.
+            val installedVersion = withContext(Dispatchers.IO) { installedVersionName() }
+            val pendingVersion = preferences.getString(PENDING_UPDATE_VERSION, "").orEmpty()
+            val pendingId = preferences.getLong(PENDING_UPDATE_DOWNLOAD_ID, -1L)
+            val installerWasStarted = _state.value.updateInstallerStarted ||
+                preferences.getBoolean(PENDING_UPDATE_INSTALLER_STARTED, false)
+            val expectedVersion = pendingVersion.ifBlank { _state.value.updateVersionName }
+            val hasPendingInstall = pendingVersion.isNotBlank() ||
+                _state.value.downloadedUpdateUri != null ||
+                installerWasStarted
 
-        if (preferences.getBoolean(PENDING_UPDATE_AWAITING_PERMISSION, false)) {
-            preferences.edit().remove(PENDING_UPDATE_AWAITING_PERMISSION).apply()
-            if (UpdateInstaller.canInstall(getApplication<Application>())) {
-                installDownloadedUpdate()
-            } else {
-                _state.value = _state.value.copy(updateCheckMessage = "Allow KILO to install apps, then tap Continue install.")
+            if (hasPendingInstall && expectedVersion.isNotBlank() &&
+                UpdateCenter.compareVersions(installedVersion, expectedVersion) >= 0
+            ) {
+                clearPendingUpdatePreferences()
+                updateDownloadJob?.cancel()
+                _state.value = _state.value.copy(
+                    updateAvailable = false,
+                    isDownloadingUpdate = false,
+                    updateDownloadId = null,
+                    updateDownloadProgress = null,
+                    downloadedUpdateUri = null,
+                    updateInstallerStarted = false,
+                    updateCheckMessage = "You’re up to date · KILO ${installedVersion}"
+                )
+                if (pendingId > 0L) viewModelScope.launch(Dispatchers.IO) { updateDownloader.remove(pendingId) }
+                checkForUpdates()
+                return@launch
             }
-            return
-        }
 
-        if (_state.value.updateInstallerStarted || preferences.getBoolean(PENDING_UPDATE_INSTALLER_STARTED, false)) {
-            preferences.edit().remove(PENDING_UPDATE_INSTALLER_STARTED).apply()
-            _state.value = _state.value.copy(
-                updateInstallerStarted = false,
-                updateCheckMessage = "The installer was closed before KILO updated. Tap Continue install to try again."
-            )
+            if (preferences.getBoolean(PENDING_UPDATE_AWAITING_PERMISSION, false)) {
+                preferences.edit().remove(PENDING_UPDATE_AWAITING_PERMISSION).apply()
+                if (UpdateInstaller.canInstall(getApplication<Application>())) {
+                    installDownloadedUpdate()
+                } else {
+                    _state.value = _state.value.copy(updateCheckMessage = "Allow KILO to install apps, then tap Continue install.")
+                }
+                return@launch
+            }
+
+            if (installerWasStarted) {
+                preferences.edit().remove(PENDING_UPDATE_INSTALLER_STARTED).apply()
+                _state.value = _state.value.copy(
+                    updateInstallerStarted = false,
+                    updateCheckMessage = "The installer was closed before KILO updated. Tap Continue install to try again."
+                )
+            }
         }
     }
 
