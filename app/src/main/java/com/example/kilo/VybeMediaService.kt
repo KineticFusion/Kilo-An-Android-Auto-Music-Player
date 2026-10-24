@@ -1482,7 +1482,7 @@ class VybeMediaService : MediaLibraryService() {
                 ))
             }
             else -> when {
-                parentId.startsWith("home:") -> childrenOf(parentId)
+                parentId.startsWith("home:") || parentId.startsWith("quickpicks:after:") -> childrenOf(parentId)
                 parentId == "mood:auto" || parentId.startsWith("mood:") || parentId.startsWith("moodradio:") || parentId.startsWith("genre:") || parentId.startsWith("artist:") -> fallbackSongs
                 parentId.startsWith("savedpl:") -> savedPlaylists()
                     .firstOrNull { it.id == parentId.removePrefix("savedpl:") }?.songs?.map { it.toMediaItem() }.orEmpty()
@@ -1515,7 +1515,7 @@ class VybeMediaService : MediaLibraryService() {
             ROOT, TAB_HOME, TAB_SEARCH, TAB_RECENT, TAB_CONTINUE, TAB_PICKS, TAB_LIKED, TAB_PLAYLISTS, TAB_OFFLINE,
             TAB_RADIO_FAVORITES, TAB_RADIO_RECENT, TAB_RADIO_CUSTOM,
             TAB_GENRES, TAB_MOODS, TAB_ARTISTS, TAB_ALBUMS, TAB_SONGS
-        ) || parentId.startsWith("home:") || parentId.startsWith("savedpl:") || parentId.startsWith("genre:") ||
+        ) || parentId.startsWith("home:") || parentId.startsWith("quickpicks:after:") || parentId.startsWith("savedpl:") || parentId.startsWith("genre:") ||
             parentId.startsWith("mood:") || parentId.startsWith("artist:") || parentId.startsWith("radio:")
 
     private fun requestBrowseGeneration(parentId: String) {
@@ -1928,10 +1928,13 @@ class VybeMediaService : MediaLibraryService() {
                 )
             }
         val shelves = carHomeShelves()
-        val quickSongs = shelves.firstOrNull { it.title.contains("quick pick", ignoreCase = true) }?.songs
-            ?: shelves.firstOrNull()?.songs.orEmpty()
+        val quickSongs = quickPicksSongs(shelves)
         return discoveryCategories + songItems(quickSongs)
     }
+
+    private fun quickPicksSongs(shelves: List<HomeShelf> = carHomeShelves()): List<SongItemClean> =
+        shelves.firstOrNull { it.title.contains("quick pick", ignoreCase = true) }?.songs
+            ?: shelves.firstOrNull()?.songs.orEmpty()
 
     private fun localLibrarySongs(): List<SongItemClean> = runCatching {
         (Favorites.songs() + SessionStore.recentSongs() + downloadedMediaItems().mapIndexed { index, item -> item.toSong(index) } + cachedHomeSongs())
@@ -1991,8 +1994,25 @@ class VybeMediaService : MediaLibraryService() {
         }
         parentId.startsWith("home:picks:") -> {
             val title = Uri.decode(parentId.removePrefix("home:picks:"))
-            songItems(HomeCache.discoveryShelves.firstOrNull { it.title.equals(title, ignoreCase = true) }?.songs.orEmpty())
+            val categorySongs = HomeCache.discoveryShelves
+                .firstOrNull { it.title.equals(title, ignoreCase = true) }
+                ?.songs
+                .orEmpty()
+            val categoryResults = songItems(categorySongs)
+            val quickPicks = quickPicksSongs()
+            categoryResults + if (quickPicks.isNotEmpty()) {
+                listOf(folderItem(
+                    id = "quickpicks:after:${Uri.encode(title)}",
+                    title = "Quick Picks",
+                    subtitle = "More music picked for you",
+                    art = quickPicks.firstOrNull()?.coverUrl
+                        ?: autoArtworkUri(AndroidAutoR.drawable.ic_auto_continue).toString()
+                ))
+            } else {
+                emptyList()
+            }
         }
+        parentId.startsWith("quickpicks:after:") -> songItems(quickPicksSongs())
         parentId == TAB_GENRES -> {
             val profile = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE))
             (profile.favoriteGenres.sorted() + PERSONALIZATION_GENRES.filterNot { it in profile.favoriteGenres }).map { genre ->
