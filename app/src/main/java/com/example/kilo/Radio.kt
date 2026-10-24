@@ -2,6 +2,7 @@ package com.example.kilo
 
 import android.net.Uri
 import android.content.Context
+import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -34,6 +35,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -186,8 +188,18 @@ fun RadioScreen(vm: MainViewModel) {
     var dialIndex by remember { mutableStateOf(0f) }
     var showAddStation by remember { mutableStateOf(false) }
     var showSleepTimer by remember { mutableStateOf(false) }
+    var sleepClockMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
     var customName by remember { mutableStateOf("") }
     var customUrl by remember { mutableStateOf("") }
+    LaunchedEffect(state.sleepTimerEndsAtMs) {
+        while (state.sleepTimerEndsAtMs != null) {
+            sleepClockMs = SystemClock.elapsedRealtime()
+            delay(30_000L)
+        }
+    }
+    val sleepMinutesRemaining = state.sleepTimerEndsAtMs?.let { deadline ->
+        ((deadline - sleepClockMs).coerceAtLeast(0L) + 59_999L) / 60_000L
+    }
 
     val visibleStations = when (listTab) {
         "Favorites" -> state.radioFavorites
@@ -268,7 +280,14 @@ fun RadioScreen(vm: MainViewModel) {
             }
             TextButton(onClick = { showSleepTimer = true }, modifier = Modifier.weight(1f)) {
                 Icon(Icons.Default.Timer, contentDescription = null, tint = accent)
-                Text(state.radioSleepTimerMinutes?.let { "${it}m left" } ?: "Sleep", color = Color.White)
+                Text(
+                    when {
+                        state.sleepTimerTrackId != null -> "After track"
+                        sleepMinutesRemaining != null -> "${sleepMinutesRemaining}m left"
+                        else -> "Sleep"
+                    },
+                    color = Color.White
+                )
             }
         }
         Spacer(Modifier.height(12.dp))

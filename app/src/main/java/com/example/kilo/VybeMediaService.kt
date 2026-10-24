@@ -12,6 +12,7 @@ import com.example.kilo.androidauto.R as AndroidAutoR
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -19,12 +20,6 @@ import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.LinearGradient
-import android.graphics.Paint
-import android.graphics.RectF
-import android.graphics.Shader
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -69,7 +64,6 @@ import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
 import org.json.JSONArray
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
@@ -398,6 +392,9 @@ object SessionStore {
 object HomeCache {
     @Volatile
     var shelves: List<HomeShelf> = emptyList()
+    /** Keep personalized unplayed shelves separate from remote catalog refreshes. */
+    @Volatile
+    var discoveryShelves: List<HomeShelf> = emptyList()
     @Volatile
     private var time = 0L
     @Volatile
@@ -405,6 +402,13 @@ object HomeCache {
 
     fun set(list: List<HomeShelf>) {
         shelves = list
+        val personalizedShelves = list.filter { shelf ->
+            shelf.title.equals("Discovered, not played", ignoreCase = true) ||
+                shelf.title.equals("Fresh discoveries", ignoreCase = true) ||
+                shelf.title.equals("Similar to your favorites", ignoreCase = true) ||
+                shelf.title.startsWith("For your ", ignoreCase = true)
+        }
+        if (personalizedShelves.isNotEmpty() || list.isEmpty()) discoveryShelves = personalizedShelves
         time = System.currentTimeMillis()
     }
 
@@ -453,8 +457,8 @@ object PlayerHolder {
     fun get(context: Context): ExoPlayer {
         player?.let { return it }
         val app = context.applicationContext
-        handleCallAudioFocus = app.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
-            .getBoolean("pause_for_calls", true)
+        val playbackPreferences = app.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
+        handleCallAudioFocus = playbackPreferences.getBoolean("pause_for_calls", true)
         Favorites.init(app)
         SessionStore.init(app)
         PlayedSongHistory.init(app)
@@ -516,6 +520,8 @@ object PlayerHolder {
             .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
+        p.setPlaybackSpeed(playbackPreferences.getFloat("playback_speed", 1f).coerceIn(0.5f, 2f))
+        p.setSkipSilenceEnabled(playbackPreferences.getBoolean("skip_silence_enabled", false))
         p.repeatMode = Player.REPEAT_MODE_ALL
 
         val positionHandler = Handler(Looper.getMainLooper())
@@ -553,12 +559,8 @@ object PlayerHolder {
 
         p.addListener(object : Player.Listener {
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-                // Audio focus can temporarily clear playWhenReady while the
-                // listener is still expecting playback to resume. Preserve that
-                // intent so a stream retry does not leave the track paused.
-                if (reason != Player.PLAY_WHEN_READY_CHANGE_REASON_AUDIO_FOCUS_LOSS) {
-                    lastPlayIntent = playWhenReady
-                }
+                // Keep playback intent in sync with the v2.5.0 player behavior.
+                lastPlayIntent = playWhenReady
                 Log.i(
                     "KiloPlayback",
                     "playWhenReadyChanged id=${p.currentMediaItem?.mediaId.orEmpty()} " +
@@ -954,35 +956,14 @@ class VybeMediaService : MediaLibraryService() {
         }
         override fun onPlaybackStateChanged(playbackState: Int) {
             postPlaybackNotification()
-            session?.player?.let(::updatePlaybackWifiLock)
+            val isPlaying = session?.player?.isPlaying == true
+            if (isPlaying && wifiLock?.isHeld == false) wifiLock?.acquire()
+            else if (!isPlaying && wifiLock?.isHeld == true) wifiLock?.release()
         }
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             postPlaybackNotification()
-            session?.player?.let(::updatePlaybackWifiLock)
-        }
-        override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-            session?.player?.let(::updatePlaybackWifiLock)
-        }
-    }
-
-    /** Keep Wi-Fi awake while a requested network stream is buffering between packets. */
-    private fun updatePlaybackWifiLock(player: Player) {
-        val lock = wifiLock ?: return
-        val shouldHold = player.playWhenReady &&
-            player.mediaItemCount > 0 &&
-            player.playbackState != Player.STATE_IDLE &&
-            player.playbackState != Player.STATE_ENDED &&
-            player.playbackSuppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE
-        runCatching {
-            if (shouldHold && !lock.isHeld) {
-                lock.acquire()
-                Log.d(TAG, "Playback Wi-Fi lock acquired state=${player.playbackState}")
-            } else if (!shouldHold && lock.isHeld) {
-                lock.release()
-                Log.d(TAG, "Playback Wi-Fi lock released state=${player.playbackState} playWhenReady=${player.playWhenReady}")
-            }
-        }.onFailure { error ->
-            Log.w(TAG, "Could not update playback Wi-Fi lock", error)
+            if (isPlaying && wifiLock?.isHeld == false) wifiLock?.acquire()
+            else if (!isPlaying && wifiLock?.isHeld == true) wifiLock?.release()
         }
     }
 
@@ -1036,10 +1017,8 @@ class VybeMediaService : MediaLibraryService() {
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
         @Suppress("DEPRECATION")
         wifiLock = wifiManager.createWifiLock(android.net.wifi.WifiManager.WIFI_MODE_FULL_HIGH_PERF, "KiloPlaybackWifiLock")
-            .apply { setReferenceCounted(false) }
         
         player.addListener(layoutListener)
-        updatePlaybackWifiLock(player)
         Favorites.addListener(favListener)
         getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
             .registerOnSharedPreferenceChangeListener(carBrowsePreferenceListener)
@@ -1397,11 +1376,19 @@ class VybeMediaService : MediaLibraryService() {
         }
         val title = item.mediaMetadata.title?.toString()?.trim()?.takeIf { it.isNotEmpty() }
             ?: if (playable) "Untitled track" else "Untitled section"
-        val artworkUri = item.mediaMetadata.artworkUri?.takeIf {
-            it.scheme?.lowercase() in setOf("http", "https", "content", "android.resource")
+        // Android Auto/AAOS browse artwork must be a locally resolvable URI. Remote URLs
+        // and inline bitmaps are not reliable for browse rows (and can bloat Binder replies).
+        // Always give browsable folders a local resource icon, including stale Room rows
+        // written by older versions that did not persist artwork bytes.
+        val sourceArtworkUri = item.mediaMetadata.artworkUri?.takeIf {
+            it.scheme?.lowercase() in setOf("content", "android.resource")
         }
-        val artworkData = item.mediaMetadata.artworkData
-        val artworkDataType = item.mediaMetadata.artworkDataType
+        val artworkUri = if (browsable) sourceArtworkUri ?: browseCategoryArtworkUri(id, title)
+            else item.mediaMetadata.artworkUri?.takeIf {
+                it.scheme?.lowercase() in setOf("http", "https", "content", "android.resource")
+            }
+        val artworkData = item.mediaMetadata.artworkData.takeUnless { browsable }
+        val artworkDataType = item.mediaMetadata.artworkDataType.takeUnless { browsable }
         val extras = Bundle(item.mediaMetadata.extras ?: Bundle())
         val metadata = MediaMetadata.Builder()
             .setTitle(title)
@@ -1470,7 +1457,8 @@ class VybeMediaService : MediaLibraryService() {
                 carTile(TAB_PLAYLISTS, "Playlists", "Your playlists", AndroidAutoR.drawable.ic_auto_playlists),
                 carTile(TAB_OFFLINE, "Downloads", "Downloaded music", AndroidAutoR.drawable.ic_auto_downloads)
             )
-            TAB_RECENT, TAB_CONTINUE, TAB_LISTEN_AGAIN, TAB_PICKS, TAB_TRENDING, TAB_HEARD_SHORTS, TAB_SONGS ->
+            TAB_PICKS -> quickPicksItems()
+            TAB_RECENT, TAB_CONTINUE, TAB_LISTEN_AGAIN, TAB_TRENDING, TAB_HEARD_SHORTS, TAB_SONGS ->
                 fallbackSongs.ifEmpty { listOf(folderItem(TAB_BROWSE, "No listening history yet", "Browse moods and Quick Picks")) }
             TAB_LIKED -> Favorites.songs().map { it.toMediaItem() }.ifEmpty {
                 listOf(folderItem(TAB_PICKS, "No liked songs yet", "Explore Quick Picks and save favorites"))
@@ -1490,7 +1478,7 @@ class VybeMediaService : MediaLibraryService() {
                     TAB_BROWSE,
                     "No downloads yet",
                     "Browse music and save tracks for offline listening",
-                    artworkData = autoArtworkData(AndroidAutoR.drawable.ic_auto_downloads)
+                    art = autoArtworkUri(AndroidAutoR.drawable.ic_auto_downloads).toString()
                 ))
             }
             else -> when {
@@ -1524,7 +1512,7 @@ class VybeMediaService : MediaLibraryService() {
 
     private fun isVolatileBrowseParent(parentId: String): Boolean =
         parentId in setOf(
-            ROOT, TAB_HOME, TAB_SEARCH, TAB_RECENT, TAB_CONTINUE, TAB_LIKED, TAB_PLAYLISTS, TAB_OFFLINE,
+            ROOT, TAB_HOME, TAB_SEARCH, TAB_RECENT, TAB_CONTINUE, TAB_PICKS, TAB_LIKED, TAB_PLAYLISTS, TAB_OFFLINE,
             TAB_RADIO_FAVORITES, TAB_RADIO_RECENT, TAB_RADIO_CUSTOM,
             TAB_GENRES, TAB_MOODS, TAB_ARTISTS, TAB_ALBUMS, TAB_SONGS
         ) || parentId.startsWith("home:") || parentId.startsWith("savedpl:") || parentId.startsWith("genre:") ||
@@ -1560,7 +1548,7 @@ class VybeMediaService : MediaLibraryService() {
             id = target,
             title = "Nothing here yet",
             subtitle = if (target == TAB_MOODS) "Choose a mood and start listening" else "Browse moods and Quick Picks",
-            artworkData = autoArtworkData(artwork)
+            art = autoArtworkUri(artwork).toString()
         )
     }
 
@@ -1801,68 +1789,39 @@ class VybeMediaService : MediaLibraryService() {
         else -> "🎧"
     }
 
-    private val autoArtworkDataCache = ConcurrentHashMap<Int, ByteArray>()
+    private fun autoArtworkUri(resourceId: Int): Uri = Uri.Builder()
+        .scheme(ContentResolver.SCHEME_ANDROID_RESOURCE)
+        .authority(resources.getResourcePackageName(resourceId))
+        .appendPath(resources.getResourceTypeName(resourceId))
+        .appendPath(resources.getResourceEntryName(resourceId))
+        .build()
 
-    private fun autoArtworkData(resourceId: Int): ByteArray? = autoArtworkDataCache[resourceId]
-        ?: runCatching {
-            val drawable = ContextCompat.getDrawable(this, resourceId)
-                ?: error("Drawable resource unavailable")
-            val bitmap = Bitmap.createBitmap(144, 144, Bitmap.Config.ARGB_8888)
-            try {
-                val canvas = Canvas(bitmap)
-                val bounds = RectF(0f, 0f, bitmap.width.toFloat(), bitmap.height.toFloat())
-                val (startColor, endColor) = autoArtworkGradient(resourceId)
-                val background = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    shader = LinearGradient(
-                        0f, 0f, bitmap.width.toFloat(), bitmap.height.toFloat(),
-                        startColor, endColor, Shader.TileMode.CLAMP
-                    )
-                }
-                canvas.drawRoundRect(bounds, 30f, 30f, background)
-                val border = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    color = Color.argb(62, 255, 255, 255)
-                    style = Paint.Style.STROKE
-                    strokeWidth = 2f
-                }
-                canvas.drawRoundRect(RectF(1f, 1f, 143f, 143f), 29f, 29f, border)
-                val inset = 18
-                drawable.setBounds(inset, inset, bitmap.width - inset, bitmap.height - inset)
-                drawable.draw(canvas)
-                ByteArrayOutputStream().use { output ->
-                    check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)) {
-                        "PNG encoding failed"
-                    }
-                    output.toByteArray()
-                }
-            } finally {
-                bitmap.recycle()
-            }
-        }.onFailure { error ->
-            Log.w(TAG, "Unable to render Android Auto artwork resource=$resourceId", error)
-        }.getOrNull()?.also { autoArtworkDataCache[resourceId] = it }
-
-    private fun autoArtworkGradient(resourceId: Int): Pair<Int, Int> = when (resourceId) {
-        AndroidAutoR.drawable.ic_auto_continue -> Color.parseColor("#12B99D") to Color.parseColor("#155B75")
-        AndroidAutoR.drawable.ic_auto_downloads -> Color.parseColor("#0EAA8F") to Color.parseColor("#07545D")
-        AndroidAutoR.drawable.ic_auto_library -> Color.parseColor("#547BC2") to Color.parseColor("#26375E")
-        AndroidAutoR.drawable.ic_auto_liked -> Color.parseColor("#D94D86") to Color.parseColor("#642C5C")
-        AndroidAutoR.drawable.ic_auto_mood -> Color.parseColor("#A144E6") to Color.parseColor("#39217C")
-        AndroidAutoR.drawable.ic_auto_playlists -> Color.parseColor("#A04CC8") to Color.parseColor("#452A82")
-        AndroidAutoR.drawable.ic_auto_radio -> Color.parseColor("#36A8D9") to Color.parseColor("#214A9C")
-        AndroidAutoR.drawable.ic_auto_recent -> Color.parseColor("#7785C3") to Color.parseColor("#34466F")
-        AndroidAutoR.drawable.ic_auto_search -> Color.parseColor("#3D8FE4") to Color.parseColor("#24529A")
-        else -> Color.parseColor("#6C65C9") to Color.parseColor("#263C69")
+    private fun browseCategoryArtworkUri(mediaId: String, title: String): Uri {
+        val id = mediaId.lowercase(Locale.ROOT)
+        val label = title.lowercase(Locale.ROOT)
+        val resourceId = when {
+            id == TAB_CONTINUE || label.contains("continue listening") -> AndroidAutoR.drawable.ic_auto_continue
+            id == TAB_PLAYLISTS || id.startsWith("savedpl:") || id.startsWith("pl:") || label.contains("playlist") -> AndroidAutoR.drawable.ic_auto_playlists
+            id == TAB_OFFLINE || label.contains("download") -> AndroidAutoR.drawable.ic_auto_downloads
+            id == TAB_LIKED || label.contains("liked") || label.contains("favorite") -> AndroidAutoR.drawable.ic_auto_liked
+            id == TAB_RADIO || id.startsWith("home:radio") || label.contains("radio") -> AndroidAutoR.drawable.ic_auto_radio
+            id == TAB_SEARCH || label == "search" -> AndroidAutoR.drawable.ic_auto_search
+            id == TAB_RECENT || id == "mood:recent" || label.contains("recent") -> AndroidAutoR.drawable.ic_auto_recent
+            id == TAB_MOODS || id.startsWith("mood:") || label.contains("mood") -> AndroidAutoR.drawable.ic_auto_mood
+            else -> AndroidAutoR.drawable.ic_auto_library
+        }
+        return autoArtworkUri(resourceId)
     }
 
     private fun carTile(id: String, title: String, subtitle: String, artwork: Int): MediaItem =
-        folderItem(id, title, subtitle, artworkData = autoArtworkData(artwork))
+        folderItem(id, title, subtitle, art = autoArtworkUri(artwork).toString())
 
     private fun moodCard(mood: String, title: String = "${moodEmoji(mood)} $mood", subtitle: String = "Music for $mood"): MediaItem =
         folderItem(
             id = "mood:${Uri.encode(mood)}",
             title = title,
             subtitle = subtitle,
-            artworkData = AndroidAutoUiModule.moodArtworkData(mood),
+            art = autoArtworkUri(AndroidAutoR.drawable.ic_auto_mood).toString(),
             childStyle = AUTO_STYLE_GRID
         )
 
@@ -1872,7 +1831,7 @@ class VybeMediaService : MediaLibraryService() {
             title = "Set My Mood",
             subtitle = "Auto-pick ${suggestion.mood} · ${suggestion.reason}",
             childStyle = AUTO_STYLE_GRID,
-            artworkData = AndroidAutoUiModule.moodArtworkData(suggestion.mood)
+            art = autoArtworkUri(AndroidAutoR.drawable.ic_auto_mood).toString()
         )
 
     private fun applyCarMoodSelection(mood: String, reason: String = "Selected in Android Auto") {
@@ -1950,6 +1909,30 @@ class VybeMediaService : MediaLibraryService() {
             .distinctBy { it.mediaId }
     }
 
+    private fun quickPicksItems(): List<MediaItem> {
+        val discoveryCategories = HomeCache.discoveryShelves
+            .filter { it.songs.isNotEmpty() }
+            .distinctBy { it.title.lowercase(Locale.ROOT) }
+            .map { shelf ->
+                val count = shelf.songs.size
+                val subtitle = if (shelf.title.equals("Discovered, not played", ignoreCase = true)) {
+                    "$count songs you haven't played yet"
+                } else {
+                    "$count fresh picks shaped by your listening"
+                }
+                folderItem(
+                    id = "home:picks:${Uri.encode(shelf.title)}",
+                    title = shelf.title,
+                    subtitle = subtitle,
+                    art = autoArtworkUri(AndroidAutoR.drawable.ic_auto_radio).toString()
+                )
+            }
+        val shelves = carHomeShelves()
+        val quickSongs = shelves.firstOrNull { it.title.contains("quick pick", ignoreCase = true) }?.songs
+            ?: shelves.firstOrNull()?.songs.orEmpty()
+        return discoveryCategories + songItems(quickSongs)
+    }
+
     private fun localLibrarySongs(): List<SongItemClean> = runCatching {
         (Favorites.songs() + SessionStore.recentSongs() + downloadedMediaItems().mapIndexed { index, item -> item.toSong(index) } + cachedHomeSongs())
             .filter { it.videoId.isNotBlank() || it.id.isNotBlank() }
@@ -2005,6 +1988,10 @@ class VybeMediaService : MediaLibraryService() {
                 RadioStationStore.load(this, "radio_recent_stations") +
                 RadioStationStore.load(this, "radio_custom_stations")).distinctBy { it.id }
             radioMediaItems(stations).ifEmpty { radioBrowseQuickLinks() }
+        }
+        parentId.startsWith("home:picks:") -> {
+            val title = Uri.decode(parentId.removePrefix("home:picks:"))
+            songItems(HomeCache.discoveryShelves.firstOrNull { it.title.equals(title, ignoreCase = true) }?.songs.orEmpty())
         }
         parentId == TAB_GENRES -> {
             val profile = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE))
@@ -2076,7 +2063,7 @@ class VybeMediaService : MediaLibraryService() {
                 TAB_BROWSE,
                 "No downloads yet",
                 "Browse music and save tracks for offline listening",
-                artworkData = autoArtworkData(AndroidAutoR.drawable.ic_auto_downloads)
+                art = autoArtworkUri(AndroidAutoR.drawable.ic_auto_downloads).toString()
             ))
         }
         parentId == TAB_HOME -> carHomeItems()
@@ -2098,9 +2085,7 @@ class VybeMediaService : MediaLibraryService() {
             }
             songItems(YtRepo.searchSongs(query))
         }
-        parentId == TAB_PICKS -> songItems(
-            matchingHomeShelf("quick pick")?.songs ?: carHomeShelves().firstOrNull()?.songs.orEmpty()
-        )
+        parentId == TAB_PICKS -> quickPicksItems()
         parentId == TAB_BROWSE -> browseCategories()
         parentId == TAB_LISTEN_AGAIN -> songItems(
             matchingHomeShelf("listen again")?.songs?.takeIf { it.isNotEmpty() } ?: SessionStore.recentSongs()
@@ -2117,7 +2102,7 @@ class VybeMediaService : MediaLibraryService() {
             folderItem("shelf:$i", shelf.title, art = shelf.songs.firstOrNull()?.coverUrl)
         }
         parentId == TAB_LIKED -> register(Favorites.songs().map { it.toMediaItem() }).ifEmpty {
-            listOf(folderItem(TAB_PICKS, "No liked songs yet", "Explore Quick Picks and save favorites", artworkData = autoArtworkData(AndroidAutoR.drawable.ic_auto_liked)))
+            listOf(folderItem(TAB_PICKS, "No liked songs yet", "Explore Quick Picks and save favorites", art = autoArtworkUri(AndroidAutoR.drawable.ic_auto_liked).toString()))
         }
         parentId == TAB_RECENT -> songItems(SessionStore.recentSongs().ifEmpty { cachedHomeSongs() })
         parentId == TAB_CONTINUE -> {
@@ -2140,7 +2125,7 @@ class VybeMediaService : MediaLibraryService() {
                 .map { folderItem("pl:${it.playlistId}", it.title, it.artist, it.coverUrl) }
                 .toList()
             (localFolders + remoteFolders).ifEmpty {
-                listOf(folderItem(TAB_PICKS, "No playlists yet", "Start with music picked for you", artworkData = autoArtworkData(AndroidAutoR.drawable.ic_auto_playlists)))
+                listOf(folderItem(TAB_PICKS, "No playlists yet", "Start with music picked for you", art = autoArtworkUri(AndroidAutoR.drawable.ic_auto_playlists).toString()))
             }
         }
         parentId.startsWith("savedpl:") -> songItems(

@@ -852,6 +852,11 @@ data class AppStateModel(
     val progress: Float = 0f,
     val currentPosMs: Long = 0L,
     val currentDurationMs: Long = 215000L,
+    val playbackSpeed: Float = 1f,
+    val skipSilenceEnabled: Boolean = false,
+    val sleepTimerMinutes: Int? = null,
+    val sleepTimerEndsAtMs: Long? = null,
+    val sleepTimerTrackId: String? = null,
     val favoriteIds: Set<String> = emptySet(),
     val radioFavorites: List<RadioStation> = emptyList(),
     val radioRecentStations: List<RadioStation> = emptyList(),
@@ -1221,7 +1226,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private var searchJob: Job? = null
     private var playJob: Job? = null
-    private var radioSleepJob: Job? = null
     private var radioRecordingJob: Job? = null
     private var videoJob: Job? = null
     private var mixFadeJob: Job? = null
@@ -1243,6 +1247,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val player: ExoPlayer = PlayerHolder.get(application)
 
     private val playbackListener = object : Player.Listener {
+        override fun onPlaybackParametersChanged(playbackParameters: androidx.media3.common.PlaybackParameters) {
+            val speed = playbackParameters.speed.coerceIn(0.5f, 2f)
+            if (_state.value.playbackSpeed != speed) {
+                _state.value = _state.value.copy(playbackSpeed = speed)
+            }
+        }
+
         override fun onPlaybackStateChanged(playbackState: Int) {
             val currentMediaId = player.currentMediaItem?.mediaId.orEmpty()
             val radio = currentMediaId.startsWith("radio:")
@@ -1254,13 +1265,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     "playWhenReady=${player.playWhenReady} isPlaying=${player.isPlaying}"
             )
             _state.value = _state.value.copy(
-                // Keep the indicator for an explicit initial load/recovery only. A later
-                // rebuffer during active playback should not make it appear again.
-                isLoadingStream = _state.value.isLoadingStream &&
-                    playbackState != Player.STATE_READY && playbackState != Player.STATE_ENDED,
+                isLoadingStream = playbackState == Player.STATE_BUFFERING && player.playWhenReady,
                 isPlaying = player.isPlaying
             )
             if (playbackState == Player.STATE_ENDED) {
+                if (_state.value.sleepTimerTrackId != null) PlaybackSleepTimer.cancel()
                 val ended = _state.value.activeSong
                 PlayedSongHistory.recordSignal(ended, "complete")
                 PlayedSongHistory.record(ended.id)
@@ -1302,6 +1311,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         "VybeVM",
                         "Early automatic track transition: ${previousSong.videoId} at ${lastKnownPositionMs}ms; catalog duration ${expectedMs}ms"
                     )
+                    PlaybackSleepTimer.retargetAfterTrackRetry(previousSong.videoId.ifBlank { previousSong.id }, id)
                     val previousIndex = _state.value.currentIndex
                     val resumePositionMs = _state.value.currentPosMs.coerceAtLeast(0L)
                     if (earlyEndRetries.add(previousSong.id)) {
@@ -1330,6 +1340,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return
                 }
             }
+            val stopAfterCurrentTrack = PlaybackSleepTimer.finishAfterTrackIfNeeded(id, acknowledgeStop = true)
             val current = _state.value
             val metadata = mediaItem?.mediaMetadata
             val mediaTitle = metadata?.title?.toString()?.trim().orEmpty()
@@ -1369,7 +1380,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             // An automatic transition means the user was listening through the previous track.
             // Keep playback intent across track boundaries, including when a stream briefly buffers.
-            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) player.play()
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO && !stopAfterCurrentTrack) player.play()
+            if (stopAfterCurrentTrack) {
+                player.pause()
+                PlaybackSleepTimer.cancel()
+            }
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -1425,6 +1440,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SessionStore.init(application)
         FastStream.warmUp()
         player.addListener(playbackListener)
+        PlaybackSleepTimer.attach(player)
 
         val savedCustomizations = UI_CUSTOMIZATION_OPTIONS.associate { option ->
             option.key to preferences.getBoolean("ui_${option.key}", option.enabledByDefault)
@@ -1465,12 +1481,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             autoLayoutMode = normalizeAutoLayoutMode(preferences.getString("auto_layout_mode", AUTO_LAYOUT_MODES.first())),
             autoPlayOnCarConnect = preferences.getBoolean("auto_play_car_connect", false),
             pauseForCalls = preferences.getBoolean("pause_for_calls", true),
+            playbackSpeed = preferences.getFloat("playback_speed", 1f).coerceIn(0.5f, 2f),
+            skipSilenceEnabled = preferences.getBoolean("skip_silence_enabled", false),
+            sleepTimerMinutes = PlaybackSleepTimer.state.value.minutes,
+            sleepTimerEndsAtMs = PlaybackSleepTimer.state.value.endsAtElapsedRealtimeMs,
+            sleepTimerTrackId = PlaybackSleepTimer.state.value.afterTrackMediaId,
+            radioSleepTimerMinutes = PlaybackSleepTimer.state.value.minutes.takeIf { PlaybackSleepTimer.state.value.setFromRadio },
             filterMatureContent = preferences.getBoolean("filter_mature_content", true),
             losslessSourceUrl = LosslessSource.root(application),
             losslessSourceEnabled = LosslessSource.isEnabled(application),
             losslessSourceHasToken = LosslessSource.hasToken(application),
             losslessSourceStatus = preferences.getString("lossless_source_status", "Optional: connect a compatible FLAC source") ?: "Optional: connect a compatible FLAC source"
         )
+        runCatching { player.setPlaybackSpeed(_state.value.playbackSpeed) }
+            .onFailure { Log.w("VybeVM", "Could not restore playback speed", it) }
+        runCatching { player.setSkipSilenceEnabled(_state.value.skipSilenceEnabled) }
+            .onFailure { Log.w("VybeVM", "Could not restore silence skipping", it) }
+        viewModelScope.launch {
+            PlaybackSleepTimer.state.collect { timer ->
+                _state.value = _state.value.copy(
+                    sleepTimerMinutes = timer.minutes,
+                    sleepTimerEndsAtMs = timer.endsAtElapsedRealtimeMs,
+                    sleepTimerTrackId = timer.afterTrackMediaId,
+                    radioSleepTimerMinutes = timer.minutes.takeIf { timer.setFromRadio }
+                )
+            }
+        }
         preferences.edit().putString("auto_layout_mode", _state.value.autoLayoutMode).apply()
         val savedRegion = preferences.getString("music_region_code", "AUTO") ?: "AUTO"
         YtRepo.setRegionCode(savedRegion)
@@ -1748,6 +1784,79 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     if (familiar.isNotEmpty()) add(HomeShelf("Familiar favorites", familiar, false))
                 }
             }
+            val followedArtistKeys = profile.followedArtists
+                .map(String::trim)
+                .filter(String::isNotBlank)
+                .mapTo(mutableSetOf()) { it.lowercase(Locale.ROOT) }
+            val followedArtistSongs = if (followedArtistKeys.isEmpty()) emptyList() else {
+                (similarResults + freshResults + homeSongs).asSequence()
+                    .filter(::acceptable)
+                    .filter { it.artist.trim().lowercase(Locale.ROOT) in followedArtistKeys }
+                    .distinctBy { it.id }
+                    .take(shelfLimit)
+                    .toList()
+            }
+            val recentlyPlayedSongs = SessionStore.recentSongs().asSequence()
+                .filter { it.videoId.isNotBlank() || it.isDownloaded }
+                .filter { it.id !in _state.value.notRecommendedIds }
+                .distinctBy { it.id }
+                .take(shelfLimit)
+                .toList()
+            val likedSongs = Favorites.songs().asSequence()
+                .filter { it.videoId.isNotBlank() || it.isDownloaded }
+                .filter { it.id !in _state.value.notRecommendedIds }
+                .filter { !_state.value.filterMatureContent || !it.isExplicit }
+                .distinctBy { it.id }
+                .take(shelfLimit)
+                .toList()
+            val reservedShelfTitles = (shelves.map { it.title.lowercase(Locale.ROOT) } +
+                listOf("artist orbit", "replay lane", "heartline")).toMutableSet()
+            fun memorableShelfTitle(sourceTitle: String): String {
+                val normalized = sourceTitle.trim().lowercase(Locale.ROOT)
+                val base = when {
+                    normalized.contains("quick pick") -> "Quick Sparks"
+                    normalized.contains("listen again") || normalized.contains("recent") -> "Back in Rotation"
+                    normalized.contains("new release") || normalized.contains("new music") -> "New-Wave Radar"
+                    normalized.contains("trend") || normalized.contains("popular") || normalized.contains("top hit") -> "What's Moving"
+                    normalized.contains("album") -> "Album Orbit"
+                    normalized.contains("mood") -> "Mood Routes"
+                    normalized.contains("radio") -> "KILO On Air"
+                    normalized.contains("similar") || normalized.contains("because you") || normalized.contains("for you") || normalized.contains("mix") -> "KILO Frequency"
+                    else -> "KILO • ${sourceTitle.trim().take(34)}"
+                }
+                var title = base
+                var edition = 2
+                while (!reservedShelfTitles.add(title.lowercase(Locale.ROOT))) {
+                    title = "$base · Vol. $edition"
+                    edition++
+                }
+                return title
+            }
+            val additionalHomeShelves = buildList {
+                fetched.shelves.forEach { sourceShelf ->
+                    val sourceTitle = sourceShelf.title.trim()
+                    val sourceKey = sourceTitle.lowercase(Locale.ROOT)
+                    if (sourceTitle.isBlank() || sourceKey in shelves.map { it.title.lowercase(Locale.ROOT) } ||
+                        sourceKey.contains("discovered, not played")
+                    ) return@forEach
+                    val songs = sourceShelf.songs.asSequence()
+                        .filter { song -> song.videoId.isNotBlank() || song.isDownloaded }
+                        .filter { song -> song.id !in _state.value.notRecommendedIds }
+                        .filter { song -> !_state.value.filterMatureContent || !song.isExplicit }
+                        .distinctBy { it.id }
+                        .take(shelfLimit + 6)
+                        .toList()
+                    if (songs.size >= 2) add(HomeShelf(memorableShelfTitle(sourceTitle), songs, sourceShelf.isList))
+                    if (size >= 12) return@buildList
+                }
+            }
+            val displayShelves = buildList {
+                addAll(shelves)
+                if (followedArtistSongs.size >= 2) add(HomeShelf("Artist Orbit", followedArtistSongs, false))
+                if (recentlyPlayedSongs.size >= 2) add(HomeShelf("Replay Lane", recentlyPlayedSongs, false))
+                if (likedSongs.size >= 2) add(HomeShelf("Heartline", likedSongs, false))
+                addAll(additionalHomeShelves)
+            }.distinctBy { it.title.trim().lowercase(Locale.ROOT) }
             val similarShelfSongs = shelves.firstOrNull { it.title.startsWith("For your ") || it.title == "Similar to your favorites" }?.songs.orEmpty()
             val discoveredShelfSongs = shelves.firstOrNull { it.title == "Discovered, not played" }?.songs.orEmpty()
             val freshShelfSongs = shelves.firstOrNull { it.title == "Fresh discoveries" }?.songs.orEmpty()
@@ -1758,11 +1867,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 PlayedSongHistory.markDiscovered(discoveredShelfSongs, "discovered")
                 PlayedSongHistory.markDiscovered(freshShelfSongs, "fresh")
             }
-            HomeCache.set(shelves)
+            HomeCache.set(displayShelves)
             val all = shelves.flatMap { it.songs }.filter { it.videoId.isNotEmpty() }.distinctBy { it.id }
             val picks = shelves.firstOrNull()?.songs.orEmpty()
             _state.value = _state.value.copy(
-                homeShelves = shelves,
+                homeShelves = displayShelves,
                 quickPicks = picks,
                 playlist = all,
                 currentIndex = 0,
@@ -1909,7 +2018,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun openArtist(artist: ArtistItem) {
-        screenBackStack.addLast(ScreenNav.SEARCH)
+        screenBackStack.addLast(_state.value.currentScreen)
         _state.value = _state.value.copy(
             activeArtist = artist, artistAlbums = emptyList(), artistSongs = emptyList(),
             selectedArtistAlbumTitle = null, currentScreen = ScreenNav.ARTIST_DETAIL, isSearching = true
@@ -1921,6 +2030,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 activeArtist = catalog.first, artistAlbums = catalog.second, artistSongs = catalog.third,
                 isSearching = false
             )
+        }
+    }
+
+    fun openArtistByName(name: String) {
+        val cleanName = name.trim()
+        if (cleanName.isBlank()) return
+        val sourceScreen = _state.value.currentScreen
+        viewModelScope.launch {
+            val artist = withContext(Dispatchers.IO) {
+                runCatching { YtRepo.searchArtists(cleanName).firstOrNull() }.getOrNull()
+            }
+            if (artist == null) {
+                Toast.makeText(getApplication(), "Could not load $cleanName.", Toast.LENGTH_SHORT).show()
+            } else if (_state.value.currentScreen == sourceScreen) {
+                openArtist(artist)
+            }
         }
     }
 
@@ -3321,21 +3446,44 @@ _state.value = _state.value.copy(
         _state.value = _state.value.copy(customRadioStations = updated)
     }
 
-    fun setRadioSleepTimer(minutes: Int?) {
-        radioSleepJob?.cancel()
-        val safeMinutes = minutes?.takeIf { it > 0 }
-        _state.value = _state.value.copy(radioSleepTimerMinutes = safeMinutes)
-        if (safeMinutes != null) {
-            radioSleepJob = viewModelScope.launch {
-                delay(safeMinutes * 60_000L)
-                player.pause()
-                _state.value = _state.value.copy(
-                    isPlaying = false, isLoadingStream = false,
-                    radioSleepTimerMinutes = null
-                )
-            }
+    fun setPlaybackSpeed(speed: Float) {
+        val safeSpeed = speed.coerceIn(0.5f, 2f)
+        runCatching {
+            player.setPlaybackSpeed(safeSpeed)
+            preferences.edit().putFloat("playback_speed", safeSpeed).apply()
+            _state.value = _state.value.copy(playbackSpeed = safeSpeed)
+        }.onFailure { error ->
+            Log.w("VybeVM", "Could not change playback speed", error)
+            Toast.makeText(getApplication(), "Playback speed could not be changed.", Toast.LENGTH_SHORT).show()
         }
     }
+
+    fun setSkipSilenceEnabled(enabled: Boolean) {
+        runCatching {
+            player.setSkipSilenceEnabled(enabled)
+            preferences.edit().putBoolean("skip_silence_enabled", enabled).apply()
+            _state.value = _state.value.copy(skipSilenceEnabled = enabled)
+        }.onFailure { error ->
+            Log.w("VybeVM", "Could not change silence skipping", error)
+            Toast.makeText(getApplication(), "Silence skipping could not be changed.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun setSleepTimer(minutes: Int?) = PlaybackSleepTimer.setDuration(player, minutes)
+
+    fun setSleepTimerAfterCurrentTrack() {
+        if (player.currentMediaItem?.mediaId?.startsWith("radio:") == true) {
+            Toast.makeText(getApplication(), "After this track is unavailable for live radio.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!PlaybackSleepTimer.setAfterCurrentTrack(player)) {
+            Toast.makeText(getApplication(), "Start a song before setting this timer.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun cancelSleepTimer() = PlaybackSleepTimer.cancel()
+
+    fun setRadioSleepTimer(minutes: Int?) = PlaybackSleepTimer.setDuration(player, minutes, fromRadio = true)
 
     fun toggleRadioRecording(station: RadioStation) {
         if (radioRecordingJob?.isActive == true) {
@@ -3770,7 +3918,6 @@ _state.value = _state.value.copy(
 
     override fun onCleared() {
         Favorites.removeListener(favoriteListener)
-        radioSleepJob?.cancel()
         radioRecordingJob?.cancel()
         player.removeListener(playbackListener)
         updateAudioEffectSession(false)
@@ -4258,7 +4405,21 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
     }.filter { it.songs.isNotEmpty() }
     val songs = shelves.flatMap { it.songs }.distinctBy { it.id }
     val companionSongsById = remember(state.companionSongs) { state.companionSongs.associateBy { it.id } }
-    val homeTabs = (listOf("All") + shelves.map { it.title }).distinct().take(7)
+    val followedArtistNames = state.listenerProfile.followedArtists.map(String::trim).filter(String::isNotBlank)
+    val suggestedArtistsByName = state.profileArtistSuggestions.associateBy { it.name.trim().lowercase(Locale.ROOT) }
+    val homeArtistNames = (followedArtistNames + state.profileArtistSuggestions.map { it.name } + songs.map { it.artist })
+        .map(String::trim).filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }.take(50)
+    val homeArtists = homeArtistNames.map { name ->
+        val suggested = suggestedArtistsByName[name.lowercase(Locale.ROOT)]
+        val representativeSong = songs.firstOrNull { it.artist.equals(name, ignoreCase = true) }
+        ArtistItem(
+            id = suggested?.id ?: "home:${name.lowercase(Locale.ROOT)}",
+            name = name,
+            subtitle = if (followedArtistNames.any { it.equals(name, ignoreCase = true) }) "Followed artist" else suggested?.subtitle ?: "From your music",
+            coverUrl = suggested?.coverUrl?.takeIf(String::isNotBlank) ?: representativeSong?.coverUrl.orEmpty()
+        )
+    }
+    val homeTabs = (listOf("All", "Artists") + shelves.map { it.title }).distinct()
     val activeHomeTab = state.activeHomeTab.takeIf { it in homeTabs } ?: "All"
     val featured = if (state.isPlaying) state.activeSong else songs.firstOrNull()
     val family = skin.layoutFamily
@@ -4326,6 +4487,42 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
             }
         }
 
+        item(key = "home_category_tabs") {
+            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                items(homeTabs) { label ->
+                    val selected = activeHomeTab == label
+                    val chipShape = if (family == 2) RoundedCornerShape(50) else primaryCardShape(skin)
+                    Box(
+                        Modifier.clip(chipShape).background(if (selected) accent.copy(alpha = 0.24f) else primaryPanelColor(skin))
+                            .border(1.dp, if (selected) accent.copy(alpha = 0.55f) else Color.White.copy(alpha = 0.07f), chipShape)
+                            .clickable { vm.selectHomeCategory(label) }.padding(horizontal = 15.dp, vertical = 9.dp)
+                    ) { Text(label, color = Color.White, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, maxLines = 1) }
+                }
+            }
+        }
+
+        if (activeHomeTab == "Artists") {
+            item(key = "home_artists_heading") {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp)) {
+                    Text("ARTISTS", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.3.sp)
+                    Text("Your followed artists first", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                }
+            }
+            if (homeArtists.isEmpty()) {
+                item(key = "home_artists_empty") {
+                    Text("Follow artists in Personalization to see them here.", color = Color.White.copy(alpha = 0.68f), modifier = Modifier.padding(20.dp))
+                }
+            } else {
+                items(homeArtists, key = { "home_artist_${it.name.lowercase()}" }) { artist ->
+                    ArtistSearchRow(
+                        artist = artist,
+                        following = followedArtistNames.any { it.equals(artist.name, ignoreCase = true) },
+                        onFollow = { vm.toggleFollowedArtist(artist.name) },
+                        onClick = { vm.openArtistByName(artist.name) }
+                    )
+                }
+            }
+        } else {
         if (featured != null) item(key = "primary_now_playing_hero") {
             PrimaryStyleHeroCard(
                 song = featured,
@@ -4412,20 +4609,6 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                     }
                     if (state.isChoosingMood) CircularProgressIndicator(color = accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                     else Icon(Icons.Filled.ArrowForward, contentDescription = null, tint = moodAccent)
-                }
-            }
-        }
-
-        if (shelves.isNotEmpty()) item {
-            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                items(homeTabs) { label ->
-                    val selected = activeHomeTab == label
-                    val chipShape = if (family == 2) RoundedCornerShape(50) else primaryCardShape(skin)
-                    Box(
-                        Modifier.clip(chipShape).background(if (selected) accent.copy(alpha = 0.24f) else primaryPanelColor(skin))
-                            .border(1.dp, if (selected) accent.copy(alpha = 0.55f) else Color.White.copy(alpha = 0.07f), chipShape)
-                            .clickable { vm.selectHomeCategory(label) }.padding(horizontal = 15.dp, vertical = 9.dp)
-                    ) { Text(label, color = Color.White, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, maxLines = 1) }
                 }
             }
         }
@@ -4604,6 +4787,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                 }
                 Icon(Icons.Filled.ArrowForward, contentDescription = null, tint = accent)
             }
+        }
         }
     }
 }
@@ -5544,6 +5728,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
     val custom = LocalUiCustomizations.current
     val song = state.activeSong
     val skin = state.activeSkin
+    var showPlaybackTools by remember { mutableStateOf(false) }
     val playerStyle = (PLAYER_STYLE_PRESETS.firstOrNull { it.id == state.selectedPlayerStyleId } ?: PLAYER_STYLE_PRESETS.first())
         .let { if (it.id == "style_custom") it.copy(accent = state.customPlayerAccent) else it }
     val playerAccent = playerStyle.accent
@@ -5824,7 +6009,8 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(formatMillis(state.currentPosMs), color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
-                        Text("${state.activeSong.codecInfo.substringBefore(" • ")} • 1.00×", color = playerAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        val speedText = if (state.playbackSpeed % 1f == 0f) state.playbackSpeed.toInt().toString() else state.playbackSpeed.toString().trimEnd('0').trimEnd('.')
+                        Text("${state.activeSong.codecInfo.substringBefore(" • ")} • ${speedText}×", color = playerAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
                         Text("-${formatMillis(remainingMs)}", color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
                     }
 
@@ -5879,6 +6065,9 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        IconButton(onClick = { showPlaybackTools = true }) {
+                            Icon(Icons.Filled.Tune, contentDescription = "Playback settings", tint = Color.White.copy(alpha = 0.85f))
+                        }
                         IconButton(onClick = vm::openAndroidAuto) {
                             Icon(Icons.Default.DirectionsCar, contentDescription = "Android Auto", tint = Color.White.copy(alpha = 0.85f))
                         }
@@ -5912,6 +6101,94 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                     }
                 }
             }
+        }
+    }
+    if (showPlaybackTools) {
+        PlaybackToolsSheet(state = state, vm = vm, onDismiss = { showPlaybackTools = false })
+    }
+}
+
+@Composable
+@OptIn(ExperimentalMaterial3Api::class)
+private fun PlaybackToolsSheet(state: AppStateModel, vm: MainViewModel, onDismiss: () -> Unit) {
+    val accent = state.activeSkin.highlight
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var selectedSpeed by remember(state.playbackSpeed) { mutableFloatStateOf(state.playbackSpeed) }
+    var timerNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    LaunchedEffect(state.sleepTimerEndsAtMs) {
+        while (state.sleepTimerEndsAtMs != null) {
+            timerNowMs = SystemClock.elapsedRealtime()
+            delay(1_000L)
+        }
+    }
+    val timerRemainingMs = state.sleepTimerEndsAtMs?.let { (it - timerNowMs).coerceAtLeast(0L) }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = Color(0xFF17191F),
+        contentColor = Color.White
+    ) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 22.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Text("Playback tools", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+            Text("These controls apply to the current shared player.", color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp)
+
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Playback speed", modifier = Modifier.weight(1f), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("${selectedSpeed}×", color = accent, fontSize = 16.sp, fontWeight = FontWeight.ExtraBold)
+            }
+            Slider(
+                value = selectedSpeed,
+                onValueChange = { selectedSpeed = it },
+                onValueChangeFinished = { vm.setPlaybackSpeed(selectedSpeed) },
+                valueRange = 0.5f..2f,
+                steps = 5,
+                colors = SliderDefaults.colors(thumbColor = accent, activeTrackColor = accent)
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("0.5×", color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp)
+                Text("1× is normal", color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp)
+                Text("2×", color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp)
+            }
+
+            HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Skip silence", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Skip quiet gaps in supported audio.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                }
+                Switch(checked = state.skipSilenceEnabled, onCheckedChange = vm::setSkipSilenceEnabled)
+            }
+
+            HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
+            Text("Sleep timer", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Text(
+                when {
+                    state.sleepTimerTrackId != null -> "Playback will pause after this track finishes."
+                    timerRemainingMs != null -> "Playback will pause in ${formatMillis(timerRemainingMs)}."
+                    else -> "Choose when playback should pause."
+                },
+                color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                listOf(15, 30, 45, 60).forEach { minutes ->
+                    TextButton(onClick = { vm.setSleepTimer(minutes) }) { Text("${minutes}m", color = accent) }
+                }
+            }
+            OutlinedButton(
+                onClick = { vm.setSleepTimerAfterCurrentTrack() },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !state.activeSong.id.isBlank()
+            ) { Text("After this track", color = Color.White) }
+            if (state.sleepTimerMinutes != null || state.sleepTimerTrackId != null) {
+                TextButton(onClick = vm::cancelSleepTimer, modifier = Modifier.align(Alignment.End)) {
+                    Text("Cancel timer", color = accent)
+                }
+            }
+            Spacer(Modifier.height(22.dp))
         }
     }
 }
@@ -7282,7 +7559,7 @@ fun ArtistDetailScreen(vm: MainViewModel) {
     val accent = state.activeSkin.highlight
     Column(Modifier.fillMaxSize().background(primaryBackdrop(state.activeSkin))) {
         Row(Modifier.fillMaxWidth().padding(start = 8.dp, end = 18.dp, top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = vm::handleSystemBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back to search", tint = Color.White) }
+            IconButton(onClick = vm::handleSystemBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White) }
             Column(Modifier.weight(1f)) {
                 Text("ARTIST", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.5.sp)
                 Text(artist?.name ?: "Artist", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
