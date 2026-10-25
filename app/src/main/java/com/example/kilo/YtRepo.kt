@@ -362,6 +362,41 @@ object YtRepo {
         return HomeCatalogFetch(shelves.distinctBy { it.title to it.songs.map(SongItemClean::id) }, complete)
     }
 
+    /** Loads playlists saved in the signed-in listener's YouTube Music library. */
+    fun fetchUserPlaylists(maxPages: Int = 8): List<SongItemClean> {
+        if (!userAuthCookie.contains("SAPISID") && !userAuthCookie.contains("__Secure-3PAPISID")) return emptyList()
+        val playlists = linkedMapOf<String, SongItemClean>()
+        var response = ytMusicPost("browse", JSONObject().put("browseId", "FEmusic_liked_playlists"))
+            ?: return emptyList()
+        var page = 0
+        while (page < maxPages.coerceIn(1, 20)) {
+            val twoRowItems = mutableListOf<JSONObject>()
+            collect(response, "musicTwoRowItemRenderer", twoRowItems)
+            twoRowItems.mapIndexedNotNull { index, item -> parseCommunityPlaylist(item, index) }
+                .forEach { item -> playlists.putIfAbsent(item.playlistId, item.copy(album = "YouTube Music playlist")) }
+
+            val responsiveItems = mutableListOf<JSONObject>()
+            collect(response, "musicResponsiveListItemRenderer", responsiveItems)
+            responsiveItems.mapIndexedNotNull { index, item -> parseCommunityPlaylist(item, index) }
+                .forEach { item -> playlists.putIfAbsent(item.playlistId, item.copy(album = "YouTube Music playlist")) }
+
+            val continuationNodes = mutableListOf<JSONObject>()
+            collect(response, "nextContinuationData", continuationNodes)
+            collect(response, "continuationItemRenderer", continuationNodes)
+            val token = continuationNodes.asSequence().mapNotNull { node ->
+                sequenceOf(
+                    node.optString("continuation"),
+                    node.optJSONObject("continuationEndpoint")?.optJSONObject("continuationCommand")?.optString("token")
+                ).firstOrNull { !it.isNullOrBlank() && it != "null" }
+            }.firstOrNull().orEmpty()
+            if (token.isBlank()) break
+            val encoded = URLEncoder.encode(token, "UTF-8")
+            response = ytMusicPost("browse", JSONObject(), "&ctoken=$encoded&continuation=$encoded&type=next") ?: break
+            page++
+        }
+        return playlists.values.toList()
+    }
+
     fun fetchPlaylistTracks(playlistId: String): List<SongItemClean> {
         var json: JSONObject? = ytMusicPost(
             "next",
@@ -623,14 +658,24 @@ object YtRepo {
             ?.optJSONObject("content")?.optJSONObject("musicPlayButtonRenderer")
             ?.optJSONObject("playNavigationEndpoint")
 
+        // YouTube Music often exposes playlists through browseEndpoint.browseId
+        // (for example, VLPL...). Treat those as playlists before the generic
+        // browse-id branch below, which otherwise mistakes them for albums.
+        parseCommunityPlaylist(r, idx)?.let { return it.copy(album = "YouTube Music playlist") }
+
         val watch = nav?.optJSONObject("watchEndpoint") ?: play?.optJSONObject("watchEndpoint")
         val videoId = watch?.optString("videoId").orEmpty()
         val playlistId = watch?.optString("playlistId").orEmpty()
             .ifEmpty { play?.optJSONObject("watchPlaylistEndpoint")?.optString("playlistId").orEmpty() }
             .ifEmpty { nav?.optJSONObject("watchPlaylistEndpoint")?.optString("playlistId").orEmpty() }
-        val albumBrowseId = nav?.optJSONObject("browseEndpoint")?.optString("browseId").orEmpty()
+        val browseId = nav?.optJSONObject("browseEndpoint")?.optString("browseId").orEmpty()
             .ifBlank { r.optJSONObject("navigationEndpoint")?.optJSONObject("browseEndpoint")?.optString("browseId").orEmpty() }
-        if (videoId.isEmpty() && playlistId.isEmpty() && albumBrowseId.isEmpty()) return null
+        val normalizedPlaylistId = playlistId.removePrefix("VL")
+            .ifBlank { browseId.removePrefix("VL").takeIf { it.startsWith("PL") || it.startsWith("RD") || it.startsWith("OLAK5uy_") }.orEmpty() }
+        val albumBrowseId = browseId.takeUnless {
+            it.removePrefix("VL").startsWith("PL") || it.removePrefix("VL").startsWith("RD") || it.removePrefix("VL").startsWith("OLAK5uy_")
+        }.orEmpty()
+        if (videoId.isEmpty() && normalizedPlaylistId.isEmpty() && albumBrowseId.isEmpty()) return null
 
         val subtitle = runsText(r.optJSONObject("subtitle")).joinToString("").trim()
         val thumb = bestThumb(
@@ -639,8 +684,8 @@ object YtRepo {
         )
 
         return SongItemClean(
-            id = videoId.ifEmpty { playlistId.takeIf { it.isNotBlank() }?.let { "pl_$it" } ?: "album_$albumBrowseId" },
-            videoId = videoId, playlistId = playlistId,
+            id = videoId.ifEmpty { normalizedPlaylistId.takeIf { it.isNotBlank() }?.let { "pl_$it" } ?: "album_$albumBrowseId" },
+            videoId = videoId, playlistId = normalizedPlaylistId,
             albumBrowseId = albumBrowseId,
             title = title, artist = subtitle.ifEmpty { "YouTube Music" }, album = "YouTube Music",
             coverUrl = thumb.ifEmpty { "https://i.ytimg.com/vi/$videoId/hqdefault.jpg" },

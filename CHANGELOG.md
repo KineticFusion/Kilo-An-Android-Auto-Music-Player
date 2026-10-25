@@ -1,3 +1,12 @@
+# KILO 2.7.1 Hotfix
+
+## What's fixed
+
+- Fixed the Appearance navigation so Themes no longer opens the legacy settings destination.
+- Grouped Themes and Player Styles together under Appearance, with working back navigation.
+
+---
+
 # KILO 2.5.5 Hotfix
 
 ## What's fixed

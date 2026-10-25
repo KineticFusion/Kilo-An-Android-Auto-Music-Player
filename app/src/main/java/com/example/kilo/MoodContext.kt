@@ -76,3 +76,17 @@ object MoodContext {
 /** Makes a recommendation only; choosing it remains an explicit user action. */
 fun suggestMoodForConditions(hourOfDay: Int, temperatureC: Double?): MoodSuggestion =
     SmartMoodEngine.suggestForConditions(hourOfDay, temperatureC)
+
+fun suggestMoodForConditions(
+    hourOfDay: Int,
+    temperatureC: Double?,
+    avoidMoods: Set<String>,
+    preferredMoods: Set<String>,
+    preferredGenres: Set<String>
+): MoodSuggestion = SmartMoodEngine.suggestForConditions(
+    hourOfDay = hourOfDay,
+    temperatureC = temperatureC,
+    avoidMoods = avoidMoods,
+    preferredMoods = preferredMoods,
+    preferredGenres = preferredGenres
+)

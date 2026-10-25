@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 21
-        versionName = "2.6.1"
+        versionCode = 23
+        versionName = "2.7.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

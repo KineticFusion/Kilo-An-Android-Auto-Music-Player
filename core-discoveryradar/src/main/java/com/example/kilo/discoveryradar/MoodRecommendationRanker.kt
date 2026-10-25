@@ -16,18 +16,31 @@ object MoodRecommendationRanker {
     ): List<CompanionTrack> {
         val moodTerms = moodTerms(mood)
         val artistWeights = mutableMapOf<String, Double>()
+        val trackAvoidance = mutableMapOf<String, Double>()
+        val nowMs = System.currentTimeMillis()
         events.forEach { event ->
-            if (event.artist.isBlank()) return@forEach
+            val ageDays = ((nowMs - event.atMs).coerceAtLeast(0L) / 86_400_000.0)
+            // Recent listening should shape recommendations more than old history,
+            // so the profile can follow changes in taste instead of going stale.
+            val recency = (1.0 - ageDays / 120.0).coerceIn(0.15, 1.0)
             val weight = when (event.action) {
                 "like" -> 9.0
                 "complete" -> 5.0
-                "listen" -> 2.0
+                "listen" -> 1.5 + (event.listenedMs / 60_000.0).coerceIn(0.0, 2.5)
                 "replay" -> 4.0
-                "skip", "unlike" -> -4.0
+                "skip" -> -6.0
+                "unlike" -> -8.0
                 else -> 0.0
+            } * recency
+            if (event.artist.isNotBlank()) {
+                val key = event.artist.normalized()
+                artistWeights[key] = (artistWeights[key] ?: 0.0) + weight
             }
-            val key = event.artist.normalized()
-            artistWeights[key] = (artistWeights[key] ?: 0.0) + weight
+            if (event.trackId.isNotBlank() && event.action in setOf("skip", "unlike")) {
+                val trackRecency = (1.0 - ageDays / 45.0).coerceIn(0.0, 1.0)
+                val personalPenalty = if (event.action == "skip") -14.0 else -20.0
+                trackAvoidance[event.trackId] = (trackAvoidance[event.trackId] ?: 0.0) + personalPenalty * trackRecency
+            }
         }
         val followed = profile.followedArtists.map { it.normalized() }.toSet()
         val favoriteGenres = profile.favoriteGenres.map { it.normalized() }.toSet()
@@ -39,14 +52,19 @@ object MoodRecommendationRanker {
             val explicitMoodMatch = moods.any { it in moodTerms } || moods.any { candidate -> moodTerms.any { term -> candidate.contains(term) } }
             val textMoodMatch = moodTerms.any { term -> titleAndArtist.contains(term) || genres.any { it.contains(term) } }
             val favoriteMoodMatch = moods.any { candidate -> profile.favoriteMoods.any { it.equals(candidate, true) } }
-            val artistAffinity = (if (artist in followed) 18.0 else 0.0) +
-                (artistWeights[artist] ?: 0.0).coerceIn(-12.0, 18.0) +
+            val followedMatch = followed.any { artistMatches(artist, it) }
+            val learnedArtistWeight = artistWeights.entries
+                .filter { (knownArtist, _) -> artistMatches(artist, knownArtist) }
+                .maxOfOrNull { it.value } ?: 0.0
+            val artistAffinity = (if (followedMatch) 18.0 else 0.0) +
+                learnedArtistWeight.coerceIn(-15.0, 20.0) +
                 (if (track.id in profile.likedTrackIds || track.isLiked) 12.0 else 0.0)
             val genreAffinity = genres.count { it in favoriteGenres } * 7.0
             val genreTextAffinity = favoriteGenres.count { it.length > 2 && titleAndArtist.contains(it) } * 3.0
             val languageAffinity = if (profile.favoriteLanguages.any { it.equals(track.language, true) && track.language.isNotBlank() }) 5.0 else 0.0
             val moodAffinity = (if (explicitMoodMatch) 12.0 else 0.0) + (if (textMoodMatch) 4.0 else 0.0) +
                 (if (favoriteMoodMatch) 6.0 else 0.0)
+            val trackAffinity = (trackAvoidance[track.id] ?: 0.0).coerceIn(-24.0, 0.0)
             val freshAffinity = if (track.playCount == 0 && !track.isLiked) 2.0 else 0.0
             val discoveryAffinity = when (profile.discoveryLevel.lowercase(Locale.ROOT)) {
                 "conservative" -> if (track.playCount > 0 || track.isLiked) 4.0 else -2.0
@@ -54,7 +72,7 @@ object MoodRecommendationRanker {
                 "adventurer" -> if (track.playCount == 0) 7.0 else 0.0
                 else -> freshAffinity
             }
-            val score = artistAffinity + genreAffinity + genreTextAffinity + languageAffinity + moodAffinity + discoveryAffinity +
+            val score = artistAffinity + genreAffinity + genreTextAffinity + languageAffinity + moodAffinity + trackAffinity + discoveryAffinity +
                 track.trendDelta.coerceIn(-10f, 10f) * 0.35 + track.popularity.coerceIn(0, 100) * 0.03 - index * 0.0001
             track to score
         }
@@ -93,4 +111,12 @@ object MoodRecommendationRanker {
     }
 
     private fun String.normalized() = lowercase(Locale.ROOT).trim()
+
+    /** Handles YouTube artist strings such as "Artist A, Artist B" and "Artist A feat. B". */
+    private fun artistMatches(candidate: String, preferred: String): Boolean =
+        candidate.isNotBlank() && preferred.isNotBlank() && (
+            candidate == preferred ||
+                (minOf(candidate.length, preferred.length) >= 3 &&
+                    (candidate.contains(preferred) || preferred.contains(candidate)))
+            )
 }

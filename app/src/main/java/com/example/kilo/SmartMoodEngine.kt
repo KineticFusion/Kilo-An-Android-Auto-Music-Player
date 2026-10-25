@@ -69,6 +69,7 @@ object SmartMoodEngine {
         }.map { it.value }
     }
 
+    /** Keeps the established suggestion behavior for existing callers, including Android Auto. */
     fun suggestForConditions(hourOfDay: Int, temperatureC: Double?): MoodSuggestion {
         val hour = hourOfDay.coerceIn(0, 23)
         val mood = when {
@@ -83,5 +84,61 @@ object SmartMoodEngine {
         val time = when (hour) { in 5..10 -> "morning"; in 11..16 -> "daytime"; in 17..20 -> "evening"; else -> "late night" }
         val weather = temperatureC?.let { "${it.toInt()}°C" } ?: "weather unavailable"
         return MoodSuggestion(mood, "$time · $weather · ${profile(mood)?.themePreset ?: "KILO mix"}")
+    }
+
+    /** Personalized reroll used only by the phone's explicit "Choose a mood for me" action. */
+    fun suggestForConditions(
+        hourOfDay: Int,
+        temperatureC: Double?,
+        avoidMoods: Set<String>,
+        preferredMoods: Set<String>,
+        preferredGenres: Set<String>
+    ): MoodSuggestion {
+        val hour = hourOfDay.coerceIn(0, 23)
+        val timeWeights = when (hour) {
+            in 5..10 -> mapOf("Commute" to 10, "Coffee Vibes" to 8, "Happy" to 5, "Road Trip" to 4, "Focus" to 3)
+            in 11..16 -> mapOf("Focus" to 10, "Coding" to 8, "Coffee Vibes" to 6, "Relax" to 4, "Commute" to 2)
+            in 17..20 -> mapOf("Happy" to 9, "Road Trip" to 7, "Relax" to 6, "Workout" to 4, "Romantic" to 4)
+            in 21..23 -> mapOf("Night Drive" to 10, "Sleep" to 6, "Gaming" to 5, "Romantic" to 4, "Relax" to 4)
+            else -> mapOf("Sleep" to 10, "Night Drive" to 8, "Relax" to 6, "Coding" to 3)
+        }
+        val favorites = preferredMoods.mapTo(mutableSetOf()) { it.lowercase(Locale.ROOT).trim() }
+        val genreFavorites = preferredGenres.mapTo(mutableSetOf()) { it.lowercase(Locale.ROOT).trim() }
+        val excluded = avoidMoods.mapTo(mutableSetOf()) { it.lowercase(Locale.ROOT).trim() }
+        val ranked = profiles.values.asSequence()
+            .filterNot { it.name.lowercase(Locale.ROOT) in excluded }
+            .map { profile ->
+                var score = (timeWeights[profile.name] ?: 0).toDouble()
+                when {
+                    temperatureC != null && temperatureC >= 32.0 -> score += when (profile.name) {
+                        "High Energy" -> 5.0
+                        "Workout" -> 4.0
+                        "Party" -> 2.0
+                        else -> 0.0
+                    }
+                    temperatureC != null && temperatureC <= 10.0 -> score += when (profile.name) {
+                        "Relax" -> 4.0
+                        "Coffee Vibes" -> 3.0
+                        "Sleep" -> 2.0
+                        else -> 0.0
+                    }
+                }
+                if (profile.name.lowercase(Locale.ROOT) in favorites) score += 9.0
+                score += profile.genres.count { it.lowercase(Locale.ROOT) in genreFavorites } * 2.0
+                profile to score
+            }
+            .toList()
+        val available = ranked.ifEmpty {
+            profiles.values.map { it to 0.0 }
+        }
+        val highestScore = available.maxOf { it.second }
+        // A small choice pool keeps the suggestion relevant to the moment while
+        // making repeated taps feel like a real reroll rather than a fixed rule.
+        val choicePool = available.filter { it.second >= highestScore - 5.0 }
+        val mood = choicePool.random().first.name
+        val time = when (hour) { in 5..10 -> "morning"; in 11..16 -> "daytime"; in 17..20 -> "evening"; else -> "late night" }
+        val weather = temperatureC?.let { "${it.toInt()}°C" } ?: "weather unavailable"
+        val personalCue = if (mood.lowercase(Locale.ROOT) in favorites) " · one of your favorites" else ""
+        return MoodSuggestion(mood, "$time · $weather$personalCue · ${profile(mood)?.themePreset ?: "KILO mix"}")
     }
 }
