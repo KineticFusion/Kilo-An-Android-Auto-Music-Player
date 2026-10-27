@@ -4,10 +4,14 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -72,6 +76,8 @@ object LyricsRepository {
         cache[key]?.filter { it.timeMs >= 0L }?.takeIf { it.isNotEmpty() }?.let { return it }
         return lookup(song, key).await()
     }
+
+    fun cached(song: SongItemClean): List<LyricLine> = cache[cacheKey(song)].orEmpty()
 
     /** Starts a background lookup as soon as playback begins, so opening Lyrics is not the fetch trigger. */
     fun prefetch(song: SongItemClean) {
@@ -432,5 +438,43 @@ fun SyncedLyricsOverlay(song: SongItemClean, positionMs: Long, onSeek: (Long) ->
                 Text(line.text, Modifier.fillMaxWidth().then(if (line.timeMs >= 0L) Modifier.clickable { onSeek(line.timeMs) } else Modifier).padding(horizontal = 18.dp), color = if (index == current) accent else Color.White.copy(alpha = .58f), fontSize = if (index == current) 22.sp else 17.sp, fontWeight = if (index == current) FontWeight.Bold else FontWeight.Medium, textAlign = TextAlign.Center)
             }
         }
+    }
+}
+
+@Composable
+fun CurrentSyncedLyricLine(
+    song: SongItemClean,
+    positionMs: Long,
+    accent: Color,
+    onOpenLyrics: () -> Unit
+) {
+    var lines by remember(song.id) { mutableStateOf(LyricsRepository.cached(song)) }
+    LaunchedEffect(song.id) { lines = LyricsRepository.find(song) }
+    val currentLine = lines.asSequence()
+        .filter { it.timeMs >= 0L && it.timeMs <= positionMs && it.text.isNotBlank() }
+        .maxByOrNull { it.timeMs }
+        ?: return
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(Color.White.copy(alpha = 0.08f))
+            .clickable(onClick = onOpenLyrics)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text("♫", color = accent, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+        Text(
+            currentLine.text,
+            modifier = Modifier.weight(1f),
+            color = Color.White,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text("›", color = Color.White.copy(alpha = 0.76f), fontSize = 22.sp)
     }
 }

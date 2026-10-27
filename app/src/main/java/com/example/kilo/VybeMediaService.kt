@@ -9,6 +9,10 @@ import com.example.kilo.search.SearchEnhancer
 import com.example.kilo.search.SearchAnalytics
 import com.example.kilo.androidauto.AndroidAutoHomeLayouts
 import com.example.kilo.androidauto.AndroidAutoUiModule
+import com.example.kilo.androidauto.AndroidAutoWarmupManager
+import com.example.kilo.androidauto.ArtworkCacheManager
+import com.example.kilo.androidauto.BrowsePreloadEngine
+import com.example.kilo.androidauto.ConnectionReliabilityManager
 import com.example.kilo.androidauto.R as AndroidAutoR
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -36,6 +40,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
@@ -63,6 +68,9 @@ import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.SettableFuture
+import com.example.kilo.audioanalysis.AudioAnalysisDatabaseProvider
+import com.example.kilo.audioanalysis.AudioAnalysisService
+import com.example.kilo.audioanalysis.TrackAnalysisEntity
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -120,6 +128,37 @@ const val ACTION_CLOSE_APP = "com.example.kilo.ACTION_CLOSE_APP"
 private const val NOTIF_CHANNEL_ID = "vybe_playback_channel"
 private const val NOTIF_ID = 4041
 private const val MAX_ANDROID_AUTO_CHILD_PAGE_SIZE = 50
+
+/** Exposes the active timed lyric as session subtitle metadata without replacing the player or queue. */
+private class AndroidAutoLyricsSessionPlayer(delegate: Player) : ForwardingPlayer(delegate) {
+    private val sessionListeners = CopyOnWriteArrayList<Player.Listener>()
+    @Volatile private var currentLyric: String? = null
+
+    override fun addListener(listener: Player.Listener) {
+        sessionListeners.addIfAbsent(listener)
+        super.addListener(listener)
+    }
+
+    override fun removeListener(listener: Player.Listener) {
+        sessionListeners.remove(listener)
+        super.removeListener(listener)
+    }
+
+    override fun getMediaMetadata(): MediaMetadata {
+        val line = currentLyric ?: return super.getMediaMetadata()
+        return super.getMediaMetadata().buildUpon().setSubtitle(line).build()
+    }
+
+    fun setCurrentLyric(line: String?) {
+        val normalized = line?.trim()?.takeIf(String::isNotBlank)
+        if (currentLyric == normalized) return
+        currentLyric = normalized
+        val metadata = mediaMetadata
+        sessionListeners.forEach { listener ->
+            listener.onMediaMetadataChanged(metadata)
+        }
+    }
+}
 
 @androidx.media3.common.util.UnstableApi
 fun SongItemClean.toMediaItem(): MediaItem {
@@ -404,10 +443,10 @@ object HomeCache {
     fun set(list: List<HomeShelf>) {
         shelves = list
         val personalizedShelves = list.filter { shelf ->
-            shelf.title.equals("Discovered, not played", ignoreCase = true) ||
-                shelf.title.equals("Fresh discoveries", ignoreCase = true) ||
-                shelf.title.equals("Similar to your favorites", ignoreCase = true) ||
-                shelf.title.startsWith("For your ", ignoreCase = true)
+            val title = shelf.title.trim()
+            title.isNotBlank() && !title.contains("mood", ignoreCase = true) &&
+                !title.endsWith(" mix", ignoreCase = true) &&
+                !title.startsWith("For your ", ignoreCase = true)
         }
         if (personalizedShelves.isNotEmpty() || list.isEmpty()) discoveryShelves = personalizedShelves
         time = System.currentTimeMillis()
@@ -432,11 +471,13 @@ object PlayerHolder {
     private data class ErrorRecovery(val positionMs: Long, val shouldResume: Boolean, val attempt: Int)
     private var player: ExoPlayer? = null
     private var bandwidthMeter: DefaultBandwidthMeter? = null
+    private var analysisService: AudioAnalysisService? = null
+    @Volatile private var analysisAppContext: Context? = null
+    @Volatile private var analysisResultListener: ((TrackAnalysisEntity) -> Unit)? = null
     private val retryAttempts = ConcurrentHashMap<String, Int>()
     private val unavailableTrackIds = ConcurrentHashMap.newKeySet<String>()
     private val lastKnownPositionMs = ConcurrentHashMap<String, Long>()
     private val pendingErrorRecoveries = ConcurrentHashMap<String, ErrorRecovery>()
-    private val recoveryPauseIds = ConcurrentHashMap.newKeySet<String>()
     private val qualifiedHistoryIds = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var lastAudibleTrackId: String? = null
     @Volatile private var lastAutoplayReadyTrackId: String? = null
@@ -449,12 +490,40 @@ object PlayerHolder {
     fun isRetrying(videoId: String): Boolean =
         (retryAttempts[videoId] ?: 0) in 1..MAX_PLAYBACK_RETRIES
 
+    fun lastPlaybackPosition(videoId: String): Long {
+        val activePlayer = player
+        val livePosition = activePlayer
+            ?.takeIf { it.currentMediaItem?.mediaId == videoId }
+            ?.currentPosition
+            ?.coerceAtLeast(0L)
+            ?: 0L
+        return maxOf(lastKnownPositionMs[videoId] ?: 0L, livePosition)
+    }
+
     @Synchronized
     fun currentMediaItemOrNull(): MediaItem? = player?.currentMediaItem
 
     fun estimatedBandwidthKbps(): Long {
         val estimate = bandwidthMeter?.bitrateEstimate ?: -1L
         return if (estimate > 0L) estimate / 1_000L else -1L
+    }
+
+    // Live PCM analysis is intentionally disabled; cached analysis remains available to DJ mode.
+    fun setDjAnalysisEnabled(enabled: Boolean) = Unit
+    fun setAnalysisMediaId(mediaId: String) = Unit
+    fun setAnalysisResultListener(listener: ((TrackAnalysisEntity) -> Unit)?) { analysisResultListener = listener }
+
+    fun loadAnalysis(trackId: String, executor: java.util.concurrent.Executor): java.util.concurrent.CompletableFuture<TrackAnalysisEntity?> =
+        getAudioAnalysisService()?.loadCachedAsync(trackId, executor)
+            ?: java.util.concurrent.CompletableFuture.completedFuture(null)
+
+    @Synchronized
+    private fun getAudioAnalysisService(): AudioAnalysisService? {
+        analysisService?.let { return it }
+        val app = analysisAppContext ?: return null
+        return AudioAnalysisService(AudioAnalysisDatabaseProvider.get(app).trackAnalysisDao()).also {
+            analysisService = it
+        }
     }
 
     @Synchronized
@@ -502,6 +571,8 @@ object PlayerHolder {
             resolve(app, spec)
         }
 
+        analysisAppContext = app
+
         val p = ExoPlayer.Builder(app)
             .setBandwidthMeter(meter)
             .setLoadControl(
@@ -526,7 +597,11 @@ object PlayerHolder {
             .build()
         p.setPlaybackSpeed(playbackPreferences.getFloat("playback_speed", 1f).coerceIn(0.5f, 2f))
         p.setSkipSilenceEnabled(playbackPreferences.getBoolean("skip_silence_enabled", false))
-        p.repeatMode = Player.REPEAT_MODE_ALL
+        p.repeatMode = if (playbackPreferences.getBoolean("repeat_current_track", false)) {
+            Player.REPEAT_MODE_ONE
+        } else {
+            Player.REPEAT_MODE_ALL
+        }
 
         val positionHandler = Handler(Looper.getMainLooper())
         val positionSampler = object : Runnable {
@@ -563,22 +638,16 @@ object PlayerHolder {
 
         p.addListener(object : Player.Listener {
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
-                // A pause issued while replacing a failed MediaSource is an internal
-                // recovery step, not a listener pause. Keep the original play intent
-                // until the recovered source becomes READY (or a real pause occurs).
                 val currentId = p.currentMediaItem?.mediaId
-                val recoveryPause = !playWhenReady && currentId != null &&
-                    recoveryPauseIds.remove(currentId)
                 if (playWhenReady) {
                     lastPlayIntent = true
-                    currentId?.let(recoveryPauseIds::remove)
-                } else if (!recoveryPause) {
+                } else {
                     lastPlayIntent = false
                 }
                 Log.i(
                     "KiloPlayback",
                     "playWhenReadyChanged id=${p.currentMediaItem?.mediaId.orEmpty()} " +
-                        "value=$playWhenReady reason=$reason recoveryPause=$recoveryPause " +
+                        "value=$playWhenReady reason=$reason " +
                         "lastIntent=$lastPlayIntent state=${p.playbackState} " +
                         "suppression=${p.playbackSuppressionReason} positionMs=${p.currentPosition}"
                 )
@@ -609,9 +678,11 @@ object PlayerHolder {
                             "errorRecoveryReady id=$id attempt=${recovery.attempt} targetPositionMs=$targetPosition " +
                                 "durationMs=${duration ?: -1L} wasPlaying=${recovery.shouldResume}"
                         )
+                        // The retry path applies this seek before prepare. Seeking again
+                        // here can trigger a second buffer cycle after READY, which sounds
+                        // like a brief pause even though the stream has recovered.
                         lastKnownPositionMs[id] = targetPosition
-                        p.seekTo(targetPosition)
-                        if (recovery.shouldResume) p.play()
+                        if (recovery.shouldResume && lastPlayIntent && !p.playWhenReady) p.play()
                     }
                 }
                 if (playbackState == Player.STATE_IDLE) {
@@ -652,6 +723,7 @@ object PlayerHolder {
                 if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                     mediaItem?.mediaId?.let { PlaybackStartupMetrics.selected(it, "automatic_queue") }
                 }
+                mediaItem?.mediaId?.let { lastKnownPositionMs[it] = p.currentPosition.coerceAtLeast(0L) }
                 Log.i(
                     "KiloPlayback",
                     "mediaItemTransition reason=$reason id=${mediaItem?.mediaId.orEmpty()} " +
@@ -723,7 +795,7 @@ object PlayerHolder {
                     QueuePreloader.forget(id)
                 }
                 val attempt = retryAttempts.merge(id, 1) { previous, increment -> previous + increment } ?: 1
-                val retryDelay = (400L * attempt).takeIf { attempt <= MAX_PLAYBACK_RETRIES }
+                val retryDelay = (100L * (attempt - 1)).takeIf { attempt <= MAX_PLAYBACK_RETRIES }
                 val failureText = generateSequence<Throwable>(error) { it.cause }
                     .mapNotNull { it.message }
                     .joinToString(" ")
@@ -766,20 +838,22 @@ object PlayerHolder {
                         // only the current MediaItem makes Media3 ask the resolver for a
                         // fresh stream, while preserving the queue and the listener's
                         // last confirmed position.
-                        pendingErrorRecoveries[id] = ErrorRecovery(resumePositionMs, shouldResume, attempt)
-                        recoveryPauseIds.add(id)
-                        p.pause()
+                        val shouldResumeNow = shouldResume && (p.playWhenReady || lastPlayIntent)
+                        pendingErrorRecoveries[id] = ErrorRecovery(resumePositionMs, shouldResumeNow, attempt)
                         val originalUri = failedItem.localConfiguration?.uri
                         val retryItem = failedItem.buildUpon().apply {
                             if (originalUri?.scheme == "vybe") setUri(originalUri)
                         }.build()
                         p.replaceMediaItem(currentIndex, retryItem)
                         p.seekTo(currentIndex, resumePositionMs)
+                        // Preserve Media3's playWhenReady intent across source recovery.
+                        // An explicit pause here adds a dead-air gap and can lose autoplay.
+                        if (shouldResumeNow && !p.playWhenReady) p.play()
                         p.prepare()
                         Log.w(
                             "KiloPlayback",
                             "errorRecoveryPrepared id=$id attempt=$attempt positionMs=$resumePositionMs " +
-                                "wasPlaying=$shouldResume uriScheme=${originalUri?.scheme.orEmpty()}"
+                                "wasPlaying=$shouldResumeNow uriScheme=${originalUri?.scheme.orEmpty()}"
                         )
                     }
                 }, retryDelay)
@@ -856,7 +930,7 @@ object PlayerHolder {
             }.onFailure { error ->
                 Log.e("KiloPlayback", "unexpectedIdleRecovery failed id=$id attempt=$attempt", error)
             }
-        }, 300L * attempt)
+        }, 100L * (attempt - 1))
     }
 
     fun prefetch(ctx: Context, videoId: String, onComplete: (() -> Unit)? = null) {
@@ -966,6 +1040,9 @@ object PlayerHolder {
 
 class VybeMediaService : MediaLibraryService() {
     private var session: MediaLibrarySession? = null
+    private var lyricsSessionPlayer: AndroidAutoLyricsSessionPlayer? = null
+    private var lyricMediaId: String? = null
+    private var lyricLines: List<LyricLine> = emptyList()
     private val io = Executors.newCachedThreadPool()
     private val main = Handler(Looper.getMainLooper())
     @Volatile private var currentTrackSnapshot: MediaItem? = null
@@ -994,7 +1071,9 @@ class VybeMediaService : MediaLibraryService() {
     }
     private val layoutListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+            DriveRecapStore.mediaItemTransition(mediaItem, reason, session?.player?.isPlaying == true)
             currentTrackSnapshot = mediaItem
+            updateAndroidAutoLyricLine(mediaItem, session?.player?.currentPosition ?: 0L)
             updateLayout()
             postPlaybackNotification()
         }
@@ -1005,10 +1084,41 @@ class VybeMediaService : MediaLibraryService() {
             else if (!isPlaying && wifiLock?.isHeld == true) wifiLock?.release()
         }
         override fun onIsPlayingChanged(isPlaying: Boolean) {
+            DriveRecapStore.playbackChanged(isPlaying)
             postPlaybackNotification()
             if (isPlaying && wifiLock?.isHeld == false) wifiLock?.acquire()
             else if (!isPlaying && wifiLock?.isHeld == true) wifiLock?.release()
         }
+    }
+
+    private val lyricMetadataPoller = object : Runnable {
+        override fun run() {
+            val player = PlayerHolder.get(this@VybeMediaService)
+            updateAndroidAutoLyricLine(player.currentMediaItem, player.currentPosition)
+            main.postDelayed(this, 500L)
+        }
+    }
+
+    private fun updateAndroidAutoLyricLine(mediaItem: MediaItem?, positionMs: Long) {
+        val id = mediaItem?.mediaId.orEmpty()
+        if (id != lyricMediaId) {
+            lyricMediaId = id
+            lyricLines = emptyList()
+            lyricsSessionPlayer?.setCurrentLyric(null)
+            if (mediaItem != null && id.isNotBlank() && !id.startsWith("radio:")) {
+                LyricsRepository.prefetch(mediaItem.toSong())
+            }
+        }
+        if (mediaItem == null || id.isBlank() || id.startsWith("radio:")) {
+            lyricsSessionPlayer?.setCurrentLyric(null)
+            return
+        }
+        val cachedLines = LyricsRepository.cached(mediaItem.toSong())
+        if (cachedLines.isNotEmpty()) lyricLines = cachedLines
+        val currentLine = lyricLines.asSequence()
+            .filter { it.timeMs >= 0L && it.timeMs <= positionMs && it.text.isNotBlank() }
+            .maxByOrNull { it.timeMs }
+        lyricsSessionPlayer?.setCurrentLyric(currentLine?.text)
     }
 
     private val notifReceiver = object : BroadcastReceiver() {
@@ -1033,6 +1143,7 @@ class VybeMediaService : MediaLibraryService() {
         super.onCreate()
         Favorites.init(this)
         SessionStore.init(this)
+        DriveRecapStore.init(this)
         YtRepo.refreshCookieFromWebView()
         createNotifChannel()
 
@@ -1046,16 +1157,23 @@ class VybeMediaService : MediaLibraryService() {
 
         val player = PlayerHolder.get(this)
         currentTrackSnapshot = player.currentMediaItem
+        lyricsSessionPlayer = AndroidAutoLyricsSessionPlayer(player)
         val open = PendingIntent.getActivity(
             this,
             0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        session = MediaLibrarySession.Builder(this, player, AutoCallback())
+        session = MediaLibrarySession.Builder(this, requireNotNull(lyricsSessionPlayer), AutoCallback())
             .setSessionActivity(open)
             .build()
+        updateAndroidAutoLyricLine(player.currentMediaItem, player.currentPosition)
+        main.post(lyricMetadataPoller)
         PlaybackWarmupManager.onMediaSessionReady()
+        AndroidAutoWarmupManager.onServiceReady(this) { parentId ->
+            runCatching { childrenFromCache(parentId) }
+                .onFailure { Log.w(TAG, "Android Auto browse warmup skipped parent=$parentId", it) }
+        }
         Log.i(TAG, "MediaLibrarySession created sessionAvailable=${session != null} playerItems=${player.mediaItemCount}")
         
         val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager
@@ -1222,17 +1340,21 @@ class VybeMediaService : MediaLibraryService() {
 
     override fun onDestroy() {
         Log.i(TAG, "MediaLibraryService destroyed sessionAvailable=${session != null}")
+        main.removeCallbacks(lyricMetadataPoller)
+        DriveRecapStore.serviceDestroyed(session?.player?.isPlaying == true)
         runCatching { unregisterReceiver(notifReceiver) }
         wifiLock?.let { if (it.isHeld) it.release() }
-        session?.player?.let {
+        PlayerHolder.get(this).let {
             SessionStore.save(it)
             it.removeListener(layoutListener)
         }
         Favorites.removeListener(favListener)
         getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
             .unregisterOnSharedPreferenceChangeListener(carBrowsePreferenceListener)
+        AndroidAutoWarmupManager.shutdown()
         session?.release()
         session = null
+        lyricsSessionPlayer = null
         io.shutdown()
         super.onDestroy()
     }
@@ -1344,12 +1466,16 @@ class VybeMediaService : MediaLibraryService() {
         }
     )
 
-    private fun radioBrowseQuickLinks(): List<MediaItem> = listOf(
-        carTile("home:radio_mood", "Mood Radio", "A music mix for your selected mood", AndroidAutoR.drawable.ic_auto_mood),
-        carTile("home:radio_discovery", "Discovery Radio", "Find something new", AndroidAutoR.drawable.ic_auto_radio),
-        carTile("home:radio_commute", "Commute Radio", "An easy mix for the drive", AndroidAutoR.drawable.ic_auto_continue),
-        carTile("home:radio_road_trip", "Road Trip Radio", "Keep the journey moving", AndroidAutoR.drawable.ic_auto_recent)
-    )
+    private fun radioBrowseQuickLinks(): List<MediaItem> {
+        val localStations = (
+            RadioStationStore.load(this, "radio_favorites") +
+                RadioStationStore.load(this, "radio_recent_stations") +
+                RadioStationStore.load(this, "radio_custom_stations")
+            ).distinctBy { it.id }
+        return radioMediaItems(localStations).ifEmpty {
+            listOf(folderItem("radio:no_stations", "No stations available", "Check your connection and try browsing again"))
+        }
+    }
 
     private fun carHomeShelves(): List<HomeShelf> {
         val cached = HomeCache.shelves
@@ -1460,10 +1586,9 @@ class VybeMediaService : MediaLibraryService() {
             val (mood, durationMinutes, _) = tripMixParameters(parentId)
             val prefs = getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
             val profile = ProfileEngine.load(prefs)
-            val liked = Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet()
-            val local = SmartMoodEngine.rankSongs(
-                localLibrarySongs().filter { it.videoId.isNotBlank() }, mood, PlayedSongHistory.ids(), liked,
-                profile.followedArtists.toSet()
+            val local = AndroidAutoMoodRecommendationAdapter.recommend(
+                this, mood, profile, MoodTrackFeedbackStore.hiddenIds(prefs, mood),
+                localCandidates = localLibrarySongs(), includeRemoteCandidates = false
             )
             return songItems(selectTripLength(local, durationMinutes))
         }
@@ -1483,30 +1608,17 @@ class VybeMediaService : MediaLibraryService() {
                         .filterNot { it in recent }
                         .map { query -> carTile("search:query:${Uri.encode(query)}", query, "Popular search", AndroidAutoR.drawable.ic_auto_search) }
             }
-            TAB_BROWSE -> listOf(
-                carTile(TAB_MOODS, "Moods", "Browse music by mood", AndroidAutoR.drawable.ic_auto_mood),
-                carTile(TAB_GENRES, "Genres", "Browse music by genre", AndroidAutoR.drawable.ic_auto_library),
-                setMyMoodCard(),
-                carTile(TAB_ARTISTS, "Your Artists", "Music from artists you follow", AndroidAutoR.drawable.ic_auto_library),
-                carTile(TAB_PICKS, "Quick Picks", "Songs selected for you", AndroidAutoR.drawable.ic_auto_continue),
-                carTile(TAB_TRENDING, "Trending", "Popular music right now", AndroidAutoR.drawable.ic_auto_recent)
-            )
+            TAB_BROWSE -> browseCategories()
             TAB_RADIO -> listOf(
-                carTile("home:artist_radio", "Artist Radio", "Start with an artist you follow", AndroidAutoR.drawable.ic_auto_radio),
-                carTile("radio:song", "Song Radio", "Build a station from what is playing", AndroidAutoR.drawable.ic_auto_continue),
-                carTile("radio:genres", "Genre Radio", "Choose a sound", AndroidAutoR.drawable.ic_auto_library),
-                carTile("radio:moods", "Mood Radio", "Choose a feeling", AndroidAutoR.drawable.ic_auto_mood),
-                carTile("home:radio_discovery", "Discovery Radio", "Find something new", AndroidAutoR.drawable.ic_auto_radio),
-                carTile("radio:trending", "Trending Radio", "Popular music right now", AndroidAutoR.drawable.ic_auto_recent),
-                carTile("radio:regional", "Regional Radio", "Choose a language", AndroidAutoR.drawable.ic_auto_library),
-                carTile(TAB_RADIO_BROWSE, "Live Radio", "Browse live stations", AndroidAutoR.drawable.ic_auto_radio)
+                carTile(TAB_RADIO_BROWSE, "Browse", "Find live stations", AndroidAutoR.drawable.ic_auto_radio),
+                carTile(TAB_RADIO_FAVORITES, "Favorites", "Stations you saved", AndroidAutoR.drawable.ic_auto_liked),
+                carTile(TAB_RADIO_RECENT, "Recent", "Stations you played recently", AndroidAutoR.drawable.ic_auto_recent),
+                carTile(TAB_RADIO_CUSTOM, "My Stations", "Your added stations", AndroidAutoR.drawable.ic_auto_library)
             )
             TAB_LIBRARY -> listOf(
                 carTile(TAB_LIKED, "Liked Songs", "Your saved tracks", AndroidAutoR.drawable.ic_auto_liked),
                 carTile(TAB_PLAYLISTS, "Playlists", "Your saved playlists", AndroidAutoR.drawable.ic_auto_playlists),
-                carTile(TAB_ALBUMS, "Albums", "Albums in your collection", AndroidAutoR.drawable.ic_auto_playlists),
-                carTile(TAB_ARTISTS, "Artists", "Followed artists first", AndroidAutoR.drawable.ic_auto_library),
-                carTile(TAB_RECENT, "History", "Recently played songs", AndroidAutoR.drawable.ic_auto_recent)
+                carTile(TAB_ARTISTS, "Followed Artists", "Music from artists you follow", AndroidAutoR.drawable.ic_auto_library)
             )
             TAB_PICKS -> quickPicksItems()
             TAB_RECENT, TAB_CONTINUE, TAB_LISTEN_AGAIN, TAB_TRENDING, TAB_HEARD_SHORTS, TAB_SONGS ->
@@ -1536,7 +1648,11 @@ class VybeMediaService : MediaLibraryService() {
                     val query = Uri.decode(parentId.removePrefix("search:query:")).lowercase(Locale.ROOT)
                     songItems(cachedHomeSongs().filter { "${it.title} ${it.artist} ${it.album}".lowercase(Locale.ROOT).contains(query) })
                 }
-                parentId == "mood:auto" || parentId.startsWith("mood:") || parentId.startsWith("moodradio:") || parentId.startsWith("genre:") || parentId.startsWith("artist:") -> fallbackSongs
+                parentId == "mood:auto" -> emptyList()
+                parentId.startsWith("mood:") || parentId.startsWith("moodradio:") -> emptyList()
+                parentId.startsWith("genre:") ->
+                    songItems(matchingCachedCategorySongs(parentId))
+                parentId.startsWith("artist:") -> fallbackSongs
                 parentId.startsWith("savedpl:") -> savedPlaylists()
                     .firstOrNull { it.id == parentId.removePrefix("savedpl:") }?.songs?.map { it.toMediaItem() }.orEmpty()
                 parentId.startsWith("shelf:") -> {
@@ -1551,8 +1667,30 @@ class VybeMediaService : MediaLibraryService() {
         return validMediaItems(parentId, result)
     }
 
+    private fun matchingCachedCategorySongs(parentId: String): List<SongItemClean> {
+        val candidates = (cachedHomeSongs() + SessionStore.recentSongs() + Favorites.songs())
+            .filter { it.videoId.isNotBlank() || it.id.isNotBlank() }
+            .distinctBy { it.videoId.ifBlank { it.id } }
+        val category = when {
+            parentId.startsWith("mood:") -> Uri.decode(parentId.removePrefix("mood:"))
+            parentId.startsWith("moodradio:") -> Uri.decode(parentId.removePrefix("moodradio:"))
+            else -> Uri.decode(parentId.removePrefix("genre:"))
+        }
+        val terms = (if (parentId.startsWith("genre:")) listOf(category) else {
+            listOf(category) + SmartMoodEngine.profile(category)?.genres.orEmpty()
+        }).map { it.lowercase(Locale.ROOT) }.filter(String::isNotBlank)
+        if (terms.isEmpty()) return emptyList()
+        return candidates.filter { song ->
+            val searchable = "${song.title} ${song.artist} ${song.album}".lowercase(Locale.ROOT)
+            terms.any(searchable::contains)
+        }
+    }
+
     private fun cacheChildren(parentId: String, items: List<MediaItem>): List<MediaItem> {
         val safe = validMediaItems(parentId, items)
+        if (isCategorySongParent(parentId)) {
+            BrowseTreeCache.put(parentId, safe.filterNot { it.mediaId.startsWith("info:") })
+        }
         if (!isVolatileBrowseParent(parentId)) {
             BrowseTreeCache.put(parentId, safe.filterNot { it.mediaId.startsWith("info:") })
             runCatching {
@@ -1565,22 +1703,45 @@ class VybeMediaService : MediaLibraryService() {
 
     private fun isVolatileBrowseParent(parentId: String): Boolean =
         parentId in setOf(
-            ROOT, TAB_HOME, TAB_SEARCH, TAB_RECENT, TAB_CONTINUE, TAB_PICKS, TAB_LIKED, TAB_PLAYLISTS, TAB_OFFLINE,
+            ROOT, TAB_HOME, TAB_BROWSE, TAB_SEARCH, TAB_RECENT, TAB_CONTINUE, TAB_PICKS, TAB_LIKED, TAB_PLAYLISTS, TAB_OFFLINE,
             TAB_RADIO_FAVORITES, TAB_RADIO_RECENT, TAB_RADIO_CUSTOM,
             TAB_GENRES, TAB_MOODS, TAB_ARTISTS, TAB_ALBUMS, TAB_SONGS
         ) || parentId.startsWith("home:") || parentId.startsWith("quickpicks:after:") || parentId.startsWith("savedpl:") || parentId.startsWith("genre:") ||
-            parentId.startsWith("mood:") || parentId.startsWith("artist:") || parentId.startsWith("radio:")
+            parentId.startsWith("mood:") || parentId.startsWith("moodradio:") || parentId.startsWith("artist:") || parentId.startsWith("radio:")
+
+    private fun isCategorySongParent(parentId: String): Boolean =
+            parentId.startsWith("mood:") ||
+            parentId.startsWith("moodradio:") || parentId.startsWith("genre:")
 
     private fun requestBrowseGeneration(parentId: String) {
-        if (parentId in setOf(ROOT, TAB_HOME, TAB_SEARCH, TAB_BROWSE, TAB_RADIO, TAB_RADIO_BROWSE)) return
+        // Only generate children for sections whose first page actually needs remote data.
+        // Rebuilding static category lists and notifying them causes Android Auto to ask
+        // for the same page again, creating a browse/notification loop (notably for Moods).
+        val needsBackgroundGeneration =
+            parentId.startsWith("mood:") ||
+                parentId.startsWith("moodradio:") ||
+                parentId.startsWith("genre:") ||
+                parentId.startsWith("artist:") ||
+                parentId.startsWith("tripmix:") ||
+                parentId.startsWith("discovery:") ||
+                parentId.startsWith("search:query:") ||
+                parentId == "radio:song" ||
+                parentId == "radio:trending" ||
+                parentId.startsWith("home:radio_")
+        if (!needsBackgroundGeneration) return
         if (!pendingBrowseBuilds.add(parentId)) return
         io.execute {
             try {
+                val previousIds = BrowseTreeCache.get(parentId).map(MediaItem::mediaId)
                 val generated = runCatching { childrenOf(parentId) }
                     .onFailure { Log.e(TAG, "Could not build Android Auto section $parentId", it) }
                     .getOrDefault(emptyList())
                 val safe = cacheChildren(parentId, generated)
-                if (safe.isNotEmpty()) main.post {
+                val changed = safe.map(MediaItem::mediaId) != previousIds
+                if (isCategorySongParent(parentId)) {
+                    Log.i(TAG, "AA_CATEGORY_RESULTS parent=$parentId count=${safe.size} changed=$changed")
+                }
+                if (safe.isNotEmpty() && changed) main.post {
                     session?.notifyChildrenChanged(parentId, safe.size, null)
                 }
             } finally {
@@ -1590,8 +1751,8 @@ class VybeMediaService : MediaLibraryService() {
     }
 
     private fun ensureMoodShortcut(parentId: String, items: List<MediaItem>): List<MediaItem> {
-        if (parentId != TAB_BROWSE || items.any { it.mediaId == "mood:auto" }) return items
-        return items + setMyMoodCard()
+        if (parentId != TAB_MOODS || items.any { it.mediaId == "mood:auto" }) return items
+        return listOf(setMyMoodCard()) + items
     }
 
     private fun emptyBrowseFallback(parentId: String): MediaItem {
@@ -1613,7 +1774,7 @@ class VybeMediaService : MediaLibraryService() {
         }
 
     private fun childrenFromCache(parentId: String): List<MediaItem> {
-        if (!isVolatileBrowseParent(parentId)) {
+        if (!isVolatileBrowseParent(parentId) || isCategorySongParent(parentId)) {
             val memory = BrowseTreeCache.get(parentId).filterNot { it.mediaId.startsWith("info:") }
             if (memory.isNotEmpty()) {
                 val validMemory = withoutBrowseCycles(parentId, validMediaItems(parentId, ensureMoodShortcut(parentId, memory)))
@@ -1641,8 +1802,17 @@ class VybeMediaService : MediaLibraryService() {
 
         // Return local data immediately. Catalog/search work is queued off the browse callback.
         val fallback = withoutBrowseCycles(parentId, fallbackChildren(parentId))
+        if (fallback.isEmpty() && isCategorySongParent(parentId)) {
+            // Do not insert a fake "Nothing here" folder that drivers must open again.
+            // Return a successful empty page while the category search runs in the
+            // background; the cache is then published to Android Auto once it is ready.
+            requestBrowseGeneration(parentId)
+            Log.i(TAG, "AA_CATEGORY_RESULTS parent=$parentId count=0 status=LOADING")
+            return emptyList()
+        }
         val safe = fallback.ifEmpty { listOf(emptyBrowseFallback(parentId)) }
-        if (safe.isNotEmpty() && !isVolatileBrowseParent(parentId)) BrowseTreeCache.put(parentId, safe)
+        if (fallback.isNotEmpty() && isCategorySongParent(parentId)) BrowseTreeCache.put(parentId, fallback)
+        else if (safe.isNotEmpty() && !isVolatileBrowseParent(parentId)) BrowseTreeCache.put(parentId, safe)
         requestBrowseGeneration(parentId)
         requestRemoteRefresh(parentId)
         if (safe.isEmpty()) Log.i(TAG, "Browse section is empty parent=$parentId; returning an empty list")
@@ -1736,30 +1906,12 @@ class VybeMediaService : MediaLibraryService() {
     }
 
     private fun browseCategories(): List<MediaItem> {
-        val shelves = carHomeShelves()
-        val quickIndex = shelves.indexOfFirst { it.title.contains("quick pick", ignoreCase = true) }.takeIf { it >= 0 } ?: 0
-        val listenIndex = shelves.indexOfFirst { it.title.contains("listen again", ignoreCase = true) }
-        val shortsIndex = shelves.indexOfFirst { it.title.contains("short", ignoreCase = true) }
-        val trendingIndex = shelves.indexOfFirst {
-            listOf("trend", "viral", "top hits", "popular").any { term -> it.title.contains(term, ignoreCase = true) }
-        }
-        val knownIndexes = setOf(quickIndex, listenIndex, shortsIndex, trendingIndex).filter { it >= 0 }.toSet()
-        return buildList {
-            add(carTile(TAB_GENRES, "Genres", "Browse music by genre", AndroidAutoR.drawable.ic_auto_library))
-            add(carTile(TAB_MOODS, "Moods", "Browse music by mood", AndroidAutoR.drawable.ic_auto_mood))
-            if (ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE)).followedArtists.isNotEmpty()) {
-                add(carTile(TAB_ARTISTS, "Your Artists", "Music from artists you follow", AndroidAutoR.drawable.ic_auto_library))
-            }
-            add(folderItem(TAB_PICKS, "Quick Picks", "Songs selected for you", shelves.getOrNull(quickIndex)?.songs?.firstOrNull()?.coverUrl))
-            add(folderItem(TAB_LISTEN_AGAIN, "Listen Again", "Recently played favorites", shelves.getOrNull(listenIndex)?.songs?.firstOrNull()?.coverUrl))
-            add(folderItem(TAB_HEARD_SHORTS, "Heard in Shorts", "Songs heard in YouTube Shorts", shelves.getOrNull(shortsIndex)?.songs?.firstOrNull()?.coverUrl))
-            add(folderItem(TAB_TRENDING, "Trending", "Popular music right now", shelves.getOrNull(trendingIndex)?.songs?.firstOrNull()?.coverUrl))
-            shelves.forEachIndexed { idx, shelf ->
-                if (idx !in knownIndexes) {
-                    add(folderItem("shelf:$idx", shelf.title, art = shelf.songs.firstOrNull()?.coverUrl))
-                }
-            }
-        }
+        return listOf(
+            carTile(TAB_MOODS, "Moods", "Pick a feeling and start a mix", AndroidAutoR.drawable.ic_auto_mood),
+            carTile(TAB_GENRES, "Genres", "Explore sounds and languages", AndroidAutoR.drawable.ic_auto_library),
+            carTile(TAB_OFFLINE, "Downloads", "Music saved for offline listening", AndroidAutoR.drawable.ic_auto_downloads),
+            carTile(TAB_ARTISTS, "Artists", "Music from artists you follow", AndroidAutoR.drawable.ic_auto_artists)
+        )
     }
 
     private fun savedPlaylists(): List<SavedPlaylist> = runCatching {
@@ -1786,6 +1938,44 @@ class VybeMediaService : MediaLibraryService() {
         }
     }.getOrDefault(emptyList())
 
+    /** Followed artists lead; artists found in saved, recent, downloaded, and cached music follow. */
+    private fun androidAutoArtistNames(): List<String> {
+        val followed = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE)).followedArtists
+        val heard = localLibrarySongs().map(SongItemClean::artist)
+        return (followed + heard)
+            .asSequence()
+            .map(String::trim)
+            .filter { it.isNotBlank() && !it.equals("unknown", ignoreCase = true) && !it.equals("various artists", ignoreCase = true) }
+            .distinctBy { it.lowercase(Locale.ROOT) }
+            .take(50)
+            .toList()
+    }
+
+    /** Prefer the artist's actual YouTube Music catalog, with a strictly artist-matched search fallback. */
+    private fun androidAutoArtistSongs(name: String): List<SongItemClean> {
+        if (name.isBlank()) return emptyList()
+        val artist = runCatching {
+            val matches = YtRepo.searchArtists(name)
+            matches.firstOrNull { it.name.equals(name, ignoreCase = true) }
+                ?: matches.firstOrNull { it.name.contains(name, ignoreCase = true) || name.contains(it.name, ignoreCase = true) }
+                ?: matches.firstOrNull()
+        }.onFailure { Log.w(TAG, "Android Auto artist lookup failed artist=$name", it) }.getOrNull()
+        val catalogSongs = artist?.let { matched ->
+            runCatching { YtRepo.fetchArtistCatalog(matched).third }
+                .onFailure { Log.w(TAG, "Android Auto artist catalog failed artist=$name", it) }
+                .getOrDefault(emptyList())
+        }.orEmpty().filter { it.videoId.isNotBlank() }
+        if (catalogSongs.isNotEmpty()) return catalogSongs.distinctBy(SongItemClean::videoId)
+
+        return runCatching { YtRepo.searchSongs("songs by $name") }
+            .onFailure { Log.w(TAG, "Android Auto artist song search failed artist=$name", it) }
+            .getOrDefault(emptyList())
+            .filter { song ->
+                song.videoId.isNotBlank() && song.artist.contains(artist?.name ?: name, ignoreCase = true)
+            }
+            .distinctBy(SongItemClean::videoId)
+    }
+
     private fun carMoodSuggestion(): MoodSuggestion = suggestMoodForConditions(
         Calendar.getInstance().get(Calendar.HOUR_OF_DAY),
         MoodContext.cachedTemperatureC(this)
@@ -1796,40 +1986,17 @@ class VybeMediaService : MediaLibraryService() {
         return saved?.takeIf { SmartMoodEngine.profile(it) != null } ?: carMoodSuggestion().mood
     }
 
-    private fun personalizedMoodQuery(mood: String, profile: ListenerProfile): String {
-        val preferredArtist = (profile.followedArtists + Favorites.songs().map { it.artist } + PlayedSongHistory.recommendationArtists())
-            .asSequence().map(String::trim).filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }.firstOrNull()
-        return listOf(
-            moodDiscoveryQuery(mood, profile.favoriteGenres.firstOrNull()),
-            preferredArtist?.let { "similar to $it" }
-        ).filterNotNull().joinToString(" ")
-    }
-
     /** Builds the Android Auto ride queue off the browse callback thread. */
     private fun buildRideMix(mood: String, durationMinutes: Int, _destination: String): List<SongItemClean> {
         val prefs = getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
         val profile = ProfileEngine.load(prefs)
-        val favorites = Favorites.songs()
-        val likedIds = favorites.flatMap { listOf(it.id, it.videoId) }.filter(String::isNotBlank).toSet()
-        val baseQuery = personalizedMoodQuery(mood, profile)
-        val networkSongs = listOf(baseQuery).flatMap { query ->
-            runCatching { YtRepo.searchSongs(query) }
-                .onFailure { Log.w(TAG, "Ride Mix query failed mood=$mood", it) }
-                .getOrDefault(emptyList())
-        }
-        val hideExplicit = prefs.getBoolean("filter_mature_content", true)
-        val candidates = (networkSongs + localLibrarySongs())
-            .asSequence()
-            .filter { it.videoId.isNotBlank() }
-            .filter { !hideExplicit || !it.isExplicit }
-            .distinctBy { it.videoId }
-            .toList()
-        val ranked = SmartMoodEngine.rankSongs(
-            candidates,
-            mood,
-            PlayedSongHistory.ids(),
-            likedIds,
-            profile.followedArtists.toSet()
+        val excluded = MoodTrackFeedbackStore.hiddenIds(prefs, mood)
+        val ranked = AndroidAutoMoodRecommendationAdapter.recommend(
+            context = this,
+            mood = mood,
+            profile = profile,
+            excludedIds = excluded,
+            localCandidates = localLibrarySongs()
         )
         return selectTripLength(ranked, durationMinutes)
     }
@@ -1850,26 +2017,27 @@ class VybeMediaService : MediaLibraryService() {
     private fun carRootItems(): List<MediaItem> {
         // Hydrate the Android Auto catalog in the background as soon as the car opens KILO.
         carHomeShelves()
+        // Android Auto supports at most four root navigation tabs. Keep Search on the
+        // host's native search action so Library remains directly visible as a tab.
         return listOf(
             carTile(TAB_HOME, "Home", "Continue listening and picks for you", AndroidAutoR.drawable.ic_auto_continue),
-            carTile(TAB_RADIO, "Radio", "One-tap stations and live radio", AndroidAutoR.drawable.ic_auto_radio),
-            carTile(TAB_MOODS, "Moods", "Start a mix for how you feel", AndroidAutoR.drawable.ic_auto_mood),
-            carTile(TAB_GENRES, "Genres", "Popular, regional and niche sounds", AndroidAutoR.drawable.ic_auto_library),
-            carTile(TAB_LIBRARY, "Library", "Liked songs, playlists and history", AndroidAutoR.drawable.ic_auto_playlists),
-            carTile(TAB_OFFLINE, "Downloads", "Downloaded songs, playlists and mixes", AndroidAutoR.drawable.ic_auto_downloads),
-            carTile(TAB_SEARCH, "Search", "Recent, popular and voice search", AndroidAutoR.drawable.ic_auto_search)
+            carTile(TAB_BROWSE, "Browse", "Moods, genres, library and downloads", AndroidAutoR.drawable.ic_auto_library),
+            carTile(TAB_RADIO, "Radio", "Your stations and music mixes", AndroidAutoR.drawable.ic_auto_radio),
+            carTile(TAB_LIBRARY, "Library", "Liked songs, playlists and followed artists", AndroidAutoR.drawable.ic_auto_library)
         )
     }
 
-    private fun personalizedCarHomeItems(): List<MediaItem> = listOf(
-        continueListeningTile(),
-        carTile(TAB_PICKS, "Quick Picks", "Songs selected for you", AndroidAutoR.drawable.ic_auto_continue),
-        carTile(TAB_RECENT, "Recently Played", "Return to a recent listen", AndroidAutoR.drawable.ic_auto_recent),
-        carTile("home:made_for_you", "Made For You", "Personal recommendations", AndroidAutoR.drawable.ic_auto_mood),
-        carTile("home:recent_mixes", "Recent Mixes", "Your saved and recent mixes", AndroidAutoR.drawable.ic_auto_playlists),
-        carTile(TAB_ARTISTS, "Your Favourite Artists", "Music from artists you follow", AndroidAutoR.drawable.ic_auto_library),
-        carTile(TAB_TRENDING, "Trending For You", "Popular picks shaped by your taste", AndroidAutoR.drawable.ic_auto_recent)
-    )
+    private fun personalizedCarHomeItems(): List<MediaItem> {
+        return buildList {
+            add(continueListeningTile())
+            add(carTile(TAB_PICKS, "Quick Picks", "Songs selected for you", AndroidAutoR.drawable.ic_auto_continue))
+            add(carTile(TAB_RECENT, "Recently Played", "Return to a recent listen", AndroidAutoR.drawable.ic_auto_recent))
+            add(carTile("home:made_for_you", "Made For You", "Personal recommendations", AndroidAutoR.drawable.ic_auto_mood))
+            add(carTile("home:recent_mixes", "Recent Mixes", "Your saved and recent mixes", AndroidAutoR.drawable.ic_auto_playlists))
+            add(carTile(TAB_ARTISTS, "Your Favourite Artists", "Music from artists you follow", AndroidAutoR.drawable.ic_auto_library))
+            add(carTile(TAB_TRENDING, "Trending For You", "Popular picks shaped by your taste", AndroidAutoR.drawable.ic_auto_recent))
+        }
+    }
 
     private fun continueListeningTile(): MediaItem {
         val current = currentTrackSnapshot
@@ -1913,31 +2081,23 @@ class VybeMediaService : MediaLibraryService() {
         .build()
 
     private fun browseCategoryArtworkUri(mediaId: String, title: String): Uri {
-        val id = mediaId.lowercase(Locale.ROOT)
-        val label = title.lowercase(Locale.ROOT)
-        val resourceId = when {
-            id == TAB_CONTINUE || label.contains("continue listening") -> AndroidAutoR.drawable.ic_auto_continue
-            id == TAB_PLAYLISTS || id.startsWith("savedpl:") || id.startsWith("pl:") || label.contains("playlist") -> AndroidAutoR.drawable.ic_auto_playlists
-            id == TAB_OFFLINE || label.contains("download") -> AndroidAutoR.drawable.ic_auto_downloads
-            id == TAB_LIKED || label.contains("liked") || label.contains("favorite") -> AndroidAutoR.drawable.ic_auto_liked
-            id == TAB_RADIO || id.startsWith("home:radio") || label.contains("radio") -> AndroidAutoR.drawable.ic_auto_radio
-            id == TAB_SEARCH || label == "search" -> AndroidAutoR.drawable.ic_auto_search
-            id == TAB_RECENT || id == "mood:recent" || label.contains("recent") -> AndroidAutoR.drawable.ic_auto_recent
-            id == TAB_MOODS || id.startsWith("mood:") || label.contains("mood") -> AndroidAutoR.drawable.ic_auto_mood
-            else -> AndroidAutoR.drawable.ic_auto_library
-        }
-        return autoArtworkUri(resourceId)
+        return ArtworkCacheManager.artworkUri(this, ArtworkCacheManager.keyFor(mediaId, title))
     }
 
     private fun carTile(id: String, title: String, subtitle: String, artwork: Int): MediaItem =
-        folderItem(id, title, subtitle, art = autoArtworkUri(artwork).toString())
+        folderItem(
+            id,
+            title,
+            subtitle,
+            art = ArtworkCacheManager.artworkUri(this, ArtworkCacheManager.keyFor(id, title)).toString()
+        )
 
     private fun moodCard(mood: String, title: String = "${moodEmoji(mood)} $mood", subtitle: String = "Music for $mood"): MediaItem =
         folderItem(
             id = "mood:${Uri.encode(mood)}",
             title = title,
             subtitle = subtitle,
-            art = autoArtworkUri(AndroidAutoR.drawable.ic_auto_mood).toString(),
+            art = ArtworkCacheManager.artworkUri(this, "moods").toString(),
             childStyle = AUTO_STYLE_GRID
         )
 
@@ -2054,10 +2214,10 @@ class VybeMediaService : MediaLibraryService() {
             .distinctBy { it.title.lowercase(Locale.ROOT) }
             .map { shelf ->
                 val count = shelf.songs.size
-                val subtitle = if (shelf.title.equals("Discovered, not played", ignoreCase = true)) {
-                    "$count songs you haven't played yet"
-                } else {
-                    "$count fresh picks shaped by your listening"
+                val subtitle = when (shelf.title) {
+                    "Spotted, Not Started", "Discovered, not played" -> "$count songs you found but haven't played yet"
+                    "First Encounters", "Fresh discoveries" -> "$count new songs shaped by your listening"
+                    else -> "$count fresh picks shaped by your listening"
                 }
                 folderItem(
                     id = "home:picks:${Uri.encode(shelf.title)}",
@@ -2119,14 +2279,10 @@ class VybeMediaService : MediaLibraryService() {
                     .map { query -> carTile("search:query:${Uri.encode(query)}", query, "Popular search", AndroidAutoR.drawable.ic_auto_search) }
         }
         parentId == TAB_RADIO -> listOf(
-            carTile("home:artist_radio", "Artist Radio", "Start with an artist you follow", AndroidAutoR.drawable.ic_auto_radio),
-            carTile("radio:song", "Song Radio", "Build a station from what is playing", AndroidAutoR.drawable.ic_auto_continue),
-            carTile("radio:genres", "Genre Radio", "Choose a sound", AndroidAutoR.drawable.ic_auto_library),
-            carTile("radio:moods", "Mood Radio", "Choose a feeling", AndroidAutoR.drawable.ic_auto_mood),
-            carTile("home:radio_discovery", "Discovery Radio", "Find something new", AndroidAutoR.drawable.ic_auto_radio),
-            carTile("radio:trending", "Trending Radio", "Popular music right now", AndroidAutoR.drawable.ic_auto_recent),
-            carTile("radio:regional", "Regional Radio", "Choose a language", AndroidAutoR.drawable.ic_auto_library),
-            carTile(TAB_RADIO_BROWSE, "Live Radio", "Browse live stations", AndroidAutoR.drawable.ic_auto_radio)
+            carTile(TAB_RADIO_BROWSE, "Browse", "Find live stations", AndroidAutoR.drawable.ic_auto_radio),
+            carTile(TAB_RADIO_FAVORITES, "Favorites", "Stations you saved", AndroidAutoR.drawable.ic_auto_liked),
+            carTile(TAB_RADIO_RECENT, "Recent", "Stations you played recently", AndroidAutoR.drawable.ic_auto_recent),
+            carTile(TAB_RADIO_CUSTOM, "My Stations", "Your added stations", AndroidAutoR.drawable.ic_auto_library)
         )
         parentId == "radio:genres" -> {
             val profile = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE))
@@ -2205,31 +2361,39 @@ class VybeMediaService : MediaLibraryService() {
             }
         }
         parentId == TAB_ARTISTS -> {
-            val followed = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE)).followedArtists
-            (followed + cachedHomeSongs().map { it.artist }.filter(String::isNotBlank).distinct())
-                .distinct()
-                .map { artist -> carTile("artist:${Uri.encode(artist)}", artist, "Songs by $artist", AndroidAutoR.drawable.ic_auto_library) }
-                .ifEmpty { listOf(folderItem(TAB_PICKS, "Find artists to follow", "Open Quick Picks to start listening")) }
+            androidAutoArtistNames().map { artist ->
+                carTile("artist:${Uri.encode(artist)}", artist, "Songs by $artist", AndroidAutoR.drawable.ic_auto_artists)
+            }.ifEmpty { listOf(folderItem(TAB_PICKS, "No artists yet", "Play or save music to see artists here")) }
         }
         parentId.startsWith("moodradio:") -> {
             val mood = Uri.decode(parentId.removePrefix("moodradio:"))
-            val profile = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE))
+            val prefs = getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
+            val profile = ProfileEngine.load(prefs)
             if (SmartMoodEngine.profile(mood) != null) applyCarMoodSelection(mood)
-            val songs = YtRepo.searchSongs(personalizedMoodQuery(mood, profile))
-            songItems(SmartMoodEngine.rankSongs(songs, mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet(),
-                (profile.followedArtists + Favorites.songs().map { it.artist }).toSet()))
+            val excluded = MoodTrackFeedbackStore.hiddenIds(prefs, mood)
+            val songs = AndroidAutoMoodRecommendationAdapter.recommend(
+                this, mood, profile, excluded, matchingCachedCategorySongs(parentId)
+            )
+            songItems(songs)
         }
         parentId.startsWith("genre:") -> {
             val genre = Uri.decode(parentId.removePrefix("genre:"))
-            songItems(filterGenreTitleMatches(YtRepo.searchSongs(genreDiscoveryQuery(genre)), genre))
+            val remote = runCatching { YtRepo.searchSongs(genreDiscoveryQuery(genre)) }
+                .onFailure { Log.w(TAG, "Android Auto genre lookup failed genre=$genre", it) }
+                .getOrDefault(emptyList())
+            val candidates = remote.ifEmpty { matchingCachedCategorySongs(parentId) }
+            songItems(filterGenreTitleMatches(candidates, genre))
         }
         parentId == "mood:auto" -> {
             val suggestion = carMoodSuggestion()
             applyCarMoodSelection(suggestion.mood, suggestion.reason)
-            val profile = ProfileEngine.load(getSharedPreferences("vybe_app_settings", MODE_PRIVATE))
-            val songs = YtRepo.searchSongs(personalizedMoodQuery(suggestion.mood, profile))
-            songItems(SmartMoodEngine.rankSongs(songs, suggestion.mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet(),
-                (profile.followedArtists + Favorites.songs().map { it.artist }).toSet()))
+            val prefs = getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
+            val profile = ProfileEngine.load(prefs)
+            val excluded = MoodTrackFeedbackStore.hiddenIds(prefs, suggestion.mood)
+            val songs = AndroidAutoMoodRecommendationAdapter.recommend(
+                this, suggestion.mood, profile, excluded, localLibrarySongs()
+            )
+            songItems(songs)
         }
         parentId.startsWith("mood:") -> {
             val requestedMood = Uri.decode(parentId.removePrefix("mood:"))
@@ -2239,11 +2403,13 @@ class VybeMediaService : MediaLibraryService() {
             } else requestedMood
             applyCarMoodSelection(mood)
             val profile = ProfileEngine.load(prefs)
-            val candidates = filterMoodTitleMatches(YtRepo.searchSongs(personalizedMoodQuery(mood, profile)), mood)
-            songItems(SmartMoodEngine.rankSongs(candidates, mood, PlayedSongHistory.ids(), Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet(),
-                (profile.followedArtists + Favorites.songs().map { it.artist }).toSet()))
+            val excluded = MoodTrackFeedbackStore.hiddenIds(prefs, mood)
+            val candidates = AndroidAutoMoodRecommendationAdapter.recommend(
+                this, mood, profile, excluded, matchingCachedCategorySongs(parentId)
+            )
+            songItems(candidates)
         }
-        parentId.startsWith("artist:") -> songItems(YtRepo.searchSongs("songs by ${Uri.decode(parentId.removePrefix("artist:"))}"))
+        parentId.startsWith("artist:") -> songItems(androidAutoArtistSongs(Uri.decode(parentId.removePrefix("artist:"))))
         parentId == TAB_RADIO_FAVORITES -> radioMediaItems(RadioStationStore.load(this, "radio_favorites"))
         parentId == TAB_RADIO_RECENT -> radioMediaItems(RadioStationStore.load(this, "radio_recent_stations"))
         parentId == TAB_RADIO_CUSTOM -> radioMediaItems(RadioStationStore.load(this, "radio_custom_stations"))
@@ -2312,9 +2478,7 @@ class VybeMediaService : MediaLibraryService() {
         parentId == TAB_LIBRARY -> listOf(
             carTile(TAB_LIKED, "Liked Songs", "Your saved tracks", AndroidAutoR.drawable.ic_auto_liked),
             carTile(TAB_PLAYLISTS, "Playlists", "Your saved playlists", AndroidAutoR.drawable.ic_auto_playlists),
-            carTile(TAB_ALBUMS, "Albums", "Albums in your collection", AndroidAutoR.drawable.ic_auto_playlists),
-            carTile(TAB_ARTISTS, "Artists", "Followed artists first", AndroidAutoR.drawable.ic_auto_library),
-            carTile(TAB_RECENT, "History", "Recently played songs", AndroidAutoR.drawable.ic_auto_recent)
+            carTile(TAB_ARTISTS, "Followed Artists", "Music from artists you follow", AndroidAutoR.drawable.ic_auto_library)
         )
         parentId == TAB_SHELVES -> carHomeShelves().mapIndexed { i, shelf ->
             folderItem("shelf:$i", shelf.title, art = shelf.songs.firstOrNull()?.coverUrl)
@@ -2432,10 +2596,10 @@ class VybeMediaService : MediaLibraryService() {
                             }
                         }
                         if (player.mediaItemCount > 0) {
+                            player.play()
                             if (player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) {
                                 player.prepare()
                             }
-                            player.play()
                         }
                     }
                 }
@@ -2452,14 +2616,37 @@ class VybeMediaService : MediaLibraryService() {
                 .build()
         }
 
+        override fun onPostConnect(session: MediaSession, controller: MediaSession.ControllerInfo) {
+            ConnectionReliabilityManager.onConnected(controller.packageName, controller.uid)
+            if (controller.packageName == "com.google.android.projection.gearhead") {
+                DriveRecapStore.controllerConnected(
+                    "${controller.packageName}:${controller.uid}",
+                    session.player.currentMediaItem,
+                    session.player.isPlaying
+                )
+                AndroidAutoWarmupManager.onCarConnected()
+            }
+        }
+
+        override fun onDisconnected(session: MediaSession, controller: MediaSession.ControllerInfo) {
+            ConnectionReliabilityManager.onDisconnected(controller.packageName, controller.uid)
+            if (controller.packageName == "com.google.android.projection.gearhead") {
+                DriveRecapStore.controllerDisconnected(
+                    "${controller.packageName}:${controller.uid}", session.player.isPlaying
+                )
+            }
+        }
+
         override fun onPlaybackResumption(
             mediaSession: MediaSession,
             controller: MediaSession.ControllerInfo
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
             bg("onPlaybackResumption controller=${controller.packageName}") {
+                ConnectionReliabilityManager.onQueueRestoreRequested(controller.packageName)
                 val player = mediaSession.player
                 if (player.mediaItemCount > 0 && player.currentMediaItem != null) {
                     val queue = (0 until player.mediaItemCount).map(player::getMediaItemAt)
+                    ConnectionReliabilityManager.onQueueRestoreReady(controller.packageName, queue.size)
                     MediaSession.MediaItemsWithStartPosition(
                         ImmutableList.copyOf(queue),
                         player.currentMediaItemIndex.coerceIn(0, queue.lastIndex),
@@ -2469,6 +2656,7 @@ class VybeMediaService : MediaLibraryService() {
                     val restored = SessionStore.load()
                     val items = restored?.items?.takeIf { it.isNotEmpty() }
                         ?: SessionStore.recentSongs().map { it.toMediaItem() }
+                    ConnectionReliabilityManager.onQueueRestoreReady(controller.packageName, items.size)
                     MediaSession.MediaItemsWithStartPosition(
                         ImmutableList.copyOf(items),
                         restored?.index?.coerceIn(0, items.lastIndex.coerceAtLeast(0)) ?: 0,
@@ -2530,16 +2718,13 @@ class VybeMediaService : MediaLibraryService() {
                         "energy=${moodProfile?.energy} tempo=${moodProfile?.tempo} discovery=${moodProfile?.discovery} " +
                         "familiarity=${moodProfile?.familiarity} focus=${moodProfile?.focus} emotion=${moodProfile?.emotion} " +
                         "androidAuto=${moodProfile?.androidAutoProfile}")
-                    val genre = ProfileEngine.load(prefs).favoriteGenres.firstOrNull()
-                    val hideExplicit = prefs.getBoolean("filter_mature_content", true)
-                    val candidates = YtRepo.searchSongs(moodDiscoveryQuery(suggestion.mood, genre))
-                        .filter { it.videoId.isNotBlank() && (!hideExplicit || !it.isExplicit) }
-                        .distinctBy { it.videoId }
-                    val songs = SmartMoodEngine.rankSongs(
-                        candidates,
-                        suggestion.mood,
-                        PlayedSongHistory.ids(),
-                        Favorites.songs().flatMap { listOf(it.id, it.videoId) }.toSet()
+                    val moodExcluded = MoodTrackFeedbackStore.hiddenIds(prefs, suggestion.mood)
+                    val songs = AndroidAutoMoodRecommendationAdapter.recommend(
+                        context = this@VybeMediaService,
+                        mood = suggestion.mood,
+                        profile = ProfileEngine.load(prefs),
+                        excludedIds = moodExcluded,
+                        localCandidates = localLibrarySongs()
                     )
                     val ready = validMediaItems("mood:auto", songs.map { song ->
                         val item = song.toMediaItem()
@@ -2562,8 +2747,8 @@ class VybeMediaService : MediaLibraryService() {
                             val player = mediaSession.player
                             PlaybackMetrics.onPlayerPrepare(ready.first().mediaId, "android_auto_mood")
                             player.setMediaItems(ready, 0, 0L)
-                            player.prepare()
                             player.play()
+                            player.prepare()
                             SessionStore.save(player)
                             Log.i(TAG, "Android Auto mood action started mood=${suggestion.mood} track=${ready.first().mediaId}")
                         } catch (error: Throwable) {
@@ -2610,6 +2795,7 @@ class VybeMediaService : MediaLibraryService() {
             params: LibraryParams?
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> =
             bg("onGetChildren controller=${browser.packageName} parent=$parentId") {
+                BrowsePreloadEngine.rememberOpened(this@VybeMediaService, parentId)
                 try {
                 // childrenFromCache returns normalized, validated items. Do not normalize
                 // the whole tree a second time inside the car callback.

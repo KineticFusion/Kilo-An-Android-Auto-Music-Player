@@ -3,6 +3,7 @@ package com.example.kilo
 import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
+import android.util.LruCache
 import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -10,8 +11,16 @@ import androidx.media3.common.MediaMetadata
 /** Validates Android Auto items while retaining KILO's existing Media3 stream route. */
 object AndroidAutoPlaybackBridge {
     private const val TAG = "KiloAutoBridge"
+    private const val BROWSE_VALIDATION_TTL_MS = 1_000L
+    private data class ValidatedBrowseItem(val item: MediaItem, val createdAtMs: Long)
+    private val validatedBrowseItems = object : LruCache<String, ValidatedBrowseItem>(128) {}
 
     fun validate(item: MediaItem, callback: String): MediaItem? {
+        val searchResult = SearchPlaybackCoordinator.adaptSearchItem(item, callback) ?: return null
+        return validateNormalized(searchResult, callback)
+    }
+
+    private fun validateNormalized(item: MediaItem, callback: String): MediaItem? {
         val id = item.mediaId.trim()
         if (id.isBlank()) {
             Log.w(TAG, "reject callback=$callback reason=empty_media_id")
@@ -23,6 +32,18 @@ object AndroidAutoPlaybackBridge {
         if (!playable && !browsable) {
             Log.w(TAG, "reject callback=$callback id=$id reason=not_playable_or_browsable")
             return null
+        }
+
+        // Car clients can request the same folder repeatedly while rendering a page.
+        // Reuse only short-lived, immutable folder normalization; playable items always
+        // pass through the normal validation path before reaching the existing player.
+        val browseCacheKey = if (browsable) browseFingerprint(item) else null
+        if (browseCacheKey != null) {
+            val cached = validatedBrowseItems.get(browseCacheKey)
+            if (cached != null && SystemClock.elapsedRealtime() - cached.createdAtMs <= BROWSE_VALIDATION_TTL_MS) {
+                return cached.item
+            }
+            if (cached != null) validatedBrowseItems.remove(browseCacheKey)
         }
 
         val sourceUri = item.localConfiguration?.uri
@@ -80,7 +101,29 @@ object AndroidAutoPlaybackBridge {
             ready.mediaMetadata.durationMs ?: -1L,
             "VALID"
         )
+        if (browseCacheKey != null) {
+            validatedBrowseItems.put(
+                browseCacheKey,
+                ValidatedBrowseItem(ready, SystemClock.elapsedRealtime())
+            )
+        }
         return ready
+    }
+
+    private fun browseFingerprint(item: MediaItem): String {
+        val metadata = item.mediaMetadata
+        return listOf(
+            item.mediaId,
+            item.localConfiguration?.uri?.toString().orEmpty(),
+            metadata.title?.toString().orEmpty(),
+            metadata.subtitle?.toString().orEmpty(),
+            metadata.artist?.toString().orEmpty(),
+            metadata.albumTitle?.toString().orEmpty(),
+            metadata.artworkUri?.toString().orEmpty(),
+            metadata.artworkData?.contentHashCode()?.toString().orEmpty(),
+            metadata.isBrowsable.toString(),
+            metadata.isPlayable.toString()
+        ).joinToString("\u001f")
     }
 
     /** Warm the resolver cache before handing the valid KILO URI to the existing player path. */
@@ -89,10 +132,9 @@ object AndroidAutoPlaybackBridge {
         if (ready.mediaMetadata.isPlayable != true) return ready
         val uri = ready.localConfiguration?.uri ?: return null
         if (uri.scheme != "vybe") return ready
+        AutoSearchDiagnostics.searchClick(ready.mediaId)
         val startedAt = SystemClock.elapsedRealtime()
-        val info = runCatching {
-            PlayerHolder.resolveForWarmup(context.applicationContext, ready.mediaId)
-        }.onFailure { Log.w(TAG, "pre-resolve failed id=" + ready.mediaId, it) }.getOrNull()
+        val info = PlaybackFallbackCoordinator.resolve(context.applicationContext, ready.mediaId)
         val elapsed = SystemClock.elapsedRealtime() - startedAt
         val status = if (info == null) "resolver_miss_using_existing_player_path" else "stream_ready"
         Log.i(TAG, "handoff id=" + ready.mediaId + " uri=$uri resolverMs=$elapsed status=$status")

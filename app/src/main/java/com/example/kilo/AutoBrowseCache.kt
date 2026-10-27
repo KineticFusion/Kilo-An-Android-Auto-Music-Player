@@ -12,10 +12,13 @@ import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
-import java.util.concurrent.ConcurrentHashMap
 import androidx.room.Transaction
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import android.os.SystemClock
+import com.example.kilo.androidauto.AndroidAutoCache
+import com.example.kilo.androidauto.AndroidAutoMetrics
+import com.example.kilo.androidauto.AndroidAutoRecoveryManager
 
 @Entity(
     tableName = "auto_browse_items",
@@ -76,20 +79,51 @@ abstract class AutoBrowseDatabase : RoomDatabase() {
 }
 
 object BrowseTreeCache {
-    private val children = ConcurrentHashMap<String, List<MediaItem>>()
-    fun get(parentId: String): List<MediaItem> = children[parentId].orEmpty()
+    fun get(parentId: String): List<MediaItem> = AndroidAutoCache.get(parentId)
     fun put(parentId: String, items: List<MediaItem>) {
-        if (items.isNotEmpty()) children[parentId] = items.toList()
+        AndroidAutoCache.put(parentId, items)
     }
-    fun invalidate(parentId: String) { children.remove(parentId) }
+    fun invalidate(parentId: String) { AndroidAutoCache.invalidate(parentId) }
+}
+
+/** Room exposes only Android Auto summary rows through this narrow data boundary. */
+private object AndroidAutoDatabaseView {
+    fun children(context: Context, parentId: String): List<AutoBrowseItemEntity> =
+        AutoBrowseDatabase.get(context).autoBrowseDao().children(parentId)
+
+    fun item(context: Context, mediaId: String): AutoBrowseItemEntity? =
+        AutoBrowseDatabase.get(context).autoBrowseDao().item(mediaId)
+
+    fun replaceChildren(context: Context, parentId: String, items: List<AutoBrowseItemEntity>) {
+        AutoBrowseDatabase.get(context).autoBrowseDao().replaceChildren(parentId, items)
+    }
 }
 
 object AutoBrowseCache {
-    fun read(context: Context, parentId: String): List<MediaItem> =
-        AutoBrowseDatabase.get(context).autoBrowseDao().children(parentId).map { it.toMediaItem() }
+    fun read(context: Context, parentId: String): List<MediaItem> {
+        val startedAt = SystemClock.elapsedRealtime()
+        var succeeded = false
+        var count = 0
+        return try {
+            AndroidAutoRecoveryManager.fallback("browse database parent=$parentId", emptyList()) {
+                AndroidAutoDatabaseView.children(context, parentId).map { it.toMediaItem() }
+            }.also { count = it.size; succeeded = true }
+        } finally {
+            AndroidAutoMetrics.recordDatabaseRead(SystemClock.elapsedRealtime() - startedAt, count, succeeded)
+        }
+    }
 
-    fun find(context: Context, mediaId: String): MediaItem? =
-        AutoBrowseDatabase.get(context).autoBrowseDao().item(mediaId)?.toMediaItem()
+    fun find(context: Context, mediaId: String): MediaItem? {
+        val startedAt = SystemClock.elapsedRealtime()
+        var succeeded = false
+        return try {
+            AndroidAutoRecoveryManager.fallback("browse item mediaId=$mediaId", null) {
+                AndroidAutoDatabaseView.item(context, mediaId)?.toMediaItem()
+            }.also { succeeded = true }
+        } finally {
+            AndroidAutoMetrics.recordDatabaseRead(SystemClock.elapsedRealtime() - startedAt, 1, succeeded)
+        }
+    }
 
     fun write(context: Context, parentId: String, items: List<MediaItem>) {
         val rows = items.mapIndexedNotNull { index, item ->
@@ -111,7 +145,7 @@ object AutoBrowseCache {
                 mediaType = item.mediaMetadata.mediaType ?: 0
             )
         }
-        AutoBrowseDatabase.get(context).autoBrowseDao().replaceChildren(parentId, rows)
+        AndroidAutoDatabaseView.replaceChildren(context, parentId, rows)
     }
 
     private fun AutoBrowseItemEntity.toMediaItem(): MediaItem {

@@ -1,0 +1,4 @@
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item><shape android:shape="rectangle"><size android:width="320dp" android:height="200dp"/><corners android:radius="24dp"/><gradient android:angle="45" android:startColor="#45185E" android:centerColor="#77328D" android:endColor="#284CA9"/></shape></item>
+    <item android:drawable="@drawable/ic_auto_playlists" android:gravity="center" android:width="100dp" android:height="100dp"/>
+</layer-list>

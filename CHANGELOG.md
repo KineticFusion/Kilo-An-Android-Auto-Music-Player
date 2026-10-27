@@ -1,3 +1,34 @@
+# KILO 2.8.0
+
+## What's new
+
+- Removed the experimental Spotify catalog browsing and sign-in screens.
+- Added regular public YouTube playlist search alongside YouTube Music community playlists and the connected user's saved playlists; selecting a playlist loads its tracks for playback.
+- Added a synced current-line strip to the full-screen player; tapping it opens the existing full lyrics tab. Android Auto receives the active line as session subtitle metadata.
+- Added a dedicated Artists destination, put followed artists first, and made moods, genres, and languages open their own matching song pages in Browse.
+- Added optional DJ mode. It uses KILO's existing AutoMix transitions and can order upcoming tracks when saved BPM, key, and energy analysis is available. Automatic track analysis is not currently active, so unscored tracks keep their existing order.
+- Added Search song recognition through AudD. The app shows a one-time disclosure before the Android microphone permission prompt, requests recording only after the user starts recognition, and encrypts the user-provided API token with Android Keystore.
+- Added Drive Recap for Android Auto sessions. Naturally completed songs are collected, skipped tracks are omitted, and the listener can name and save the recap as a Library playlist.
+- Added “Not for this mood” feedback to mood song pages. The choice is saved for that mood only and does not hide the song from other moods or globally.
+- Kept the original Media3 player, media session, Android Auto browse and playback, queue, downloads, and source resolver as the active playback architecture.
+
+---
+
+# KILO 2.7.2
+
+## What's new
+
+- Restored personal Home category filters, with Quick Picks and Recently Played available alongside the selected shelf.
+- Renamed the two discovery shelves to “Spotted, Not Started” and “First Encounters” so previously surfaced music is distinct from new finds.
+- Mood and genre cards in Browse open dedicated matching song lists instead of routing through Search filters.
+- Android Auto Home now includes the same personal discovery shelves before Quick Picks, and Library is focused on liked songs, playlists, and followed artists.
+- Added a single Set My Mood action and kept Trip Builder near the top of Home. Radio is now a bottom navigation tab.
+- Removed the automatic sign-in popup; sign-in is available from You, while Offline Vault remains accessible.
+- Improved playback recovery so normal track transitions aren’t mistaken for early stream endings, and failed streams resume automatically when playback was active.
+- Added a one-time update note for the Home and category navigation changes. It appears after setup and stays dismissed after acknowledgment.
+
+---
+
 # KILO 2.7.1 Hotfix
 
 ## What's fixed

@@ -369,13 +369,7 @@ object PlaybackPerformanceLayer {
     fun onPlayerState(context: Context, player: Player, state: Int, isPlaying: Boolean) {
         val currentId = player.currentMediaItem?.mediaId ?: return
         PlaybackMetrics.onPlaybackState(currentId, state, isPlaying)
-        if (!isPlaying || currentId.startsWith("radio:")) return
-        val count = player.mediaItemCount
-        if (count < 2) return
-        val ids = (1..minOf(4, count - 1))
-            .map { offset -> player.getMediaItemAt((player.currentMediaItemIndex + offset) % count).mediaId }
-            .filterNot { it.startsWith("radio:") }
-        QueuePreloader.enqueue(context, ids)
+        PlaybackReliabilityLayer.prefetchUpcoming(context, player, isPlaying)
     }
 }
 
@@ -394,6 +388,7 @@ object PlaybackWarmupManager {
         AudioCache.get(app)
         AutoBrowseDatabase.get(app)
         val player = PlayerHolder.get(app)
+        PlaybackReliabilityLayer.initialize(app, player)
         PlaybackMetrics.onPlayerReady()
         val playerItems = player.mediaItemCount
         val readyMs = SystemClock.elapsedRealtime() - processStartedAt

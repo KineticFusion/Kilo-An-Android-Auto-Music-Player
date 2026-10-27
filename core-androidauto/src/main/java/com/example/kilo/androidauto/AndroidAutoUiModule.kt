@@ -8,11 +8,11 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.net.Uri
 import android.os.Bundle
+import android.util.LruCache
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.session.MediaLibraryService
 import java.io.ByteArrayOutputStream
-import java.util.concurrent.ConcurrentHashMap
 
 /** Builds Android Auto browse cards and style hints without sharing phone UI components. */
 object AndroidAutoUiModule {
@@ -21,7 +21,10 @@ object AndroidAutoUiModule {
     const val STYLE_SUPPORTED = "android.media.browse.CONTENT_STYLE_SUPPORTED"
     const val BROWSABLE_HINT = "android.media.browse.CONTENT_STYLE_BROWSABLE_HINT"
     const val PLAYABLE_HINT = "android.media.browse.CONTENT_STYLE_PLAYABLE_HINT"
-    private val moodArtworkCache = ConcurrentHashMap<String, ByteArray>()
+    private const val MAX_MOOD_ARTWORK_BYTES = 1024 * 1024
+    private val moodArtworkCache = object : LruCache<String, ByteArray>(MAX_MOOD_ARTWORK_BYTES) {
+        override fun sizeOf(key: String, value: ByteArray): Int = value.size.coerceAtLeast(1)
+    }
     private val gridParentIds = setOf(
         "root", "tab_home", "tab_search", "tab_radio", "tab_library", "tab_browse", "journeys:home",
         "tab_moods", "tab_genres", "tab_profile_artists", "tab_albums", "tab_playlists"
@@ -48,32 +51,36 @@ object AndroidAutoUiModule {
         return MediaItem.Builder().setMediaId(id).setMediaMetadata(metadata.build()).build()
     }
 
-    fun moodArtworkData(mood: String): ByteArray = moodArtworkCache.getOrPut(mood.lowercase()) {
+    @Synchronized
+    fun moodArtworkData(mood: String): ByteArray {
+        val key = mood.lowercase()
+        moodArtworkCache.get(key)?.let { return it }
         val (start, end) = moodColors(mood)
-        val bitmap = Bitmap.createBitmap(320, 200, Bitmap.Config.ARGB_8888)
+        val bitmap = Bitmap.createBitmap(256, 160, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         val background = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            shader = LinearGradient(0f, 0f, 320f, 200f, start, end, Shader.TileMode.CLAMP)
+            shader = LinearGradient(0f, 0f, 256f, 160f, start, end, Shader.TileMode.CLAMP)
         }
-        canvas.drawRoundRect(RectF(0f, 0f, 320f, 200f), 28f, 28f, background)
+        canvas.drawRoundRect(RectF(0f, 0f, 256f, 160f), 28f, 28f, background)
         val shade = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x55070B16 }
-        canvas.drawRoundRect(RectF(0f, 0f, 320f, 200f), 28f, 28f, shade)
+        canvas.drawRoundRect(RectF(0f, 0f, 256f, 160f), 28f, 28f, shade)
         val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x55FFFFFF }
-        canvas.drawCircle(266f, 43f, 70f, glow)
+        canvas.drawCircle(213f, 34f, 56f, glow)
         val bars = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = 0xFFF8FAFF.toInt()
-            strokeWidth = 8f
+            strokeWidth = 7f
             strokeCap = Paint.Cap.ROUND
         }
         val heights = intArrayOf(28, 56, 82, 45, 68, 35, 58)
         heights.forEachIndexed { index, height ->
-            val x = 98f + index * 22f
-            canvas.drawLine(x, 142f - height / 2f, x, 142f + height / 2f, bars)
+            val x = 78f + index * 18f
+            val scaledHeight = height * 0.8f
+            canvas.drawLine(x, 114f - scaledHeight / 2f, x, 114f + scaledHeight / 2f, bars)
         }
         val output = ByteArrayOutputStream()
         bitmap.compress(Bitmap.CompressFormat.PNG, 90, output)
         bitmap.recycle()
-        output.toByteArray()
+        return output.toByteArray().also { moodArtworkCache.put(key, it) }
     }
 
     private fun moodColors(mood: String): Pair<Int, Int> = when (mood.lowercase()) {

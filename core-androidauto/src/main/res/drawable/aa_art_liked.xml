@@ -1,0 +1,4 @@
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item><shape android:shape="rectangle"><size android:width="320dp" android:height="200dp"/><corners android:radius="24dp"/><gradient android:angle="45" android:startColor="#691E56" android:centerColor="#AF3566" android:endColor="#E2646D"/></shape></item>
+    <item android:drawable="@drawable/ic_auto_liked" android:gravity="center" android:width="100dp" android:height="100dp"/>
+</layer-list>

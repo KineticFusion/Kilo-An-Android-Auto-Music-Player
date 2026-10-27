@@ -111,6 +111,13 @@ import com.example.kilo.companion.CompanionTrack
 import com.example.kilo.companion.ListeningEvent
 import com.example.kilo.journeys.JourneyEngine
 import com.example.kilo.journeys.JourneyPreview
+import com.example.kilo.mood.MoodCandidateSeed
+import com.example.kilo.mood.MoodRecommendationEngine
+import com.example.kilo.mood.MoodSessionContext
+import com.example.kilo.mood.SongFeatureExtractionPipeline
+import com.example.kilo.mood.TrackFeatureDatabase
+import com.example.kilo.mood.TrackFeatureInput
+import com.example.kilo.mood.isCollectionLikeResult
 import com.example.kilo.discoveryradar.DiscoveryRadar
 import com.example.kilo.discoveryradar.MoodRecommendationRanker
 import com.example.kilo.discoveryradar.RadarSection
@@ -124,6 +131,15 @@ import com.example.kilo.updates.UpdateCenter
 import com.example.kilo.updates.UpdateInstaller
 import com.example.kilo.search.SearchEnhancer
 import com.example.kilo.search.SearchAnalytics
+import com.example.kilo.audioanalysis.AudioAnalysisDatabaseProvider
+import com.example.kilo.audioanalysis.RecognitionHistoryEntity
+import com.example.kilo.djmode.DjModeController
+import com.example.kilo.djmode.DjModeSettings
+import com.example.kilo.djmode.DjTrack
+import com.example.kilo.songrecognition.AuddRecognitionProvider
+import com.example.kilo.songrecognition.AuddTokenStore
+import com.example.kilo.songrecognition.RecognizedSong
+import com.example.kilo.songrecognition.SongRecognitionManager
 import com.example.kilo.ui.components.KiloCard
 import com.example.kilo.ui.components.KiloAlbumCard
 import com.example.kilo.ui.components.KiloButton
@@ -162,6 +178,7 @@ import java.security.MessageDigest
 import java.util.Calendar
 import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executor
 import kotlin.system.exitProcess
 
 private class PlayedSongHistoryDb(context: Context) : SQLiteOpenHelper(context, "kilo_played_history.db", null, 4) {
@@ -420,6 +437,12 @@ private data class CompanionFeatureSnapshot(
     val capsules: List<TimeCapsule>
 )
 
+private data class SearchWorkResult(
+    val songs: List<SongItemClean>,
+    val playlists: List<SongItemClean>,
+    val artists: List<ArtistItem>
+)
+
 private const val PENDING_UPDATE_DOWNLOAD_ID = "pending_update_download_id"
 private const val PENDING_UPDATE_VERSION = "pending_update_version"
 private const val PENDING_UPDATE_SHA256 = "pending_update_sha256"
@@ -514,6 +537,34 @@ fun moodDiscoveryQuery(mood: String, genre: String? = null): String {
 }
 
 fun genreDiscoveryQuery(genre: String): String = "${genre.trim()} songs playlist mix"
+
+fun languageDiscoveryQuery(language: String): String = "${language.trim()} language songs music mix"
+
+/** Builds a small set of distinct mood searches so results come from the mood's sound, not its label alone. */
+fun moodDiscoveryQueries(
+    mood: String,
+    favoriteGenres: Collection<String> = emptyList(),
+    preferredArtists: Collection<String> = emptyList()
+): List<String> {
+    val profile = SmartMoodEngine.profile(mood)
+    val profileGenres = profile?.genres.orEmpty()
+    val favoriteGenreMatches = profileGenres.filter { profileGenre ->
+        favoriteGenres.any { it.equals(profileGenre, ignoreCase = true) }
+    }
+    val moodGenres = (favoriteGenreMatches + profileGenres + favoriteGenres)
+        .map(String::trim).filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }.take(3)
+    val base = buildList {
+        if (moodGenres.isNotEmpty()) add("${moodGenres.joinToString(" ")} songs music mix")
+        add("${mood.trim()} ${moodGenres.take(2).joinToString(" ")} songs mix")
+        if (profile == null) add(moodDiscoveryQuery(mood))
+        preferredArtists.asSequence().map(String::trim).filter(String::isNotBlank)
+            .distinctBy { it.lowercase(Locale.ROOT) }.take(2).forEach { artist ->
+                val genre = moodGenres.firstOrNull().orEmpty()
+                add(listOf(artist, genre, "songs").filter(String::isNotBlank).joinToString(" "))
+            }
+    }
+    return base.map(String::trim).filter(String::isNotBlank).distinct().take(5)
+}
 
 fun filterMoodTitleMatches(songs: List<SongItemClean>, mood: String): List<SongItemClean> {
     val moodKey = discoveryLabelKey(mood)
@@ -673,8 +724,11 @@ private fun primaryPanelColor(skin: SkinTheme): Color = when (skin.layoutFamily)
 
 enum class ScreenNav {
     HOME, EXPLORE, LIBRARY, SEARCH, YOU, OFFLINE, RADIO, SETTINGS, APPEARANCE, APP_APPEARANCE,
-    PLAYBACK_SETTINGS, ABOUT_UPDATES, ANDROID_AUTO_SETTINGS, PLAYER_STYLES, EQUALIZER, V2_ROADMAP, ARTIST_DETAIL
+    PLAYBACK_SETTINGS, ABOUT_UPDATES, ANDROID_AUTO_SETTINGS, PLAYER_STYLES, EQUALIZER, V2_ROADMAP,
+    BROWSE_CATEGORY, ARTISTS, ARTIST_DETAIL
 }
+
+enum class BrowseCategoryKind { MOOD, GENRE, LANGUAGE }
 
 enum class OverlayTab {
     NONE, QUEUE, LYRICS, CODEC_INFO
@@ -802,9 +856,11 @@ data class AppStateModel(
     val uiCustomizations: Map<String, Boolean> = UI_CUSTOMIZATION_OPTIONS.associate { it.key to it.enabledByDefault },
     val selectedPlayerStyleId: String = PLAYER_STYLE_PRESETS.first().id,
     val savedPlaylists: List<SavedPlaylist> = emptyList(),
+    val pendingDriveRecap: DriveRecapPending? = null,
     val youtubeMusicPlaylists: List<SongItemClean> = emptyList(),
     val isLoadingYoutubeMusicPlaylists: Boolean = false,
     val notRecommendedIds: Set<String> = emptySet(),
+    val notForCurrentMoodIds: Set<String> = emptySet(),
     val selectedAutoMenus: List<String> = listOf(
         "Quick picks",
         "Curated for you",
@@ -830,17 +886,29 @@ data class AppStateModel(
     val downloadsInProgress: Map<String, DownloadTaskState> = emptyMap(),
     val isScanningDownloads: Boolean = false,
     val homeShelves: List<HomeShelf> = emptyList(),
+    val browseCategoryTitle: String = "",
+    val browseCategoryKind: BrowseCategoryKind = BrowseCategoryKind.MOOD,
+    val browseCategorySongs: List<SongItemClean> = emptyList(),
+    val isLoadingBrowseCategory: Boolean = false,
     val searchQuery: String = "",
     val searchSuggestions: List<String> = emptyList(),
     val searchResults: List<SongItemClean> = emptyList(),
+    val isSearchingYouTubePlaylists: Boolean = false,
     val artistSearchResults: List<ArtistItem> = emptyList(),
+    val artistBrowseResults: List<ArtistItem> = emptyList(),
+    val isLoadingArtistBrowse: Boolean = false,
+    val isRecognizingSong: Boolean = false,
+    val recognitionResult: RecognizedSong? = null,
+    val recognitionMessage: String? = null,
+    val recognitionHistory: List<RecognitionHistoryEntity> = emptyList(),
     val activeArtist: ArtistItem? = null,
     val artistAlbums: List<SongItemClean> = emptyList(),
     val artistSongs: List<SongItemClean> = emptyList(),
     val selectedArtistAlbumTitle: String? = null,
     val musicRegionCode: String = "AUTO",
     val communityPlaylistResults: List<SongItemClean> = emptyList(),
-    val libraryTab: Int = 0,
+    val youtubeSearchPlaylistResults: List<SongItemClean> = emptyList(),
+    val libraryTab: Int = 1,
     val currentIndex: Int = 0,
     val isPlaying: Boolean = false,
     val isLoadingStream: Boolean = false,
@@ -856,6 +924,8 @@ data class AppStateModel(
     val currentDurationMs: Long = 215000L,
     val playbackSpeed: Float = 1f,
     val skipSilenceEnabled: Boolean = false,
+    val repeatCurrentTrack: Boolean = false,
+    val djModeEnabled: Boolean = false,
     val sleepTimerMinutes: Int? = null,
     val sleepTimerEndsAtMs: Long? = null,
     val sleepTimerTrackId: String? = null,
@@ -1126,14 +1196,14 @@ object dYtRepo {
             ?.optJSONObject("musicResponsiveListItemFlexColumnRenderer")?.optJSONObject("text")
 
         val title = runsText(col(0)).firstOrNull() ?: return null
-        var videoId = r.optJSONObject("playlistItemData")?.optString("videoId").orEmpty()
-        if (videoId.isEmpty()) {
-            videoId = r.optJSONObject("overlay")?.optJSONObject("musicItemThumbnailOverlayRenderer")
+        val videoId = sequenceOf(
+            r.optJSONObject("playlistItemData")?.optString("videoId"),
+            r.optJSONObject("overlay")?.optJSONObject("musicItemThumbnailOverlayRenderer")
                 ?.optJSONObject("content")?.optJSONObject("musicPlayButtonRenderer")
                 ?.optJSONObject("playNavigationEndpoint")?.optJSONObject("watchEndpoint")
-                ?.optString("videoId").orEmpty()
-        }
-        if (videoId.isEmpty()) return null
+                ?.optString("videoId"),
+            r.optJSONObject("navigationEndpoint")?.optJSONObject("watchEndpoint")?.optString("videoId")
+        ).filterNotNull().firstOrNull { it.isNotBlank() && it != "null" } ?: return null
 
         val meta = runsText(col(1)).joinToString("").split("•").map { it.trim() }
             .filter { it.isNotEmpty() && it != "Song" && it != "Video" }
@@ -1220,6 +1290,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _state = MutableStateFlow(AppStateModel())
     val state: StateFlow<AppStateModel> = _state.asStateFlow()
     private val preferences = application.getSharedPreferences("vybe_app_settings", Application.MODE_PRIVATE)
+
+    init {
+        application.getSharedPreferences("kilo_spotify_oauth", Application.MODE_PRIVATE)
+            .edit().clear().apply()
+    }
+
     private val equalizerController = EqualizerController(preferences)
     private val screenBackStack = ArrayDeque<ScreenNav>()
 
@@ -1227,8 +1303,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(favoriteIds = Favorites.ids())
         refreshCompanionFeatures()
     }
+    private val driveRecapPreferenceListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (key == "drive_recap_pending_v1" && prefs != null) {
+            _state.value = _state.value.copy(pendingDriveRecap = DriveRecapStore.pending(prefs))
+        }
+    }
 
     private var searchJob: Job? = null
+    private var youtubePlaylistSearchJob: Job? = null
     private var playJob: Job? = null
     private var radioRecordingJob: Job? = null
     private var videoJob: Job? = null
@@ -1245,6 +1327,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var companionFeatureGeneration = 0
     private var companionFeatureJob: Job? = null
     private var tripBuilderJob: Job? = null
+    private var browseCategoryJob: Job? = null
+    private var artistBrowseJob: Job? = null
+    private var djReorderJob: Job? = null
+    private var recognitionJob: Job? = null
+    private val djModeController = DjModeController()
+    private var browseCategoryGeneration = 0
     private var updateDownloadJob: Job? = null
     private val updateDownloader by lazy { UpdateDownloader(getApplication<Application>()) }
     private val earlyEndRetries = mutableSetOf<String>()
@@ -1272,7 +1360,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     "playWhenReady=${player.playWhenReady} isPlaying=${player.isPlaying}"
             )
             _state.value = _state.value.copy(
-                isLoadingStream = playbackState == Player.STATE_BUFFERING && player.playWhenReady,
+                // IDLE with playWhenReady means an automatic recovery is preparing,
+                // not that the listener asked to pause.
+                isLoadingStream = player.playWhenReady &&
+                    (playbackState == Player.STATE_BUFFERING || playbackState == Player.STATE_IDLE),
                 isPlaying = player.isPlaying
             )
             if (playbackState == Player.STATE_ENDED) {
@@ -1309,10 +1400,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             val id = mediaItem?.mediaId ?: return
+            PlayerHolder.setAnalysisMediaId(id)
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
                 val previousSong = _state.value.activeSong
                 val expectedMs = previousSong.durationMs
-                val currentPositionMs = _state.value.currentPosMs
+                // currentPosMs is presentation state and may lag behind Media3 during
+                // a natural transition. The service samples the live playhead while
+                // audio is advancing; use it here so a full-length track is not
+                // mistaken for an early stream end and reloaded from the beginning.
+                val currentPositionMs = PlayerHolder.lastPlaybackPosition(
+                    previousSong.videoId.ifBlank { previousSong.id }
+                )
                 val observedDurationMs = _state.value.currentDurationMs.takeIf { it > 90_000L } ?: expectedMs
                 val catalogLooksEarly = currentPositionMs < expectedMs * 0.75f
                 val playerDurationLooksEarly = currentPositionMs < observedDurationMs * 0.75f
@@ -1449,6 +1547,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         Favorites.init(application)
         Favorites.addListener(favoriteListener)
         SessionStore.init(application)
+        DriveRecapStore.init(application)
+        preferences.registerOnSharedPreferenceChangeListener(driveRecapPreferenceListener)
         FastStream.warmUp()
         player.addListener(playbackListener)
         PlaybackSleepTimer.attach(player)
@@ -1479,12 +1579,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             accountsList = loadAccounts(),
             activeAccountId = preferences.getString("active_account_id", "1") ?: "1",
             savedPlaylists = loadSavedPlaylists(),
+            pendingDriveRecap = DriveRecapStore.pending(preferences),
             favoriteIds = Favorites.ids(),
             radioFavorites = RadioStationStore.load(application, "radio_favorites"),
             radioRecentStations = RadioStationStore.load(application, "radio_recent_stations"),
             customRadioStations = RadioStationStore.load(application, "radio_custom_stations"),
             lastRadioStation = RadioStationStore.loadLast(application),
             notRecommendedIds = preferences.getStringSet("not_recommended_ids", emptySet())?.toSet() ?: emptySet(),
+            notForCurrentMoodIds = MoodTrackFeedbackStore.hiddenIds(
+                preferences, preferences.getString("discovery_mood", "Discover") ?: "Discover"
+            ),
             activeSkin = SkinTheme.values().getOrElse(preferences.getInt("active_skin", 0)) { SkinTheme.SUNSET_GLASS },
             displayName = preferences.getString("display_name", "Arnav") ?: "Arnav",
             autoMixEnabled = preferences.getBoolean("auto_mix_enabled", false),
@@ -1494,6 +1598,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             pauseForCalls = preferences.getBoolean("pause_for_calls", true),
             playbackSpeed = preferences.getFloat("playback_speed", 1f).coerceIn(0.5f, 2f),
             skipSilenceEnabled = preferences.getBoolean("skip_silence_enabled", false),
+            repeatCurrentTrack = preferences.getBoolean("repeat_current_track", false),
+            djModeEnabled = preferences.getBoolean("dj_mode_enabled", false),
             sleepTimerMinutes = PlaybackSleepTimer.state.value.minutes,
             sleepTimerEndsAtMs = PlaybackSleepTimer.state.value.endsAtElapsedRealtimeMs,
             sleepTimerTrackId = PlaybackSleepTimer.state.value.afterTrackMediaId,
@@ -1502,12 +1608,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             losslessSourceUrl = LosslessSource.root(application),
             losslessSourceEnabled = LosslessSource.isEnabled(application),
             losslessSourceHasToken = LosslessSource.hasToken(application),
-            losslessSourceStatus = preferences.getString("lossless_source_status", "Optional: connect a compatible FLAC source") ?: "Optional: connect a compatible FLAC source"
+            losslessSourceStatus = preferences.getString("lossless_source_status", "Optional: connect a compatible FLAC source") ?: "Optional: connect a compatible FLAC source",
         )
         runCatching { player.setPlaybackSpeed(_state.value.playbackSpeed) }
             .onFailure { Log.w("VybeVM", "Could not restore playback speed", it) }
         runCatching { player.setSkipSilenceEnabled(_state.value.skipSilenceEnabled) }
             .onFailure { Log.w("VybeVM", "Could not restore silence skipping", it) }
+        PlayerHolder.setDjAnalysisEnabled(_state.value.djModeEnabled)
+        PlayerHolder.setAnalysisMediaId(player.currentMediaItem?.mediaId.orEmpty())
+        PlayerHolder.setAnalysisResultListener {
+            if (_state.value.djModeEnabled) reorderDjQueueFromAnalysis()
+        }
         viewModelScope.launch {
             PlaybackSleepTimer.state.collect { timer ->
                 _state.value = _state.value.copy(
@@ -1702,28 +1813,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val selectedDiscovery = selectedValue.takeUnless { it.equals("Discover", ignoreCase = true) }
             val activeMood = if (selectedDiscovery != null) selectedDiscovery.takeIf { it in PERSONALIZATION_MOODS }
                 else if (selectedValue.equals("Discover", ignoreCase = true)) null else profile.favoriteMoods.firstOrNull()
+            val moodSpecificExclusions = activeMood?.let { MoodTrackFeedbackStore.hiddenIds(preferences, it) }.orEmpty()
             val activeGenre = if (selectedDiscovery != null) selectedDiscovery.takeIf { it in PERSONALIZATION_GENRES }
                 else if (selectedValue.equals("Discover", ignoreCase = true)) null else profile.favoriteGenres.firstOrNull()
-            val recommendationQuery = when {
-                activeMood != null -> "${moodDiscoveryQuery(activeMood, activeGenre)} recommendations"
-                activeGenre != null -> "${genreDiscoveryQuery(activeGenre)} recommendations"
-                baseInterests.isNotEmpty() -> "songs like ${baseInterests[(launchNumber - 1) % baseInterests.size]}"
-                else -> discoveryThemes[(launchNumber - 1) % discoveryThemes.size]
+            val moodSeeds = activeMood?.let { mood ->
+                MoodRecommendationEngine.candidateSeeds(
+                    mood = mood,
+                    favoriteGenres = profile.favoriteGenres,
+                    preferredArtists = baseInterests,
+                    preferredLanguages = profile.favoriteLanguages,
+                    limit = 6
+                )
+            }.orEmpty()
+            val moodQueries = moodSeeds.map { it.query }
+            val recommendationQueries = when {
+                activeMood != null -> moodQueries.take(3)
+                activeGenre != null -> listOf("${genreDiscoveryQuery(activeGenre)} recommendations")
+                baseInterests.isNotEmpty() -> listOf("songs like ${baseInterests[(launchNumber - 1) % baseInterests.size]}")
+                else -> listOf(discoveryThemes[(launchNumber - 1) % discoveryThemes.size])
             }
-            val freshThemes = listOf(
-                "new music releases",
-                "new indie artists",
-                "fresh alternative songs",
-                "new electronic music",
-                "rising pop songs",
-                "underground R&B discoveries",
-                "new regional music",
-                "emerging artists"
-            )
-            val freshQuery = when {
-                activeMood != null -> "new ${moodDiscoveryQuery(activeMood, activeGenre)}"
-                activeGenre != null -> "new ${genreDiscoveryQuery(activeGenre)}"
-                else -> freshThemes[(launchNumber - 1) % freshThemes.size]
+            val freshThemes = listOf("new music releases", "new indie artists", "fresh alternative songs", "new electronic music", "rising pop songs", "underground R&B discoveries", "new regional music", "emerging artists")
+            val freshQueries = when {
+                activeMood != null -> moodQueries.drop(3).take(3).ifEmpty { moodQueries.takeLast(2) }
+                activeGenre != null -> listOf("new ${genreDiscoveryQuery(activeGenre)}")
+                else -> listOf(freshThemes[(launchNumber - 1) % freshThemes.size])
             }
             val hasPersonalizedInterest = baseInterests.isNotEmpty() || selectedDiscovery != null ||
                 profile.favoriteMoods.isNotEmpty() || profile.favoriteGenres.isNotEmpty()
@@ -1736,17 +1849,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val completeTask = async(Dispatchers.IO) { PlayedSongHistory.isHomeCatalogComplete() }
                 val similarTask = async(Dispatchers.IO) {
                     if (!hasPersonalizedInterest) emptyList() else {
-                        YtRepo.searchSongs(recommendationQuery).let { results ->
-                            val moodFiltered = activeMood?.let { filterMoodTitleMatches(results, it) } ?: results
-                            activeGenre?.let { filterGenreTitleMatches(moodFiltered, it) } ?: moodFiltered
+                        val queryResults = coroutineScope {
+                            recommendationQueries.map { query ->
+                                async(Dispatchers.IO) {
+                                    query to runCatching { YtRepo.searchSongs(query) }.getOrDefault(emptyList())
+                                }
+                            }.awaitAll()
                         }
+                        activeGenre?.let { genre ->
+                            queryResults.map { (query, results) -> query to filterGenreTitleMatches(results, genre) }
+                        } ?: queryResults
                     }
                 }
                 val freshTask = async(Dispatchers.IO) {
-                    YtRepo.searchSongs(freshQuery).let { results ->
-                        val moodFiltered = activeMood?.let { filterMoodTitleMatches(results, it) } ?: results
-                        activeGenre?.let { filterGenreTitleMatches(moodFiltered, it) } ?: moodFiltered
+                    val queryResults = coroutineScope {
+                        freshQueries.map { query ->
+                            async(Dispatchers.IO) {
+                                query to runCatching { YtRepo.searchSongs(query) }.getOrDefault(emptyList())
+                            }
+                        }.awaitAll()
                     }
+                    activeGenre?.let { genre ->
+                        queryResults.map { (query, results) -> query to filterGenreTitleMatches(results, genre) }
+                    } ?: queryResults
                 }
                 Triple(
                     homeTask.await(),
@@ -1761,11 +1886,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val discoveredBefore = historyState.second
             val dormantDiscovered = historyState.third
             val alreadyComplete = loadResult.second.second
-            val rawSimilarResults = loadResult.third.first
-            val rawFreshResults = loadResult.third.second
+            val similarSearchResults = loadResult.third.first
+            val freshSearchResults = loadResult.third.second
+            val rawSimilarResults = similarSearchResults.flatMap { it.second }
+            val rawFreshResults = freshSearchResults.flatMap { it.second }
+            val retrievalGenres = moodCandidateGenreHints(similarSearchResults + freshSearchResults, moodSeeds)
             val recommendationMood = activeMood ?: activeGenre ?: profile.favoriteMoods.firstOrNull() ?: "Discover"
             val recommendationState = _state.value
-            val (similarResults, freshResults) = withContext(Dispatchers.Default) {
+            val (similarResults, freshResults) = if (activeMood != null) {
+                val likedSongs = withContext(Dispatchers.IO) { Favorites.songs() }
+                val moodOrdered = rankMoodSongs(
+                    (rawSimilarResults + rawFreshResults).distinctBy { it.videoId.ifBlank { it.id } },
+                    activeMood, recommendationState, recentEvents, likedSongs, retrievalGenres
+                )
+                val positions = moodOrdered.mapIndexed { index, song -> song.id to index }.toMap()
+                fun orderByMood(candidates: List<SongItemClean>) = candidates.withIndex()
+                    .sortedWith(compareBy<IndexedValue<SongItemClean>> { positions[it.value.id] ?: Int.MAX_VALUE }.thenBy { it.index })
+                    .map { it.value }
+                orderByMood(rawSimilarResults) to orderByMood(rawFreshResults)
+            } else withContext(Dispatchers.Default) {
                 val recommendationProfile = CompanionFeatureAdapter.profile(
                     profile,
                     recommendationState.favoriteIds,
@@ -1791,7 +1930,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 .map { it.trackId }
                 .filter(String::isNotBlank)
                 .toSet()
-            val blockedIds = playedBefore + _state.value.notRecommendedIds + recentSkippedIds
+            val blockedIds = playedBefore + _state.value.notRecommendedIds + recentSkippedIds + moodSpecificExclusions
             fun acceptable(song: SongItemClean) = song.videoId.isNotBlank() && song.id !in blockedIds &&
                 (!_state.value.filterMatureContent || !song.isExplicit)
 
@@ -1831,8 +1970,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     similarSongs,
                     false
                 ))
-                if (discoveredSongs.isNotEmpty()) add(HomeShelf("Discovered, not played", discoveredSongs, false))
-                if (freshSongs.isNotEmpty()) add(HomeShelf("Fresh discoveries", freshSongs, false))
+                if (discoveredSongs.isNotEmpty()) add(HomeShelf("Spotted, Not Started", discoveredSongs, false))
+                if (freshSongs.isNotEmpty()) add(HomeShelf("First Encounters", freshSongs, false))
                 if (isEmpty() && alreadyComplete) {
                     // Familiar tracks are a failsafe only after a complete Home catalog scan.
                     val familiar = (SessionStore.recentSongs() + Favorites.songs())
@@ -1895,11 +2034,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 fetched.shelves.forEach { sourceShelf ->
                     val sourceTitle = sourceShelf.title.trim()
                     val sourceKey = sourceTitle.lowercase(Locale.ROOT)
+                    val isRotationShelf = sourceKey.contains("listen again") || sourceKey.contains("recent")
                     if (sourceTitle.isBlank() || sourceKey in shelves.map { it.title.lowercase(Locale.ROOT) } ||
-                        sourceKey.contains("discovered, not played")
+                        sourceKey.contains("discovered, not played") || sourceKey.contains("on the radar")
                     ) return@forEach
                     val songs = sourceShelf.songs.asSequence()
-                        .filter { song -> song.videoId.isNotBlank() || song.playlistId.isNotBlank() || song.albumBrowseId.isNotBlank() || song.isDownloaded }
+                        // A rotation row is a song shelf: don't present album or
+                        // playlist cards there as if they were directly playable tracks.
+                        .filter { song ->
+                            if (isRotationShelf) song.videoId.isNotBlank()
+                            else song.videoId.isNotBlank() || song.playlistId.isNotBlank() ||
+                                song.albumBrowseId.isNotBlank() || song.isDownloaded
+                        }
                         .filter { song -> song.id !in _state.value.notRecommendedIds }
                         .filter { song -> !_state.value.filterMatureContent || !song.isExplicit }
                         .distinctBy { it.id }
@@ -1919,8 +2065,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 addAll(additionalHomeShelves)
             }.distinctBy { it.title.trim().lowercase(Locale.ROOT) }
             val similarShelfSongs = shelves.firstOrNull { it.title.startsWith("For your ") || it.title == "Similar to your favorites" }?.songs.orEmpty()
-            val discoveredShelfSongs = shelves.firstOrNull { it.title == "Discovered, not played" }?.songs.orEmpty()
-            val freshShelfSongs = shelves.firstOrNull { it.title == "Fresh discoveries" }?.songs.orEmpty()
+            val discoveredShelfSongs = shelves.firstOrNull { it.title == "Spotted, Not Started" }?.songs.orEmpty()
+            val freshShelfSongs = shelves.firstOrNull { it.title == "First Encounters" }?.songs.orEmpty()
             withContext(Dispatchers.IO) {
                 if (fetched.complete) PlayedSongHistory.markHomeCatalogComplete()
                 PlayedSongHistory.markDiscovered(homeSongs, "home_catalog")
@@ -2022,39 +2168,56 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun onSearchQueryChanged(query: String) {
         val cleanQuery = query.trim()
         val suggestions = if (cleanQuery.isBlank()) SearchAnalytics.recentSearches() else SearchEnhancer.suggestions(cleanQuery)
-        _state.value = _state.value.copy(searchQuery = query, searchSuggestions = suggestions.take(6))
+        _state.value = _state.value.copy(
+            searchQuery = query,
+            searchSuggestions = suggestions.take(6),
+            searchResults = emptyList(),
+            communityPlaylistResults = emptyList(),
+            youtubeSearchPlaylistResults = emptyList(),
+            artistSearchResults = emptyList(),
+            isSearchingYouTubePlaylists = cleanQuery.isNotBlank(),
+            isSearching = cleanQuery.isNotBlank()
+        )
         searchJob?.cancel()
+        youtubePlaylistSearchJob?.cancel()
         if (cleanQuery.isBlank()) {
-            _state.value = _state.value.copy(
-                searchResults = emptyList(), communityPlaylistResults = emptyList(), artistSearchResults = emptyList(), isSearching = false
-            )
+            _state.value = _state.value.copy(isSearching = false)
             return
         }
         searchJob = viewModelScope.launch {
             delay(250)
-            _state.value = _state.value.copy(isSearching = true)
-            val (results, playlists, artists) = coroutineScope {
+            youtubePlaylistSearchJob = viewModelScope.launch(Dispatchers.IO) {
+                val youtubePlaylists = runCatching { YtRepo.searchYouTubePlaylists(cleanQuery) }.getOrDefault(emptyList())
+                withContext(Dispatchers.Main.immediate) {
+                    if (_state.value.searchQuery.trim() == cleanQuery) {
+                        _state.value = _state.value.copy(
+                            youtubeSearchPlaylistResults = youtubePlaylists,
+                            isSearchingYouTubePlaylists = false
+                        )
+                    }
+                }
+            }
+            val results = coroutineScope {
                 val songsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchSongs(cleanQuery) }.getOrDefault(emptyList()) }
                 val playlistsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchCommunityPlaylists(cleanQuery) }.getOrDefault(emptyList()) }
                 val artistsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchArtists(cleanQuery) }.getOrDefault(emptyList()) }
-                Triple(songsRequest.await(), playlistsRequest.await(), artistsRequest.await())
+                SearchWorkResult(songsRequest.await(), playlistsRequest.await(), artistsRequest.await())
             }
             if (_state.value.searchQuery.trim() != cleanQuery) return@launch
-            val visibleResults = results.filter { !_state.value.filterMatureContent || !it.isExplicit }
+            val visibleResults = results.songs.filter { !_state.value.filterMatureContent || !it.isExplicit }
             _state.value = _state.value.copy(
                 searchResults = visibleResults,
-                communityPlaylistResults = playlists,
-                artistSearchResults = artists,
+                communityPlaylistResults = results.playlists,
+                artistSearchResults = results.artists,
                 isSearching = false
             )
             SearchAnalytics.record(cleanQuery)
-            results.take(3).forEach { song ->
+            visibleResults.take(3).forEach { song ->
                 LosslessSource.register(song)
                 song.videoId.takeIf(String::isNotBlank)?.let(::prefetchStream)
             }
 
-            // Run the enhancement after production results are visible. The existing
-            // result set stays first and remains available if any supplemental query fails.
+            // Keep the production results visible while supplemental searches finish.
             val queryVariants = SearchEnhancer.supplementalQueries(cleanQuery, visibleResults.map { it.title }).take(2)
             if (queryVariants.isNotEmpty()) {
                 val supplemental = coroutineScope {
@@ -2192,6 +2355,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val idx = (index + list.size) % list.size
         val song = list[idx]
         val metricTrackId = song.videoId.ifBlank { song.id }
+        PlayerHolder.setAnalysisMediaId(metricTrackId)
         val profilerSource = selectionSource ?: when {
             _state.value.currentScreen == ScreenNav.SEARCH -> "phone_search"
             _state.value.currentScreen == ScreenNav.ARTIST_DETAIL && _state.value.selectedArtistAlbumTitle != null -> "phone_album"
@@ -2270,6 +2434,9 @@ _state.value = _state.value.copy(
                 } else {
                     player.volume = 1f
                 }
+                // Set the play intent before preparation so the first READY state
+                // starts audio immediately, including on a cold resolver path.
+                if (autoPlay) player.play()
                 PlaybackMetrics.onPlayerPrepare(metricTrackId, "phone_track_load")
                 val prepareStartedAt = SystemClock.elapsedRealtime()
                 player.prepare()
@@ -2277,7 +2444,6 @@ _state.value = _state.value.copy(
                     metricTrackId,
                     SystemClock.elapsedRealtime() - prepareStartedAt
                 )
-                if (autoPlay) player.play()
                 (LosslessSource.peek(song.videoId) ?: FastStream.peek(song.videoId))?.let { info ->
                     val updated = _state.value.playlist.map { if (it.id == song.id) it.copy(codecInfo = info.codec) else it }
                     _state.value = _state.value.copy(playlist = updated)
@@ -2525,10 +2691,318 @@ _state.value = _state.value.copy(
             if (account.id == _state.value.activeAccountId) account.copy(favoriteGenre = mood) else account
         }
         persistAccounts(accounts, _state.value.activeAccountId)
-        _state.value = _state.value.copy(selectedMood = mood, accountsList = accounts)
+        _state.value = _state.value.copy(
+            selectedMood = mood,
+            accountsList = accounts,
+            notForCurrentMoodIds = MoodTrackFeedbackStore.hiddenIds(preferences, mood)
+        )
         if (refreshHome) loadHome()
     }
 
+    fun openBrowseCategory(title: String, kind: BrowseCategoryKind) {
+        val category = title.trim().take(64)
+        if (category.isBlank()) return
+        browseCategoryJob?.cancel()
+        val generation = ++browseCategoryGeneration
+        if (kind == BrowseCategoryKind.MOOD) setDiscoveryMood(category, refreshHome = false)
+        setScreen(ScreenNav.BROWSE_CATEGORY)
+        _state.value = _state.value.copy(
+            browseCategoryTitle = category,
+            browseCategoryKind = kind,
+            browseCategorySongs = emptyList(),
+            isLoadingBrowseCategory = true
+        )
+        browseCategoryJob = viewModelScope.launch {
+            val snapshot = _state.value
+            val results = try {
+                val signals = withContext(Dispatchers.IO) {
+                    Triple(
+                        Favorites.songs(),
+                        (snapshot.listenerProfile.followedArtists + PlayedSongHistory.recommendationArtists())
+                            .filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) },
+                        PlayedSongHistory.listeningEvents(500)
+                    )
+                }
+                val likedSongs = signals.first
+                val preferredArtists = (signals.second + likedSongs.map { it.artist })
+                    .filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }
+                val moodSeeds = if (kind == BrowseCategoryKind.MOOD) {
+                    MoodRecommendationEngine.candidateSeeds(
+                        mood = category,
+                        favoriteGenres = snapshot.listenerProfile.favoriteGenres,
+                        preferredArtists = preferredArtists,
+                        preferredLanguages = snapshot.listenerProfile.favoriteLanguages,
+                        limit = 5
+                    )
+                } else emptyList()
+                val queries = when (kind) {
+                    BrowseCategoryKind.MOOD -> moodSeeds.map { it.query }
+                    BrowseCategoryKind.GENRE -> listOf(genreDiscoveryQuery(category), "$category artists songs")
+                    BrowseCategoryKind.LANGUAGE -> listOf(languageDiscoveryQuery(category), "$category hits songs")
+                }
+                val queryResults = withContext(Dispatchers.IO) {
+                    coroutineScope {
+                        queries.map { query ->
+                            async(Dispatchers.IO) {
+                                query to runCatching { YtRepo.searchSongs(query) }.getOrDefault(emptyList())
+                            }
+                        }.awaitAll()
+                    }
+                }
+                val candidates = queryResults.flatMap { it.second }.distinctBy { it.videoId.ifBlank { it.id } }
+                val retrievalGenres = moodCandidateGenreHints(queryResults, moodSeeds)
+                val moodScopedExcludedIds = if (kind == BrowseCategoryKind.MOOD) {
+                    snapshot.notForCurrentMoodIds + MoodTrackFeedbackStore.hiddenIds(preferences, category)
+                } else emptySet()
+                val visible = candidates
+                    .filter { !snapshot.filterMatureContent || !it.isExplicit }
+                    .filter { it.id !in snapshot.notRecommendedIds && it.videoId !in snapshot.notRecommendedIds }
+                    .filter { it.id !in moodScopedExcludedIds && it.videoId !in moodScopedExcludedIds }
+                if (visible.isEmpty()) emptyList() else {
+                    val likedIds = snapshot.favoriteIds + likedSongs.flatMap { listOf(it.id, it.videoId) }
+                    val downloadedIds = snapshot.downloadedSongs.mapTo(mutableSetOf()) { it.id }
+                    val recommendationProfile = CompanionFeatureAdapter.profile(
+                        snapshot.listenerProfile, likedIds, downloadedIds
+                    ).copy(excludedTrackIds = snapshot.notRecommendedIds + moodScopedExcludedIds)
+                    val events = signals.third
+                    val learnedOrder = if (kind == BrowseCategoryKind.MOOD) emptyMap() else withContext(Dispatchers.Default) {
+                        val tracks = CompanionFeatureAdapter.tracks(visible, events, likedIds, downloadedIds)
+                        MoodRecommendationRanker.rank(tracks, category, recommendationProfile, events, tracks.size)
+                            .mapIndexed { index, track -> track.id to index }.toMap()
+                    }
+                    when (kind) {
+                        BrowseCategoryKind.MOOD -> rankMoodSongs(
+                            visible, category, snapshot, events, likedSongs, retrievalGenres
+                        )
+                        BrowseCategoryKind.GENRE -> visible.sortedBy { song ->
+                            (learnedOrder[song.id] ?: Int.MAX_VALUE / 2) +
+                                if (song.title.contains(category, ignoreCase = true) || song.artist.contains(category, ignoreCase = true)) -visible.size else 0
+                        }
+                        BrowseCategoryKind.LANGUAGE -> visible.sortedBy { song ->
+                            val languageMatch = CompanionFeatureAdapter.languageOf(song.title).equals(category, ignoreCase = true)
+                            (learnedOrder[song.id] ?: Int.MAX_VALUE / 2) + if (languageMatch) -visible.size else 0
+                        }
+                    }
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                Log.w("VybeVM", "Browse category search failed for $category", error)
+                emptyList()
+            }
+            if (generation != browseCategoryGeneration) return@launch
+            if (generation == browseCategoryGeneration) {
+                _state.value = _state.value.copy(
+                    browseCategorySongs = results,
+                    isLoadingBrowseCategory = false
+                )
+            }
+        }
+    }
+
+    fun searchArtistsForBrowse(query: String) {
+        val cleanQuery = query.trim().take(96)
+        artistBrowseJob?.cancel()
+        _state.value = _state.value.copy(isLoadingArtistBrowse = true)
+        artistBrowseJob = viewModelScope.launch {
+            val effectiveQuery = cleanQuery.ifBlank {
+                val profile = _state.value.listenerProfile
+                val preferred = profile.favoriteGenres.firstOrNull() ?: profile.favoriteLanguages.firstOrNull()
+                if (preferred.isNullOrBlank()) "popular music artists" else "$preferred music artists"
+            }
+            val results = withContext(Dispatchers.IO) {
+                runCatching { YtRepo.searchArtists(effectiveQuery) }
+                    .onFailure { Log.w("VybeVM", "Artist browse search failed", it) }
+                    .getOrDefault(emptyList())
+            }
+            _state.value = _state.value.copy(artistBrowseResults = results, isLoadingArtistBrowse = false)
+        }
+    }
+
+    fun saveRecognitionToken(token: String): Boolean = runCatching {
+        AuddTokenStore(getApplication<Application>()).save(token)
+    }.isSuccess
+
+    fun loadRecognitionHistory() {
+        viewModelScope.launch {
+            val recent = withContext(Dispatchers.IO) {
+                runCatching { AudioAnalysisDatabaseProvider.get(getApplication()).recognitionHistoryDao().recent(10) }
+                    .getOrDefault(emptyList())
+            }
+            _state.value = _state.value.copy(recognitionHistory = recent)
+        }
+    }
+
+    fun recognizeSong() {
+        val app = getApplication<Application>()
+        val token = AuddTokenStore(app).read()
+        if (token.isNullOrBlank()) {
+            _state.value = _state.value.copy(recognitionMessage = "Enter an AudD API token to use song recognition.")
+            return
+        }
+        recognitionJob?.cancel()
+        _state.value = _state.value.copy(isRecognizingSong = true, recognitionMessage = "Listening for a few seconds…", recognitionResult = null)
+        recognitionJob = viewModelScope.launch {
+            try {
+                val (result, recentHistory) = withContext(Dispatchers.IO) {
+                    val database = AudioAnalysisDatabaseProvider.get(app)
+                    val historyDao = database.recognitionHistoryDao()
+                    val match = SongRecognitionManager(app, historyDao, AuddRecognitionProvider(token))
+                        .recognize(Executor { command -> command.run() }, sampleSeconds = 5).get()
+                    match to historyDao.recent(10)
+                }
+                _state.value = _state.value.copy(
+                    isRecognizingSong = false,
+                    recognitionResult = result,
+                    recognitionHistory = recentHistory,
+                    recognitionMessage = if (result == null) "No match found. Try again with the music closer to your phone." else "Identified"
+                )
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                val message = error.cause?.message ?: error.message ?: "Song recognition failed."
+                _state.value = _state.value.copy(isRecognizingSong = false, recognitionMessage = message)
+                Log.w("SongRecognition", "Recognition request failed", error)
+            }
+        }
+    }
+
+    fun clearRecognitionMessage() { _state.value = _state.value.copy(recognitionMessage = null) }
+
+    fun searchRecognizedSong() {
+        val result = _state.value.recognitionResult ?: return
+        val query = "${result.title} ${result.artist}".trim()
+        setScreen(ScreenNav.SEARCH)
+        onSearchQueryChanged(query)
+    }
+
+    fun playRecognizedSongNow() {
+        val result = _state.value.recognitionResult ?: return
+        viewModelScope.launch {
+            val matches = withContext(Dispatchers.IO) {
+                runCatching { YtRepo.searchSongs("${result.title} ${result.artist}") }.getOrDefault(emptyList())
+            }
+            val playable = matches.filter { it.videoId.isNotBlank() }
+            if (playable.isEmpty()) {
+                Toast.makeText(getApplication(), "KILO could not find a playable match.", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            _state.value = _state.value.copy(playlist = playable, currentIndex = 0, currentScreen = ScreenNav.HOME)
+            loadTrack(0, autoPlay = true, selectionSource = "song_recognition")
+        }
+    }
+
+    fun queueRecognizedSongNext() {
+        val result = _state.value.recognitionResult ?: return
+        viewModelScope.launch {
+            val song = withContext(Dispatchers.IO) {
+                runCatching { YtRepo.searchSongs("${result.title} ${result.artist}").firstOrNull { it.videoId.isNotBlank() } }.getOrNull()
+            } ?: run {
+                Toast.makeText(getApplication(), "KILO could not find a playable match.", Toast.LENGTH_SHORT).show()
+                return@launch
+            }
+            val current = _state.value
+            val insertAt = (current.currentIndex + 1).coerceIn(0, current.playlist.size)
+            val updated = current.playlist.toMutableList().apply { add(insertAt, song) }
+            if (player.mediaItemCount == current.playlist.size && player.mediaItemCount > 0) {
+                player.addMediaItem(insertAt, song.toMediaItem())
+            }
+            _state.value = _state.value.copy(playlist = updated)
+            Toast.makeText(getApplication(), "Added to play next.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private suspend fun rankMoodSongs(
+        candidates: List<SongItemClean>,
+        mood: String,
+        snapshot: AppStateModel,
+        events: List<ListeningEvent>,
+        likedSongs: List<SongItemClean> = emptyList(),
+        retrievalGenresByTrack: Map<String, Set<String>> = emptyMap()
+    ): List<SongItemClean> = withContext(Dispatchers.IO) {
+        val songs = candidates.filter { it.id.isNotBlank() }
+            .filterNot { isCollectionLikeResult(it.title, it.album, it.durationMs, mood) }
+            .distinctBy { it.videoId.ifBlank { it.id } }.take(240)
+        if (songs.isEmpty()) return@withContext emptyList()
+        val app = getApplication<Application>()
+        val cached = TrackFeatureDatabase.read(app, songs.map { it.id })
+        // Reuse recent feature profiles and only read analysis for tracks without a fresh profile.
+        val now = System.currentTimeMillis()
+        val cachedAudio = songs.take(80).filter { song ->
+            cached[song.id]?.let { now - it.updatedAtMs >= 7L * 24L * 60L * 60L * 1000L } ?: true
+        }.mapNotNull { song ->
+            val mediaId = song.videoId.ifBlank { song.id }
+            val audio = runCatching { PlayerHolder.loadAnalysis(mediaId, Executor { command -> command.run() }).get() }
+                .getOrNull()
+            audio?.let { song.id to it }
+        }.toMap()
+        val likedIds = snapshot.favoriteIds + likedSongs.flatMap { listOf(it.id, it.videoId) }
+            .filter(String::isNotBlank).toSet()
+        val downloadedIds = snapshot.downloadedSongs.mapTo(mutableSetOf()) { it.id }
+        val inputs = songs.map { song ->
+            val aliases = setOf(song.id, song.videoId).filter(String::isNotBlank).toSet()
+            val history = events.filter { it.trackId in aliases }
+            TrackFeatureInput(
+                id = song.id,
+                aliases = aliases,
+                title = song.title,
+                artist = song.artist,
+                album = song.album,
+                durationMs = song.durationMs,
+                retrievalGenres = (retrievalGenresByTrack[song.id].orEmpty() + retrievalGenresByTrack[song.videoId].orEmpty()),
+                providerGenres = history.flatMap { it.genres }.toSet(),
+                languageHint = history.firstOrNull { it.language.isNotBlank() }?.language
+                    ?: CompanionFeatureAdapter.languageOf(song.title),
+                audio = cachedAudio[song.id],
+                liked = aliases.any { it in likedIds },
+                downloaded = aliases.any { it in downloadedIds }
+            )
+        }
+        val profiles = inputs.map { input ->
+            cached[input.id]?.takeIf { now - it.updatedAtMs < 7L * 24L * 60L * 60L * 1000L }
+                ?: SongFeatureExtractionPipeline.extract(input, events, now)
+        }
+        TrackFeatureDatabase.write(app, profiles)
+        val user = CompanionFeatureAdapter.profile(
+            snapshot.listenerProfile, likedIds, downloadedIds
+        ).copy(excludedTrackIds = snapshot.notRecommendedIds + snapshot.notForCurrentMoodIds)
+        val rankedIds = withContext(Dispatchers.Default) {
+            MoodRecommendationEngine.rank(
+                candidates = profiles,
+                mood = mood,
+                user = user,
+                events = events,
+                limit = songs.size,
+                context = MoodSessionContext(
+                    hourOfDay = Calendar.getInstance().get(Calendar.HOUR_OF_DAY),
+                    recentMoods = setOf(snapshot.selectedMood).filter(String::isNotBlank).toSet()
+                ),
+                nowMs = now,
+                retrievalGenresByTrack = retrievalGenresByTrack
+            )
+        }
+        val byId = songs.associateBy { it.id }
+        rankedIds.mapNotNull(byId::get)
+    }
+
+    /** Retain which retrieval seed surfaced each result for multi-query ranking. */
+    private fun moodCandidateGenreHints(
+        results: List<Pair<String, List<SongItemClean>>>,
+        seeds: List<MoodCandidateSeed>
+    ): Map<String, Set<String>> {
+        val genresByQuery = seeds.associate { it.query.lowercase(Locale.ROOT) to it.genres }
+        val hints = mutableMapOf<String, MutableSet<String>>()
+        results.forEach { (query, songs) ->
+            val genres = genresByQuery[query.lowercase(Locale.ROOT)].orEmpty()
+            if (genres.isEmpty()) return@forEach
+            songs.forEach { song ->
+                (listOf(song.id, song.videoId).filter(String::isNotBlank)).forEach { id ->
+                    hints.getOrPut(id) { linkedSetOf() }.addAll(genres)
+                }
+            }
+        }
+        return hints.mapValues { it.value.toSet() }
+    }
     fun chooseMoodForMe() {
         if (_state.value.isChoosingMood) return
         _state.value = _state.value.copy(isChoosingMood = true)
@@ -2555,27 +3029,20 @@ _state.value = _state.value.copy(
                     withContext(Dispatchers.IO) { PlayedSongHistory.recommendationArtists() })
                     .map(String::trim).filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }.take(4)
 
-                val moodProfile = SmartMoodEngine.profile(suggestion.mood)
-                val genreQuery = moodProfile?.genres?.take(3)?.joinToString(" ").orEmpty()
-                // Keep the mood's own sound as the primary search. Profile genres
-                // and preferred artists get separate, weaker candidate sources so
-                // a favorite genre cannot drown out the selected mood.
-                val profileGenreQuery = profile.favoriteGenres.take(2)
-                    .takeIf { it.isNotEmpty() }
-                    ?.let { genres ->
-                        listOf(suggestion.mood, genres.joinToString(" "), "songs")
-                            .filter(String::isNotBlank).joinToString(" ")
-                    }
-                val artistQueries = preferredArtists.take(2).map { artist ->
-                    listOf(artist, genreQuery, suggestion.mood, "songs")
-                        .filter(String::isNotBlank).joinToString(" ")
-                }
-                val queries = (listOf(moodDiscoveryQuery(suggestion.mood)) +
-                    listOfNotNull(profileGenreQuery) + artistQueries).distinct().take(4)
+                val moodSeeds = MoodRecommendationEngine.candidateSeeds(
+                    mood = suggestion.mood,
+                    favoriteGenres = profile.favoriteGenres,
+                    preferredArtists = preferredArtists,
+                    preferredLanguages = profile.favoriteLanguages,
+                    limit = 5
+                )
+                val queries = moodSeeds.map { it.query }
                 val songs = withContext(Dispatchers.IO) {
                     val queryResults = coroutineScope {
                         queries.map { query ->
-                            async(Dispatchers.IO) { runCatching { YtRepo.searchSongs(query) }.getOrDefault(emptyList()) }
+                            async(Dispatchers.IO) {
+                                query to runCatching { YtRepo.searchSongs(query) }.getOrDefault(emptyList())
+                            }
                         }.awaitAll()
                     }
                     val current = _state.value
@@ -2585,32 +3052,16 @@ _state.value = _state.value.copy(
                         .map { it.trackId }
                         .filter(String::isNotBlank)
                         .toSet()
-                    val excludedIds = current.notRecommendedIds + recentlySkippedIds
-                    val candidates = queryResults.flatten()
+                    val excludedIds = current.notRecommendedIds + recentlySkippedIds + current.notForCurrentMoodIds
+                    val candidates = queryResults.flatMap { it.second }
                         .filter { it.videoId.isNotBlank() && it.id !in excludedIds && it.videoId !in excludedIds &&
                             (!current.filterMatureContent || !it.isExplicit) }
                         .distinctBy { it.videoId }
                     if (candidates.isEmpty()) return@withContext emptyList()
 
-                    val likedIds = Favorites.songs().flatMap { listOf(it.id, it.videoId) }.filter(String::isNotBlank).toSet()
-                    val downloadedIds = current.downloadedSongs.mapTo(mutableSetOf()) { it.id }
-                    val recommendationProfile = CompanionFeatureAdapter.profile(
-                        profile, likedIds, downloadedIds
-                    ).copy(excludedTrackIds = excludedIds)
-                    val companionTracks = CompanionFeatureAdapter.tracks(candidates, events, likedIds, downloadedIds)
-                    val personalOrder = MoodRecommendationRanker.rank(
-                        companionTracks, suggestion.mood, recommendationProfile, events, candidates.size
-                    ).mapIndexed { index, track -> track.id to index }.toMap()
-                    val signalOrder = SmartMoodEngine.rankSongs(
-                        candidates,
-                        suggestion.mood,
-                        PlayedSongHistory.ids(),
-                        likedIds,
-                        preferredArtists.toSet()
-                    ).mapIndexed { index, song -> song.id to index }.toMap()
-                    candidates.sortedWith(
-                        compareBy<SongItemClean> { personalOrder[it.id] ?: Int.MAX_VALUE }
-                            .thenBy { signalOrder[it.id] ?: Int.MAX_VALUE }
+                    rankMoodSongs(
+                        candidates, suggestion.mood, current, events, Favorites.songs(),
+                        moodCandidateGenreHints(queryResults, moodSeeds)
                     )
                 }
 
@@ -2984,12 +3435,12 @@ _state.value = _state.value.copy(
                     } ?: videoSource
                 }
                 player.setMediaSource(source)
+                if (positionMs > 0L) player.seekTo(positionMs)
+                if (shouldPlay) player.play() else player.pause()
                 player.prepare()
                 // Video mode reuses the same ExoPlayer session; attach the saved
                 // equalizer profile to its audio output as soon as the source changes.
                 updateAudioEffectSession(true)
-                if (positionMs > 0L) player.seekTo(positionMs)
-                if (shouldPlay) player.play() else player.pause()
                 _state.value = _state.value.copy(isLoadingStream = false)
             } catch (_: Exception) {
                 _state.value = _state.value.copy(videoMode = false, isLoadingStream = false)
@@ -3180,24 +3631,25 @@ _state.value = _state.value.copy(
 
         val targetDurationMs = durationMinutes.toLong() * 60_000L
         val localDurationMs = localCandidates.sumOf { it.durationMs.coerceAtLeast(0L) }
-        val queries = buildList {
-            if (localDurationMs < targetDurationMs || localCandidates.size < 8) {
-                add(moodDiscoveryQuery(mood, current.listenerProfile.favoriteGenres.firstOrNull()))
-                val followedArtists = current.listenerProfile.followedArtists
-                    .map(String::trim).filter(String::isNotBlank).take(3)
-                val tasteTerms = (followedArtists + current.listenerProfile.favoriteGenres.take(2))
-                    .distinct().joinToString(" ")
-                if (tasteTerms.isNotBlank()) add("$mood $tasteTerms songs mix")
-            }
-        }.distinct().take(2)
-
-        val networkCandidates = if (queries.isEmpty()) emptyList() else withContext(Dispatchers.IO) {
+        val moodSeeds = if (localDurationMs < targetDurationMs || localCandidates.size < 8) {
+            MoodRecommendationEngine.candidateSeeds(
+                mood = mood,
+                favoriteGenres = current.listenerProfile.favoriteGenres,
+                preferredArtists = current.listenerProfile.followedArtists,
+                preferredLanguages = current.listenerProfile.favoriteLanguages,
+                limit = 2
+            )
+        } else emptyList()
+        val queryResults = if (moodSeeds.isEmpty()) emptyList() else withContext(Dispatchers.IO) {
             coroutineScope {
-                queries.map { query ->
-                    async(Dispatchers.IO) { runCatching { YtRepo.searchSongs(query) }.getOrDefault(emptyList()) }
-                }.awaitAll().flatten()
+                moodSeeds.map { seed ->
+                    async(Dispatchers.IO) {
+                        seed.query to runCatching { YtRepo.searchSongs(seed.query) }.getOrDefault(emptyList())
+                    }
+                }.awaitAll()
             }
         }
+        val networkCandidates = queryResults.flatMap { it.second }
         val candidates = (localCandidates + networkCandidates)
             .asSequence()
             .filter { it.id !in current.notRecommendedIds && it.videoId !in current.notRecommendedIds }
@@ -3208,14 +3660,10 @@ _state.value = _state.value.copy(
         if (candidates.isEmpty()) return emptyList()
 
         val events = withContext(Dispatchers.IO) { PlayedSongHistory.listeningEvents(500) }
-        val likedIds = current.favoriteIds
-        val downloadedIds = current.downloadedSongs.mapTo(mutableSetOf()) { it.id }
-        val profile = CompanionFeatureAdapter.profile(current.listenerProfile, likedIds, downloadedIds)
-            .copy(excludedTrackIds = current.notRecommendedIds)
-        val ranked = withContext(Dispatchers.Default) {
-            val tracks = CompanionFeatureAdapter.tracks(candidates, events, likedIds, downloadedIds)
-            MoodRecommendationRanker.rank(tracks, mood, profile, events, tracks.size).map { it.id }
-        }
+        val ranked = rankMoodSongs(
+            candidates, mood, current, events, Favorites.songs(),
+            moodCandidateGenreHints(queryResults, moodSeeds)
+        ).map { it.id }
         val byId = candidates.associateBy { it.id }
         val ordered = ranked.mapNotNull(byId::get)
         val selected = mutableListOf<SongItemClean>()
@@ -3904,8 +4352,8 @@ _state.value = _state.value.copy(
                     .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(5))
                     .createMediaSource(item)
                 player.setMediaSource(mediaSource)
-                player.prepare()
                 player.play()
+                player.prepare()
                 _state.value = _state.value.copy(isLoadingStream = true, isPlaying = true)
             } catch (cancelled: CancellationException) {
                 throw cancelled
@@ -3969,6 +4417,80 @@ _state.value = _state.value.copy(
         }.onFailure { error ->
             Log.w("VybeVM", "Could not change silence skipping", error)
             Toast.makeText(getApplication(), "Silence skipping could not be changed.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun setRepeatCurrentTrack(enabled: Boolean) {
+        runCatching {
+            player.repeatMode = if (enabled) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_ALL
+            preferences.edit().putBoolean("repeat_current_track", enabled).apply()
+            _state.value = _state.value.copy(repeatCurrentTrack = enabled)
+        }.onFailure { error ->
+            Log.w("VybeVM", "Could not change repeat mode", error)
+            Toast.makeText(getApplication(), "Repeat mode could not be changed.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun setDjModeEnabled(enabled: Boolean) {
+        preferences.edit().putBoolean("dj_mode_enabled", enabled).apply()
+        PlayerHolder.setDjAnalysisEnabled(enabled)
+        _state.value = _state.value.copy(djModeEnabled = enabled)
+        if (enabled) {
+            // KILO's existing AutoMix is the transition layer. DJ mode only opts into it.
+            if (!_state.value.autoMixEnabled) preferences.edit().putBoolean("dj_mode_owned_automix", true).apply()
+            setAutoMixEnabled(true)
+            reorderDjQueueFromAnalysis()
+        } else if (preferences.getBoolean("dj_mode_owned_automix", false)) {
+            preferences.edit().remove("dj_mode_owned_automix").apply()
+            setAutoMixEnabled(false)
+        }
+    }
+
+    private fun reorderDjQueueFromAnalysis() {
+        djReorderJob?.cancel()
+        djReorderJob = viewModelScope.launch {
+            val snapshot = _state.value
+            if (!snapshot.djModeEnabled || snapshot.playlist.size - snapshot.currentIndex < 3) return@launch
+            val start = snapshot.currentIndex.coerceIn(0, snapshot.playlist.lastIndex)
+            val currentQueue = snapshot.playlist.drop(start)
+            val analyzed = withContext(Dispatchers.IO) {
+                currentQueue.map { song ->
+                    val id = song.videoId.ifBlank { song.id }
+                    song to PlayerHolder.loadAnalysis(id, Executor { command -> command.run() }).get()
+                }
+            }
+            if (!_state.value.djModeEnabled || analyzed.size < 3) return@launch
+            if (_state.value.currentIndex != start ||
+                _state.value.playlist.map { song -> song.videoId.ifBlank { song.id } } !=
+                snapshot.playlist.map { song -> song.videoId.ifBlank { song.id } }) return@launch
+            val planned = withContext(Dispatchers.Default) {
+                djModeController.planQueue(
+                    analyzed.map { (song, analysis) -> DjTrack(song.videoId.ifBlank { song.id }, analysis) },
+                    DjModeSettings(enabled = true, crossfadeMs = 4_000L, beatMatch = true, smartQueue = true)
+                ).map { it.id }
+            }
+            val lookup = analyzed.associate { (song, _) -> (song.videoId.ifBlank { song.id }) to song }
+            val orderedTail = planned.mapNotNull(lookup::get)
+            if (orderedTail.map { it.videoId.ifBlank { it.id } } == currentQueue.map { it.videoId.ifBlank { it.id } }) return@launch
+            val updated = snapshot.playlist.take(start) + orderedTail
+            val mediaIdsMatch = player.mediaItemCount == snapshot.playlist.size &&
+                (0 until player.mediaItemCount).all { i ->
+                    player.getMediaItemAt(i).mediaId == snapshot.playlist[i].videoId.ifBlank { snapshot.playlist[i].id }
+                }
+            if (player.mediaItemCount > 0 && !mediaIdsMatch) return@launch
+            if (mediaIdsMatch) {
+                val moving = snapshot.playlist.toMutableList()
+                for (target in start until updated.size) {
+                    val wantedId = updated[target].videoId.ifBlank { updated[target].id }
+                    val from = moving.indexOfFirst { it.videoId.ifBlank { it.id } == wantedId }
+                    if (from >= 0 && from != target) {
+                        player.moveMediaItem(from, target)
+                        val moved = moving.removeAt(from)
+                        moving.add(target, moved)
+                    }
+                }
+            }
+            _state.value = _state.value.copy(playlist = updated, currentIndex = start)
         }
     }
 
@@ -4406,11 +4928,68 @@ _state.value = _state.value.copy(
         persistSavedPlaylists(updated)
     }
 
+    fun addPlaylistToAutoplay(playlistId: String) {
+        val saved = _state.value.savedPlaylists.firstOrNull { it.id == playlistId } ?: return
+        val tracks = saved.songs.filter { it.videoId.isNotBlank() || it.id.isNotBlank() }
+        if (tracks.isEmpty()) {
+            Toast.makeText(getApplication(), "This playlist has no playable songs yet.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val current = _state.value
+        val trackIds = tracks.map { it.videoId.ifBlank { it.id } }
+        val queueTailIds = current.playlist.takeLast(tracks.size).map { it.videoId.ifBlank { it.id } }
+        if (queueTailIds == trackIds) {
+            Toast.makeText(getApplication(), "${saved.name} is already at the end of your queue.", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val startNow = player.mediaItemCount == 0 || current.playlist.isEmpty() || current.activeSong.id.startsWith("radio:")
+        if (startNow) {
+            _state.value = current.copy(playlist = tracks, currentIndex = 0)
+            loadTrack(0, autoPlay = true, selectionSource = "settings_autoplay_playlist")
+        } else {
+            // This only appends a user-selected saved playlist to Media3's existing
+            // queue. The current item and its playback state are left untouched.
+            player.addMediaItems(tracks.map { it.toMediaItem() })
+            _state.value = current.copy(playlist = current.playlist + tracks)
+        }
+        Toast.makeText(getApplication(), "${saved.name} added to autoplay.", Toast.LENGTH_SHORT).show()
+    }
+
     fun createPlaylist(name: String, song: SongItemClean) {
         val cleanName = name.trim()
         if (cleanName.isEmpty()) return
         val playlist = SavedPlaylist(System.currentTimeMillis().toString(), cleanName, listOf(song))
         persistSavedPlaylists(_state.value.savedPlaylists + playlist)
+    }
+
+    fun savePendingDriveRecapAsPlaylist(name: String) {
+        val recap = _state.value.pendingDriveRecap ?: return
+        val cleanName = name.trim().take(80)
+        if (cleanName.isBlank() || recap.songs.isEmpty()) return
+        val playlist = SavedPlaylist("drive-recap-${recap.id}", cleanName, recap.songs.distinctBy { it.videoId })
+        persistSavedPlaylists(_state.value.savedPlaylists + playlist)
+        DriveRecapStore.removePending(preferences, recap.id)
+        _state.value = _state.value.copy(pendingDriveRecap = DriveRecapStore.pending(preferences))
+        Toast.makeText(getApplication(), "Drive recap saved to your library.", Toast.LENGTH_SHORT).show()
+    }
+
+    fun setSongNotForMood(song: SongItemClean, mood: String) {
+        val cleanMood = mood.trim().take(64)
+        if (cleanMood.isBlank()) return
+        MoodTrackFeedbackStore.setNotForMood(preferences, cleanMood, song)
+        PlayedSongHistory.recordSignal(song, "not_for_mood:${cleanMood.lowercase(Locale.ROOT)}")
+        val hidden = MoodTrackFeedbackStore.hiddenIds(preferences, cleanMood)
+        val isCurrentMoodPage = _state.value.currentScreen == ScreenNav.BROWSE_CATEGORY &&
+            _state.value.browseCategoryKind == BrowseCategoryKind.MOOD &&
+            _state.value.browseCategoryTitle.equals(cleanMood, ignoreCase = true)
+        if (_state.value.selectedMood.equals(cleanMood, ignoreCase = true)) {
+            _state.value = _state.value.copy(notForCurrentMoodIds = hidden)
+        }
+        Toast.makeText(getApplication(), "We’ll keep ${song.title} out of $cleanMood mixes.", Toast.LENGTH_SHORT).show()
+        if (isCurrentMoodPage) openBrowseCategory(cleanMood, BrowseCategoryKind.MOOD)
+        else if (_state.value.selectedMood.equals(cleanMood, ignoreCase = true)) loadHome()
     }
 
     fun setSongRecommendation(songId: String, recommend: Boolean) {
@@ -4422,6 +5001,7 @@ _state.value = _state.value.copy(
 
     override fun onCleared() {
         Favorites.removeListener(favoriteListener)
+        preferences.unregisterOnSharedPreferenceChangeListener(driveRecapPreferenceListener)
         radioRecordingJob?.cancel()
         player.removeListener(playbackListener)
         updateAudioEffectSession(false)
@@ -4481,26 +5061,20 @@ private fun KiloAppTheme(vm: MainViewModel, content: @Composable () -> Unit) {
 fun VybeRootApp(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
-    var showLoginPopup by remember { mutableStateOf(false) }
     val releaseNotesPreferences = remember(context) {
         context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
     }
-    var showV270Notes by remember(releaseNotesPreferences) {
+    val releaseNotesSeenKey = "whats_new_seen_${BuildConfig.VERSION_NAME}"
+    var showReleaseNotes by remember(releaseNotesPreferences, releaseNotesSeenKey) {
         mutableStateOf(
-            BuildConfig.VERSION_NAME == "2.7.0" &&
-                !releaseNotesPreferences.getBoolean("whats_new_v2_7_0_seen", false)
+            BuildConfig.VERSION_NAME == "2.8.0" &&
+                !releaseNotesPreferences.getBoolean(releaseNotesSeenKey, false)
         )
     }
 
-    fun dismissV270Notes() {
-        releaseNotesPreferences.edit().putBoolean("whats_new_v2_7_0_seen", true).apply()
-        showV270Notes = false
-    }
-
-    LaunchedEffect(state.isSetupComplete, state.isLoggedIn) {
-        if (state.isSetupComplete && !state.isLoggedIn) {
-            showLoginPopup = true
-        }
+    fun dismissReleaseNotes() {
+        releaseNotesPreferences.edit().putBoolean(releaseNotesSeenKey, true).apply()
+        showReleaseNotes = false
     }
 
     if (state.showWebLoginDialog) {
@@ -4546,16 +5120,16 @@ fun VybeRootApp(vm: MainViewModel) {
         )
     }
 
-    if (showV270Notes && state.isSetupComplete && !state.showPersonalizationWizard && !showLoginPopup) {
+    if (showReleaseNotes && state.isSetupComplete && !state.showPersonalizationWizard) {
         AlertDialog(
-            onDismissRequest = { dismissV270Notes() },
-            title = { Text("What’s new in KILO 2.7.0", fontWeight = FontWeight.Bold) },
+            onDismissRequest = { dismissReleaseNotes() },
+            title = { Text("What’s new in KILO 2.8.0", fontWeight = FontWeight.Bold) },
             text = {
-                Text("Explore the refreshed KILO layout. Home brings your listening and personal picks together, while Browse makes it easier to find music by mood, genre, language, and collection. Library and You keep your music and settings organized. Android Auto now has clear sections for Home, Radio, Moods, Genres, Library, Downloads, and Search.")
+                Text("Browse now has dedicated mood, genre, language, and artist destinations. DJ mode uses cached track analysis with KILO’s existing AutoMix transitions. Song recognition is available from Search and asks before using the microphone; it sends a short sample to AudD only when you start recognition.")
             },
             confirmButton = {
-                TextButton(onClick = { dismissV270Notes() }) {
-                    Text("OK", color = state.activeSkin.highlight, fontWeight = FontWeight.Bold)
+                TextButton(onClick = { dismissReleaseNotes() }) {
+                    Text("Got it", color = state.activeSkin.highlight, fontWeight = FontWeight.Bold)
                 }
             },
             containerColor = Color(0xFF15131D),
@@ -4595,29 +5169,6 @@ fun VybeRootApp(vm: MainViewModel) {
             }
         }
 
-        if (showLoginPopup && !state.isLoggedIn) {
-            AlertDialog(
-                onDismissRequest = { showLoginPopup = false },
-                title = { Text("Sync Your YouTube Music", fontWeight = FontWeight.Bold) },
-                text = { Text("Sign in to load music discovery and online playlists. Without signing in, only songs saved in your Offline Vault are available.") },
-                confirmButton = {
-                    TextButton(onClick = {
-                        showLoginPopup = false
-                        vm.openWebLogin()
-                    }) {
-                        Text("Sign in", color = state.activeSkin.highlight, fontWeight = FontWeight.Bold)
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showLoginPopup = false }) {
-                        Text("Offline only", color = Color.Gray)
-                    }
-                },
-                containerColor = Color(0xFF14131D),
-                titleContentColor = Color.White,
-                textContentColor = Color.White.copy(0.8f)
-            )
-        }
     }
 }
 
@@ -4865,6 +5416,8 @@ fun VybeMainScaffold(vm: MainViewModel) {
                     ScreenNav.PLAYER_STYLES -> PlayerStylesScreen(vm)
                     ScreenNav.EQUALIZER -> EqualizerScreen(vm)
                     ScreenNav.V2_ROADMAP -> V2RoadmapScreen(vm)
+                    ScreenNav.BROWSE_CATEGORY -> BrowseCategoryResultsScreen(vm)
+                    ScreenNav.ARTISTS -> ArtistsBrowseScreen(vm)
                     ScreenNav.ARTIST_DETAIL -> ArtistDetailScreen(vm)
                 }
             }
@@ -4922,6 +5475,70 @@ private fun timeOfDayGreeting(hour: Int): String = when (hour) {
     in 12..16 -> "Good afternoon"
     in 17..20 -> "Good evening"
     else -> "Good night"
+}
+
+@Composable
+private fun DriveRecapHomeCard(
+    recap: DriveRecapPending,
+    skin: SkinTheme,
+    onSave: (String) -> Unit
+) {
+    var showNamingDialog by remember(recap.id) { mutableStateOf(false) }
+    var playlistName by remember(recap.id) {
+        val date = java.text.DateFormat.getDateInstance(java.text.DateFormat.MEDIUM)
+            .format(java.util.Date(recap.completedAtMs))
+        mutableStateOf("Drive Recap · $date")
+    }
+    val accent = skin.highlight
+    KiloCard(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp),
+        shape = primaryCardShape(skin),
+        backgroundBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.24f), primaryPanelColor(skin), primaryPanelColor(skin))),
+        borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.58f), accent.copy(alpha = 0.12f))),
+        contentPadding = 16.dp
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Icon(Icons.Default.DirectionsCar, contentDescription = null, tint = accent, modifier = Modifier.size(25.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Your drive recap is ready", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                Text("${recap.songs.size} songs · skipped tracks left out", color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+            }
+            TextButton(onClick = { showNamingDialog = true }) { Text("Save", color = accent, fontWeight = FontWeight.Bold) }
+        }
+    }
+    if (showNamingDialog) {
+        AlertDialog(
+            onDismissRequest = { showNamingDialog = false },
+            title = { Text("Save your drive recap", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Name this playlist to add it to your Library. Tracks you skipped are not included.", color = Color.White.copy(alpha = 0.72f), fontSize = 13.sp)
+                    OutlinedTextField(
+                        value = playlistName,
+                        onValueChange = { playlistName = it.take(80) },
+                        label = { Text("Playlist name") },
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = accent,
+                            unfocusedBorderColor = Color.White.copy(alpha = 0.25f)
+                        )
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(enabled = playlistName.isNotBlank(), onClick = {
+                    onSave(playlistName)
+                    showNamingDialog = false
+                }) { Text("Save to Library", color = accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNamingDialog = false }) { Text("Later", color = Color.White.copy(alpha = 0.72f)) }
+            },
+            containerColor = Color(0xFF17191F)
+        )
+    }
 }
 
 @Composable
@@ -5026,6 +5643,12 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                         }
                     }
                 }
+            }
+        }
+
+        state.pendingDriveRecap?.let { recap ->
+            item(key = "pending_drive_recap_${recap.id}") {
+                DriveRecapHomeCard(recap, skin, vm::savePendingDriveRecapAsPlaylist)
             }
         }
 
@@ -6159,6 +6782,9 @@ fun BitchordSongRowItem(
 @Composable
 fun SongOverflowMenuButton(song: SongItemClean, vm: MainViewModel) {
     val state by vm.state.collectAsState()
+    val currentMoodContext = state.browseCategoryTitle.takeIf {
+        state.currentScreen == ScreenNav.BROWSE_CATEGORY && state.browseCategoryKind == BrowseCategoryKind.MOOD
+    }
     var expanded by remember(song.id) { mutableStateOf(false) }
     var showSaveDialog by remember(song.id) { mutableStateOf(false) }
     var playlistName by remember(song.id) { mutableStateOf("") }
@@ -6200,6 +6826,13 @@ fun SongOverflowMenuButton(song: SongItemClean, vm: MainViewModel) {
                 leadingIcon = { Icon(if (currentlyHidden) Icons.Outlined.ThumbUp else Icons.Outlined.ThumbDown, contentDescription = null) },
                 onClick = { expanded = false; vm.setSongRecommendation(song.id, currentlyHidden) }
             )
+            if (currentMoodContext != null) {
+                DropdownMenuItem(
+                    text = { Text("Not for this mood") },
+                    leadingIcon = { Icon(Icons.Outlined.ThumbDown, contentDescription = null) },
+                    onClick = { expanded = false; vm.setSongNotForMood(song, currentMoodContext) }
+                )
+            }
             DropdownMenuItem(
                 text = {
                     val progress = downloadTask?.progress
@@ -6705,6 +7338,16 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         }
                     }
 
+                    if (state.playerOverlayTab == OverlayTab.NONE && !song.id.startsWith("radio:")) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        CurrentSyncedLyricLine(
+                            song = song,
+                            positionMs = state.currentPosMs,
+                            accent = playerAccent,
+                            onOpenLyrics = { vm.togglePlayerOverlayTab(OverlayTab.LYRICS) }
+                        )
+                    }
+
                     Spacer(modifier = Modifier.height(8.dp))
 
                     Slider(
@@ -6889,6 +7532,24 @@ private fun PlaybackToolsSheet(state: AppStateModel, vm: MainViewModel, onDismis
             }
 
             HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Repeat this track", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Keep the current song on repeat. Turn off to continue through the queue.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                }
+                Switch(checked = state.repeatCurrentTrack, onCheckedChange = vm::setRepeatCurrentTrack)
+            }
+
+            HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("DJ mode", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                    Text("Uses cached track analysis with KILO’s existing AutoMix transitions. Live analysis is temporarily unavailable.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                }
+                Switch(checked = state.djModeEnabled, onCheckedChange = vm::setDjModeEnabled)
+            }
+
+            HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
             Text("Sleep timer", fontSize = 16.sp, fontWeight = FontWeight.Bold)
             Text(
                 when {
@@ -6927,6 +7588,7 @@ fun BitChordBottomNavPill(state: AppStateModel, vm: MainViewModel) {
         Triple(ScreenNav.HOME, "Home", Icons.Filled.Home),
         Triple(ScreenNav.EXPLORE, "Browse", Icons.Filled.Explore),
         Triple(ScreenNav.SEARCH, "Search", Icons.Outlined.Search),
+        Triple(ScreenNav.RADIO, "Radio", Icons.Default.Radio),
         Triple(ScreenNav.LIBRARY, "Library", Icons.Outlined.LibraryMusic),
         Triple(ScreenNav.YOU, "You", Icons.Outlined.Person)
     )
@@ -6953,7 +7615,9 @@ fun BitChordBottomNavPill(state: AppStateModel, vm: MainViewModel) {
                     ScreenNav.PLAYBACK_SETTINGS, ScreenNav.ABOUT_UPDATES,
                     ScreenNav.ANDROID_AUTO_SETTINGS, ScreenNav.EQUALIZER, ScreenNav.V2_ROADMAP
                 )) || (screen == ScreenNav.LIBRARY && state.currentScreen == ScreenNav.OFFLINE) ||
-                (screen == ScreenNav.EXPLORE && state.currentScreen == ScreenNav.RADIO)
+                (screen == ScreenNav.EXPLORE && state.currentScreen in setOf(
+                    ScreenNav.BROWSE_CATEGORY, ScreenNav.ARTISTS, ScreenNav.ARTIST_DETAIL
+                ))
 
             Box(
                 modifier = Modifier
@@ -6993,7 +7657,10 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
             .distinctBy { it.id }.filter { it.videoId.isNotBlank() || it.isDownloaded }.take(12)
     }
     val madeForYouSongs = remember(state.homeShelves, state.quickPicks) {
-        state.homeShelves.filterNot { it.title.contains("quick", true) }
+        state.homeShelves.filterNot {
+            it.title.contains("quick", true) || it.title.contains("mood", true) ||
+                it.title.endsWith(" mix", true) || it.title.startsWith("For your ", true)
+        }
             .flatMap { it.songs }.distinctBy { it.id }
             .filter { it.videoId.isNotBlank() || it.isDownloaded }.take(12)
     }
@@ -7008,9 +7675,6 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
             listOf("trend", "popular", "viral", "chart").any { shelf.title.contains(it, true) }
         }.flatMap { it.songs }.distinctBy { it.id }.take(12)
     }
-    val favoriteMoods = state.listenerProfile.favoriteMoods.toList().ifEmpty {
-        listOf("Night Drive", "Workout", "Focus", "Relax", "Road Trip", "Happy")
-    }.take(12)
     val followedArtists = state.listenerProfile.followedArtists.toList().take(12)
 
     LazyColumn(
@@ -7063,29 +7727,84 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
             }
         }
 
-        if (recentSongs.isNotEmpty()) item(key = "home_continue_listening") {
-            HomeSongCarousel("Continue Listening", recentSongs, skin, vm, "Pick up where you left off")
-        }
-        if (quickSongs.isNotEmpty()) item(key = "home_quick_picks") {
-            HomeSongCarousel("Quick Picks", quickSongs, skin, vm, "A few good next listens")
+        state.pendingDriveRecap?.let { recap ->
+            item(key = "home_pending_drive_recap_${recap.id}") {
+                DriveRecapHomeCard(recap, skin, vm::savePendingDriveRecapAsPlaylist)
+            }
         }
         item(key = "home_moods") {
-            HomeSectionHeading("Set My Mood", "Choose the feeling for your next listen", accent)
-            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-                items(favoriteMoods, key = { "home_mood_$it" }) { mood ->
-                    HomeMoodCard(mood, state.selectedMood.equals(mood, true), accent, skin) {
-                        vm.setDiscoveryMood(mood)
-                        vm.onSearchQueryChanged("$mood music")
-                        vm.setScreen(ScreenNav.SEARCH)
+            MoodRerollHomeCard(state, skin, accent, vm::chooseMoodForMe)
+        }
+        item(key = "home_trip_builder") {
+            TripBuilderHomeCard(skin, accent) {
+                vm.resetTripBuilderStatus()
+                tripPlaylistName = vm.suggestedRoadMixName()
+                showTripBuilder = true
+            }
+        }
+        val categoryShelves = state.homeShelves
+            .filterNot { shelf ->
+                val title = shelf.title.trim()
+                title.contains("mood", ignoreCase = true) || title.endsWith(" mix", ignoreCase = true) ||
+                    title.startsWith("For your ", ignoreCase = true) || SmartMoodEngine.profile(title) != null
+            }
+            .map { shelf -> shelf.copy(songs = shelf.songs.filterNot { it.id in state.notRecommendedIds }) }
+            .filter { it.songs.isNotEmpty() }
+            .distinctBy { it.title.trim().lowercase(Locale.ROOT) }
+        val homeCategoryTabs = listOf("All") + categoryShelves.map { it.title }
+        val activeHomeCategory = state.activeHomeTab.takeIf { it in homeCategoryTabs } ?: "All"
+        item(key = "home_category_tabs") {
+            LazyRow(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                contentPadding = PaddingValues(horizontal = 18.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(homeCategoryTabs, key = { "home_category_$it" }) { category ->
+                    val selected = category == activeHomeCategory
+                    Box(
+                        Modifier.clip(RoundedCornerShape(16.dp))
+                            .background(if (selected) accent else primaryPanelColor(skin))
+                            .border(1.dp, if (selected) accent.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.08f), RoundedCornerShape(16.dp))
+                            .clickable { vm.selectHomeCategory(category) }
+                            .padding(horizontal = 16.dp, vertical = 9.dp)
+                    ) {
+                        Text(category, color = if (selected) Color.Black else Color.White.copy(alpha = 0.9f), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
         }
-        if (madeForYouSongs.isNotEmpty()) item(key = "home_made_for_you") {
-            HomeSongCarousel("Made For You", madeForYouSongs, skin, vm, "Built from your listening and favorites")
-        }
-        if (recentSongs.isNotEmpty()) item(key = "home_recently_played") {
-            HomeSongCarousel("Recently Played", SessionStore.recentSongs().take(12), skin, vm, "Return to something familiar")
+        if (activeHomeCategory != "All") {
+            categoryShelves.firstOrNull { it.title == activeHomeCategory }?.let { selectedShelf ->
+                item(key = "home_selected_category_${selectedShelf.title}") {
+                    HomeSongCarousel(selectedShelf.title, selectedShelf.songs, skin, vm, "Picked from your personal music feed")
+                }
+            }
+            if (quickSongs.isNotEmpty()) item(key = "home_quick_picks_after_category") {
+                HomeSongCarousel("Quick Picks", quickSongs, skin, vm, "More music picked for you")
+            }
+            val played = SessionStore.recentSongs().take(12)
+            if (played.isNotEmpty()) item(key = "home_recently_played_after_category") {
+                HomeSongCarousel("Recently Played", played, skin, vm, "Return to something familiar")
+            }
+        } else {
+            if (recentSongs.isNotEmpty()) item(key = "home_continue_listening") {
+                HomeSongCarousel("Continue Listening", recentSongs, skin, vm, "Pick up where you left off")
+            }
+            if (quickSongs.isNotEmpty()) item(key = "home_quick_picks") {
+                HomeSongCarousel("Quick Picks", quickSongs, skin, vm, "A few good next listens")
+            }
+            categoryShelves.forEachIndexed { index, shelf ->
+                item(key = "home_feed_category_${index}_${shelf.title}") {
+                    HomeSongCarousel(shelf.title, shelf.songs, skin, vm, "Selected from your personal music feed")
+                }
+            }
+            if (madeForYouSongs.isNotEmpty()) item(key = "home_made_for_you") {
+                HomeSongCarousel("Made For You", madeForYouSongs, skin, vm, "Built from your listening and favorites")
+            }
+            val played = SessionStore.recentSongs().take(12)
+            if (played.isNotEmpty()) item(key = "home_recently_played") {
+                HomeSongCarousel("Recently Played", played, skin, vm, "Return to something familiar")
+            }
         }
         if (discoverySongs.isNotEmpty() || followedArtists.isNotEmpty()) item(key = "home_discover_for_you") {
             HomeSongCarousel("Discover For You", discoverySongs, skin, vm, "Fresh finds shaped by your taste")
@@ -7114,13 +7833,6 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                 HomeShortcutCard("Downloads", Icons.Default.Download, accent, skin, Modifier.weight(1f)) {
                     vm.setScreen(ScreenNav.OFFLINE)
                 }
-            }
-        }
-        item(key = "home_trip_builder") {
-            TripBuilderHomeCard(skin, accent) {
-                vm.resetTripBuilderStatus()
-                tripPlaylistName = vm.suggestedRoadMixName()
-                showTripBuilder = true
             }
         }
         if (state.homeShelves.isEmpty() && state.companionSongs.isEmpty()) item {
@@ -7230,10 +7942,20 @@ private fun YouScreen(vm: MainViewModel) {
                     }
                     Column(Modifier.weight(1f)) {
                         Text(state.displayName.trim().ifBlank { "Listener" }, color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold)
-                        Text(if (state.isLoggedIn) "YouTube Music connected" else "Listening profile on this device", color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp)
+                        Text(
+                            if (state.isLoggedIn) "YouTube Music connected"
+                            else "On-device profile · sign in for online playlists",
+                            color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp
+                        )
                     }
-                    IconButton(onClick = { if (state.isLoggedIn) vm.toggleAccountManager(true) else vm.openWebLogin() }) {
-                        Icon(Icons.Default.Edit, contentDescription = "Edit profile", tint = accent)
+                    if (state.isLoggedIn) {
+                        IconButton(onClick = { vm.toggleAccountManager(true) }) {
+                            Icon(Icons.Default.Edit, contentDescription = "Manage accounts", tint = accent)
+                        }
+                    } else {
+                        TextButton(onClick = vm::openWebLogin) {
+                            Text("Sign in", color = accent, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
             }
@@ -7264,7 +7986,7 @@ private fun YouScreen(vm: MainViewModel) {
             SettingsGroupCard {
                 SettingsRowItem(Icons.Default.Tune, "Personalisation Settings", "Moods, genres, artists, languages and discovery", onClick = vm::openPersonalizationWizard)
                 HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
-                SettingsRowItem(Icons.Default.PlayArrow, "Playback Settings", "Playback speed, silence skipping and sleep timer", onClick = { vm.setScreen(ScreenNav.PLAYBACK_SETTINGS) })
+                SettingsRowItem(Icons.Default.PlayArrow, "Playback Settings", "Speed, repeat, DJ mode and sleep timer", onClick = { vm.setScreen(ScreenNav.PLAYBACK_SETTINGS) })
                 HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
                 SettingsRowItem(Icons.Default.Equalizer, "Audio Settings", "Equalizer and sound controls", onClick = { vm.setScreen(ScreenNav.EQUALIZER) })
                 HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
@@ -7284,6 +8006,7 @@ private fun YouScreen(vm: MainViewModel) {
 private fun PlaybackSettingsScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val accent = state.activeSkin.highlight
+    var showDjGuide by remember { mutableStateOf(false) }
     var selectedSpeed by remember(state.playbackSpeed) { mutableFloatStateOf(state.playbackSpeed) }
     var timerNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
     LaunchedEffect(state.sleepTimerEndsAtMs) {
@@ -7332,6 +8055,64 @@ private fun PlaybackSettingsScreen(vm: MainViewModel) {
                     }
                     Switch(checked = state.skipSilenceEnabled, onCheckedChange = vm::setSkipSilenceEnabled)
                 }
+                HorizontalDivider(color = Color.White.copy(alpha = 0.10f), modifier = Modifier.padding(vertical = 5.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Repeat this track", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        Text("Keep the current song on repeat.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                    }
+                    Switch(checked = state.repeatCurrentTrack, onCheckedChange = vm::setRepeatCurrentTrack)
+                }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        SettingsSectionHeader("AUTOPLAY PLAYLISTS")
+        SettingsGroupCard {
+            Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                Text(
+                    "Add a saved playlist to the end of your current queue. KILO will continue into it when the queued songs finish.",
+                    color = Color.White.copy(alpha = 0.64f), fontSize = 12.sp, lineHeight = 17.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                )
+                if (state.savedPlaylists.isEmpty()) {
+                    Text(
+                        "Save a playlist first, then it will appear here.",
+                        color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                    )
+                } else {
+                    state.savedPlaylists.forEachIndexed { index, playlist ->
+                        if (index > 0) HorizontalDivider(color = Color.White.copy(alpha = 0.07f), modifier = Modifier.padding(horizontal = 16.dp))
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(playlist.name, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text("${playlist.songs.size} songs", color = Color.White.copy(alpha = 0.58f), fontSize = 11.sp)
+                            }
+                            TextButton(onClick = { vm.addPlaylistToAutoplay(playlist.id) }) {
+                                Text("Add to autoplay", color = accent, fontWeight = FontWeight.Bold)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        SettingsSectionHeader("DJ MODE")
+        SettingsGroupCard {
+            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("DJ mode", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        Text("Use KILO’s AutoMix for transitions. Saved BPM and key details can also guide the upcoming queue.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp)
+                    }
+                    Switch(checked = state.djModeEnabled, onCheckedChange = vm::setDjModeEnabled)
+                }
+                TextButton(onClick = { showDjGuide = true }, modifier = Modifier.align(Alignment.End)) {
+                    Text("How DJ mode works", color = accent)
+                }
             }
         }
         Spacer(Modifier.height(14.dp))
@@ -7364,6 +8145,66 @@ private fun PlaybackSettingsScreen(vm: MainViewModel) {
             }
         }
     }
+    if (showDjGuide) {
+        KiloStepGuideDialog(
+            title = "How DJ mode works",
+            steps = listOf(
+                KiloGuideStep("Turn it on", "Enable DJ mode here. It also turns on KILO’s existing AutoMix if AutoMix was off."),
+                KiloGuideStep("The current song stays put", "DJ mode only arranges tracks after the song already playing. It does not replace the player or restart the current track."),
+                KiloGuideStep("Queue matching", "If a track already has saved BPM, key, or energy details, KILO can use them to place more compatible tracks closer together."),
+                KiloGuideStep("What happens today", "KILO does not currently analyze tracks automatically. Until analysis is available, DJ mode uses the existing AutoMix transition and leaves unscored songs in their normal order."),
+            ),
+            accent = accent,
+            onDismiss = { showDjGuide = false }
+        )
+    }
+}
+
+private data class KiloGuideStep(val heading: String, val detail: String)
+
+@Composable
+private fun KiloStepGuideDialog(
+    title: String,
+    steps: List<KiloGuideStep>,
+    accent: Color,
+    onDismiss: () -> Unit
+) {
+    var stepIndex by remember(title) { mutableIntStateOf(0) }
+    if (steps.isEmpty()) return
+    val current = steps[stepIndex.coerceIn(0, steps.lastIndex)]
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF17191F),
+        title = {
+            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Text(title, color = Color.White, fontWeight = FontWeight.Bold)
+                Text("Step ${stepIndex + 1} of ${steps.size}", color = accent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                LinearProgressIndicator(
+                    progress = { (stepIndex + 1f) / steps.size },
+                    modifier = Modifier.fillMaxWidth(),
+                    color = accent,
+                    trackColor = Color.White.copy(alpha = 0.10f)
+                )
+                Text(current.heading, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                Text(current.detail, color = Color.White.copy(alpha = 0.74f), fontSize = 14.sp, lineHeight = 21.sp)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { if (stepIndex == steps.lastIndex) onDismiss() else stepIndex++ }) {
+                Text(if (stepIndex == steps.lastIndex) "Done" else "Next", color = accent)
+            }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onDismiss) { Text("Skip tour", color = Color.White.copy(alpha = 0.72f)) }
+                if (stepIndex > 0) TextButton(onClick = { stepIndex-- }) { Text("Back", color = accent) }
+            }
+        }
+    )
 }
 
 @Composable
@@ -7457,21 +8298,17 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val skin = state.activeSkin
     val accent = skin.highlight
-    val moodNames = state.listenerProfile.favoriteMoods.toList().ifEmpty {
-        listOf("Night Drive", "Hype Mode", "Focus", "Chill", "Romantic", "Gym", "Rainy Day", "Road Trip", "Devotional", "Study")
-    }.distinct().take(12)
-    val genreNames = state.listenerProfile.favoriteGenres.toList().ifEmpty {
-        listOf("Hip-Hop", "Pop", "Rock", "EDM", "Classical", "Jazz", "Phonk", "Indie", "R&B", "Devotional")
-    }.distinct().take(12)
-    val languages = state.listenerProfile.favoriteLanguages.toList().ifEmpty {
-        listOf("English", "Hindi", "Tamil", "Telugu", "Kannada", "Malayalam", "Punjabi", "Japanese", "Korean")
-    }.distinct().take(12)
+    val moodNames = (state.listenerProfile.favoriteMoods.sorted() + SmartMoodEngine.allMoodNames())
+        .distinctBy { it.lowercase(Locale.ROOT) }
+    val genreNames = (state.listenerProfile.favoriteGenres.sorted() + PERSONALIZATION_GENRES)
+        .distinctBy { it.lowercase(Locale.ROOT) }
+    val languages = (state.listenerProfile.favoriteLanguages.sorted() + PERSONALIZATION_LANGUAGES)
+        .distinctBy { it.lowercase(Locale.ROOT) }
     val coverArts = remember(state.homeShelves) { state.homeShelves.flatMap { it.songs }.map { it.coverUrl }.filter(String::isNotBlank) }
     val collections = listOf("Hidden Gems", "Underground Artists", "Throwback Hits", "Trending Now", "Top Charts")
     val seasonal = listOf("Weekend Vibes", "Monsoon Sessions", "Festival Music", "Late Night Sessions")
 
-    fun browseSearch(query: String, mood: Boolean = false) {
-        if (mood) vm.setDiscoveryMood(query)
+    fun browseSearch(query: String) {
         vm.onSearchQueryChanged(query)
         vm.setScreen(ScreenNav.SEARCH)
     }
@@ -7512,7 +8349,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                         title = mood, subtitle = "Mood mix", artwork = coverArts.getOrNull(index),
                         tint = listOf(Color(0xFF4B2B85), Color(0xFF087C89), Color(0xFF9B4C34), Color(0xFF344D8A))[index % 4],
                         modifier = Modifier.width(156.dp).height(152.dp)
-                    ) { browseSearch(mood, mood = true) }
+                    ) { vm.openBrowseCategory(mood, BrowseCategoryKind.MOOD) }
                 }
             }
         }
@@ -7524,21 +8361,34 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                         title = genre, subtitle = "Genre", artwork = coverArts.getOrNull((index + 3) % coverArts.size.coerceAtLeast(1)),
                         tint = listOf(Color(0xFF7B263D), Color(0xFF155C73), Color(0xFF5C3B83), Color(0xFF73602B))[index % 4],
                         modifier = Modifier.width(156.dp).height(142.dp)
-                    ) { browseSearch("$genre music") }
+                    ) { vm.openBrowseCategory(genre, BrowseCategoryKind.GENRE) }
                 }
             }
         }
         item {
-            HomeSectionHeading("Languages", "Music from around the world", accent)
+            HomeSectionHeading("Languages", "Browse a separate song page for each language", accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(languages) { language ->
-                    FilterChip(
-                        selected = false,
-                        onClick = { browseSearch("$language songs") },
-                        label = { Text(language) },
-                        colors = FilterChipDefaults.filterChipColors(labelColor = Color.White, containerColor = primaryPanelColor(skin))
-                    )
+                itemsIndexed(languages) { index, language ->
+                    BrowseVisualCard(
+                        title = language,
+                        subtitle = "Language",
+                        artwork = coverArts.getOrNull((index + 7) % coverArts.size.coerceAtLeast(1)),
+                        tint = listOf(Color(0xFF24566B), Color(0xFF71436B), Color(0xFF67512D), Color(0xFF394D79))[index % 4],
+                        modifier = Modifier.width(132.dp).height(120.dp)
+                    ) { vm.openBrowseCategory(language, BrowseCategoryKind.LANGUAGE) }
                 }
+            }
+        }
+        item {
+            HomeSectionHeading("Artists", "Your followed artists first, with more to explore", accent)
+            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                BrowseVisualCard(
+                    title = "Your Artists",
+                    subtitle = "Followed & discover",
+                    artwork = coverArts.getOrNull(0),
+                    tint = Color(0xFF31596B),
+                    modifier = Modifier.fillMaxWidth().height(112.dp)
+                ) { vm.setScreen(ScreenNav.ARTISTS) }
             }
         }
         item {
@@ -7571,8 +8421,202 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
             HomeSectionHeading("Quick discovery", "Go straight to a radio or your favourites", accent)
             Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
                 HomeShortcutCard("Radio", Icons.Default.Radio, accent, skin, Modifier.weight(1f)) { vm.setScreen(ScreenNav.RADIO) }
-                HomeShortcutCard("Artists", Icons.Default.Person, accent, skin, Modifier.weight(1f)) { vm.setScreen(ScreenNav.LIBRARY); vm.setLibraryTab(5) }
+                HomeShortcutCard("Artists", Icons.Default.Person, accent, skin, Modifier.weight(1f)) { vm.setScreen(ScreenNav.ARTISTS) }
                 HomeShortcutCard("Liked", Icons.Default.Favorite, accent, skin, Modifier.weight(1f)) { vm.setScreen(ScreenNav.LIBRARY); vm.setLibraryTab(1) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ArtistsBrowseScreen(vm: MainViewModel) {
+    val state by vm.state.collectAsState()
+    val skin = state.activeSkin
+    val accent = skin.highlight
+    var query by remember { mutableStateOf("") }
+    val followedArtists = state.listenerProfile.followedArtists
+        .map(String::trim).filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }
+    val artworkByArtist = (state.homeShelves.flatMap { it.songs } + state.savedPlaylists.flatMap { it.songs })
+        .distinctBy { it.id }
+
+    LaunchedEffect(Unit) {
+        if (state.artistBrowseResults.isEmpty() && !state.isLoadingArtistBrowse) vm.searchArtistsForBrowse("")
+    }
+
+    Column(Modifier.fillMaxSize().background(primaryBackdrop(skin))) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 18.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = vm::handleSystemBack) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back to Browse", tint = Color.White)
+            }
+            Column {
+                Text("ARTISTS", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.5.sp)
+                Text("Artists", color = Color.White, fontSize = 26.sp, fontWeight = FontWeight.ExtraBold)
+            }
+        }
+        LazyColumn(contentPadding = PaddingValues(bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (followedArtists.isNotEmpty()) {
+                item { HomeSectionHeading("Following", "Your artists, always at the top", accent) }
+                items(followedArtists, key = { "browse_followed_${it.lowercase(Locale.ROOT)}" }) { name ->
+                    val representative = artworkByArtist.firstOrNull { it.artist.equals(name, true) }
+                    ArtistSearchRow(
+                        ArtistItem("followed:${name.lowercase(Locale.ROOT)}", name, "Followed artist", representative?.coverUrl.orEmpty()),
+                        following = true,
+                        onFollow = { vm.toggleFollowedArtist(name) },
+                        onClick = { vm.openArtistByName(name) }
+                    )
+                }
+            } else {
+                item {
+                    Text(
+                        "Follow artists from search and they’ll appear here first.",
+                        color = Color.White.copy(alpha = 0.68f),
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp)
+                    )
+                }
+            }
+            item {
+                HomeSectionHeading("Find artists", "Search the catalogue and follow the ones you like", accent)
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedTextField(
+                        value = query,
+                        onValueChange = { query = it },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        placeholder = { Text("Search artists", color = Color.White.copy(alpha = 0.52f)) },
+                        leadingIcon = { Icon(Icons.Default.Search, contentDescription = null, tint = accent) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = Color.White,
+                            unfocusedTextColor = Color.White,
+                            focusedBorderColor = accent,
+                            unfocusedBorderColor = Color.White.copy(alpha = 0.24f),
+                            cursorColor = accent
+                        )
+                    )
+                    Button(onClick = { vm.searchArtistsForBrowse(query) }) {
+                        Text("Search")
+                    }
+                }
+            }
+            if (state.isLoadingArtistBrowse) {
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().padding(20.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        CircularProgressIndicator(color = accent, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Text("Finding artists…", color = Color.White.copy(alpha = 0.72f), fontSize = 13.sp)
+                    }
+                }
+            } else if (state.artistBrowseResults.isNotEmpty()) {
+                item { HomeSectionHeading(if (query.isBlank()) "Picked for your sound" else "Results", "Open an artist or follow them", accent) }
+                items(state.artistBrowseResults, key = { "browse_artist_${it.id}" }) { artist ->
+                    ArtistSearchRow(
+                        artist = artist,
+                        following = followedArtists.any { it.equals(artist.name, true) },
+                        onFollow = { vm.toggleFollowedArtist(artist.name) },
+                        onClick = { vm.openArtist(artist) }
+                    )
+                }
+            } else {
+                item {
+                    Text(
+                        "No artist results yet. Try a different name or check your connection.",
+                        color = Color.White.copy(alpha = 0.65f),
+                        fontSize = 13.sp,
+                        modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BrowseCategoryResultsScreen(vm: MainViewModel) {
+    val state by vm.state.collectAsState()
+    val skin = state.activeSkin
+    val accent = skin.highlight
+    val title = state.browseCategoryTitle
+    val kind = state.browseCategoryKind
+    val songs = state.browseCategorySongs
+
+    Column(Modifier.fillMaxSize().background(primaryBackdrop(skin))) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 18.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = vm::handleSystemBack) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back to Browse", tint = Color.White)
+            }
+            Column(Modifier.weight(1f)) {
+                Text(
+                    when (kind) {
+                        BrowseCategoryKind.MOOD -> "MOOD MIX"
+                        BrowseCategoryKind.GENRE -> "GENRE MIX"
+                        BrowseCategoryKind.LANGUAGE -> "LANGUAGE MIX"
+                    },
+                    color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.5.sp
+                )
+                Text(title, color = Color.White, fontSize = 25.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    when (kind) {
+                        BrowseCategoryKind.MOOD -> "A personal mix shaped by your taste and the sound of $title"
+                        BrowseCategoryKind.GENRE -> "Songs in $title, ranked around your listening taste"
+                        BrowseCategoryKind.LANGUAGE -> "Music in $title, with your favourites ranked first"
+                    },
+                    color = Color.White.copy(alpha = 0.65f), fontSize = 12.sp
+                )
+            }
+        }
+
+        when {
+            state.isLoadingBrowseCategory && songs.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    CircularProgressIndicator(color = accent)
+                    Text("Finding songs for $title…", color = Color.White.copy(alpha = 0.72f), fontSize = 13.sp)
+                }
+            }
+            songs.isEmpty() -> Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("No songs found for $title right now.", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                    TextButton(onClick = { vm.openBrowseCategory(title, kind) }) {
+                        Text("Try again", color = accent)
+                    }
+                }
+            }
+            else -> {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    Button(
+                        onClick = { songs.firstOrNull()?.let { vm.playSongFromShelf(it, songs, "phone_browse_${kind.name.lowercase(Locale.ROOT)}") } },
+                        colors = ButtonDefaults.buttonColors(containerColor = accent)
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Color.Black)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Play all", color = Color.Black, fontWeight = FontWeight.Bold)
+                    }
+                }
+                LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
+                    itemsIndexed(songs, key = { index, song -> "browse-category-${song.videoId.ifBlank { song.id }}-$index" }) { _, song ->
+                        BitchordSongRowItem(
+                            song = song,
+                            isCurrent = state.activeSong.id == song.id,
+                            onClick = { vm.playSongFromShelf(song, songs, "phone_browse_${kind.name.lowercase(Locale.ROOT)}") },
+                            vm = vm
+                        )
+                    }
+                }
             }
         }
     }
@@ -8007,6 +9051,7 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
         }
         Spacer(modifier = Modifier.height(40.dp))
     }
+
 }
 
 @Composable
@@ -8351,6 +9396,7 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
     val accent = state.activeSkin.highlight
+    var showGuide by remember { mutableStateOf(false) }
     var homePriority by remember {
         mutableStateOf(AndroidAutoHomeLayouts.normalizePriority(
             context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
@@ -8377,11 +9423,22 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item {
-            Text(
+                Text(
                     "Choose how KILO appears in your car. Android Auto keeps its driver-safe controls and applies the final card size and spacing.",
                     color = Color.White.copy(alpha = 0.65f), fontSize = 13.sp, lineHeight = 19.sp,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
                 )
+            }
+            item {
+                SettingsGroupCard {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("Quick guide to KILO in the car", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            Text("A short, skippable tour of Home, Browse, Radio, and Search.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp)
+                        }
+                        TextButton(onClick = { showGuide = true }) { Text("Take tour", color = accent) }
+                    }
+                }
             }
             item {
                 SettingsGroupCard {
@@ -8472,6 +9529,20 @@ fun AndroidAutoSettingsScreen(vm: MainViewModel) {
                 }
             }
         }
+    }
+    if (showGuide) {
+        KiloStepGuideDialog(
+            title = "KILO in Android Auto",
+            steps = listOf(
+                KiloGuideStep("Four places to start", "The car screen has Home, Browse, Radio, and Search. Android Auto displays them with its standard driver-safe controls."),
+                KiloGuideStep("Home", "Continue Listening and Quick Picks are at the top, followed by recent and personalized music."),
+                KiloGuideStep("Browse", "Open moods, genres, languages, and your library categories. Pick a category to see matching music."),
+                KiloGuideStep("Radio", "Start a station for continuous listening, or return to a station you played recently."),
+                KiloGuideStep("Search", "Use voice search while driving when possible. Choose or organize a queue before you start moving."),
+            ),
+            accent = accent,
+            onDismiss = { showGuide = false }
+        )
     }
 }
 
@@ -8739,17 +9810,20 @@ fun ExploreScreen(vm: MainViewModel) {
         listOf("Pop", "Hip-Hop", "R&B", "Electronic", "Rock", "Lofi", "Indie Rock", "Bollywood")
     }
 
-    fun openBrowseCategory(category: String) {
-        vm.setDiscoveryMood(category)
-        vm.onSearchQueryChanged(category)
+    fun searchCollection(query: String) {
+        vm.onSearchQueryChanged(query)
         vm.setScreen(ScreenNav.SEARCH)
     }
 
     Column(modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)).padding(top = 16.dp)) {
         Text(when (skin.layoutFamily) { 0 -> "Explore, in glass"; 1 -> "Browse everything"; 2 -> "Explore & Vibe Reels"; 3 -> "Browse new sounds"; else -> "The sound stream" }, color = Color.White, fontSize = if (skin.layoutFamily == 3) 30.sp else 26.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 20.dp))
         Spacer(modifier = Modifier.height(8.dp))
-        BrowseCategoryTags("MOODS", moodTags, state.selectedMood, skin, accent) { category -> openBrowseCategory(category) }
-        BrowseCategoryTags("GENRES", genreTags, state.selectedMood, skin, accent) { category -> openBrowseCategory(category) }
+        BrowseCategoryTags("MOODS", moodTags, state.selectedMood, skin, accent) { category ->
+            vm.openBrowseCategory(category, BrowseCategoryKind.MOOD)
+        }
+        BrowseCategoryTags("GENRES", genreTags, state.selectedMood, skin, accent) { category ->
+            vm.openBrowseCategory(category, BrowseCategoryKind.GENRE)
+        }
         KiloSection("QUICK BROWSE", accent = accent)
         LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             val genres = listOf("Discover", "Global Top 50", "80s & 90s Classics", "Synthwave", "Indie Chill", "Alternative", "Electronic", "R&B")
@@ -8761,7 +9835,11 @@ fun ExploreScreen(vm: MainViewModel) {
                         .then(if (skin.layoutFamily == 0) Modifier.border(1.dp, Color.White.copy(alpha = 0.12f), primaryCardShape(skin)) else Modifier)
                         .clickable {
                             if (mood != "Discover") {
-                                openBrowseCategory(mood)
+                                if (mood in setOf("Synthwave", "Alternative", "Electronic", "R&B")) {
+                                    vm.openBrowseCategory(mood, BrowseCategoryKind.GENRE)
+                                } else {
+                                    searchCollection(mood)
+                                }
                             } else {
                                 vm.setDiscoveryMood(mood)
                             }
@@ -8836,14 +9914,91 @@ fun SearchScreen(vm: MainViewModel) {
     val accent = skin.highlight
     var selectedSearchTab by remember { mutableIntStateOf(0) }
 
-    if (!state.isLoggedIn) {
-        SignInRequiredContent(vm, skin)
-        return
+    val context = LocalContext.current
+    val disclosurePreferences = remember(context) { context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE) }
+    var showRecognitionDisclosure by remember { mutableStateOf(false) }
+    var showRecognitionTokenDialog by remember { mutableStateOf(false) }
+    var recognitionToken by remember { mutableStateOf(AuddTokenStore(context).read().orEmpty()) }
+    val microphonePermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) vm.recognizeSong()
+        else Toast.makeText(context, "Microphone access is needed to identify a song.", Toast.LENGTH_LONG).show()
     }
+    LaunchedEffect(Unit) { vm.loadRecognitionHistory() }
+    val displayList = if (state.searchQuery.isBlank()) emptyList() else state.searchResults
+    val playlistQuery = state.searchQuery.trim()
+    val savedPlaylistResults = state.savedPlaylists.filter { playlistQuery.isBlank() || it.name.contains(playlistQuery, ignoreCase = true) }
+    val youtubePlaylistResults = state.youtubeMusicPlaylists.filter {
+        playlistQuery.isBlank() || it.title.contains(playlistQuery, ignoreCase = true) || it.artist.contains(playlistQuery, ignoreCase = true)
+    }
+    val communityPlaylistResults = state.communityPlaylistResults
+    val youtubeSearchPlaylistResults = state.youtubeSearchPlaylistResults
+    val hasPlaylistResults = savedPlaylistResults.isNotEmpty() || youtubePlaylistResults.isNotEmpty() ||
+        youtubeSearchPlaylistResults.isNotEmpty() || communityPlaylistResults.isNotEmpty()
 
-    Column(modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)).padding(top = 16.dp)) {
-        Text(when (skin.layoutFamily) { 0 -> "Find your frequency"; 1 -> "Search"; 2 -> "Search YouTube Music"; 3 -> "What do you want to hear?"; else -> "Search the sound" }, color = Color.White, fontSize = if (skin.layoutFamily == 3) 30.sp else 27.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 20.dp))
+    LazyColumn(
+        modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)),
+        contentPadding = PaddingValues(top = 16.dp, bottom = 24.dp)
+    ) {
+        item {
+            Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 20.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                when (skin.layoutFamily) { 0 -> "Find your frequency"; 1 -> "Search"; 2 -> "Search YouTube Music"; 3 -> "What do you want to hear?"; else -> "Search the sound" },
+                color = Color.White,
+                fontSize = if (skin.layoutFamily == 3) 30.sp else 27.sp,
+                fontWeight = FontWeight.ExtraBold,
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedButton(
+                onClick = {
+                    if (disclosurePreferences.getBoolean("song_recognition_disclosure_seen", false)) showRecognitionTokenDialog = true
+                    else showRecognitionDisclosure = true
+                },
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+            ) {
+                Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(17.dp))
+                Spacer(Modifier.width(5.dp))
+                Text("Recognize", fontSize = 12.sp)
+            }
+        }
         Spacer(modifier = Modifier.height(12.dp))
+        if (state.isRecognizingSong || state.recognitionMessage != null || state.recognitionResult != null) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
+                if (state.isRecognizingSong) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth(), color = accent)
+                    Text("Listening and checking with AudD…", color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                } else if (state.recognitionResult != null) {
+                    val match = requireNotNull(state.recognitionResult)
+                    Row(
+                        Modifier.fillMaxWidth().clip(primaryCardShape(skin)).background(primaryPanelColor(skin)).padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text("${match.title} · ${match.artist}", color = Color.White, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text("Identified by AudD", color = accent, fontSize = 11.sp)
+                            Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                                TextButton(onClick = vm::playRecognizedSongNow, contentPadding = PaddingValues(horizontal = 5.dp)) {
+                                    Text("Play", color = accent, fontSize = 11.sp)
+                                }
+                                TextButton(onClick = vm::queueRecognizedSongNext, contentPadding = PaddingValues(horizontal = 5.dp)) {
+                                    Text("Play next", color = accent, fontSize = 11.sp)
+                                }
+                                TextButton(onClick = vm::searchRecognizedSong, contentPadding = PaddingValues(horizontal = 5.dp)) {
+                                    Text("Find", color = accent, fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Text(state.recognitionMessage.orEmpty(), color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp)
+                }
+            }
+        }
         OutlinedTextField(
             value = state.searchQuery,
             onValueChange = { vm.onSearchQueryChanged(it) },
@@ -8866,11 +10021,53 @@ fun SearchScreen(vm: MainViewModel) {
             )
         )
 
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            itemsIndexed(listOf("Songs", "Artists", "Playlists")) { index, title ->
+                val selected = selectedSearchTab == index
+                val titleWithCount = when (index) {
+                    1 -> if (state.artistSearchResults.isNotEmpty()) "$title (${state.artistSearchResults.size})" else title
+                    2 -> if (hasPlaylistResults) "$title (${savedPlaylistResults.size + youtubePlaylistResults.size + youtubeSearchPlaylistResults.size + communityPlaylistResults.size})" else title
+                    else -> title
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(if (selected) accent else primaryPanelColor(skin))
+                        .clickable { selectedSearchTab = index }
+                        .padding(horizontal = 15.dp, vertical = 9.dp)
+                ) {
+                    Text(
+                        titleWithCount,
+                        color = if (selected) Color.Black else Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+
         if (state.searchQuery.isBlank() && state.searchSuggestions.isNotEmpty()) {
             KiloSection("RECENT SEARCHES", accent = accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(state.searchSuggestions.take(8)) { recent ->
                     FilterChip(selected = false, onClick = { vm.onSearchQueryChanged(recent) }, label = { Text(recent, maxLines = 1) })
+                }
+            }
+        }
+        if (state.searchQuery.isBlank() && state.recognitionHistory.isNotEmpty()) {
+            KiloSection("RECENTLY RECOGNIZED", accent = accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(state.recognitionHistory.take(8), key = { "recognition_${it.id}" }) { item ->
+                    FilterChip(
+                        selected = false,
+                        onClick = { vm.onSearchQueryChanged("${item.title} ${item.artist}") },
+                        label = { Text("${item.title} · ${item.artist}", maxLines = 1) }
+                    )
                 }
             }
         }
@@ -8882,114 +10079,208 @@ fun SearchScreen(vm: MainViewModel) {
                 }
             }
         }
-        KiloSection("SEARCH TYPES", accent = accent)
-        LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(listOf("Songs", "Artists", "Albums", "Playlists", "Podcasts", "Languages", "Moods", "Genres")) { type ->
-                FilterChip(
-                    selected = false,
-                    onClick = { vm.onSearchQueryChanged(listOf(state.searchQuery, type).filter(String::isNotBlank).joinToString(" ")) },
-                    label = { Text(type) }
+        if (state.searchQuery.isBlank()) {
+            KiloSection("SEARCH TYPES", accent = accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(listOf("Songs", "Artists", "Albums", "Playlists", "Podcasts", "Languages", "Moods", "Genres")) { type ->
+                    FilterChip(
+                        selected = false,
+                        onClick = { vm.onSearchQueryChanged(listOf(state.searchQuery, type).filter(String::isNotBlank).joinToString(" ")) },
+                        label = { Text(type) }
+                    )
+                }
+            }
+            KiloSection("ADVANCED FILTERS", accent = accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(SearchEnhancer.quickFilters()) { filter ->
+                    val shape = RoundedCornerShape(50)
+                    Box(
+                        Modifier.clip(shape).background(primaryPanelColor(skin))
+                            .border(1.dp, accent.copy(alpha = 0.35f), shape)
+                            .clickable {
+                                val applied = if (filter.queryTerm.startsWith("(")) {
+                                    "${filter.label} songs"
+                                } else filter.queryTerm
+                                vm.onSearchQueryChanged(applied)
+                            }
+                            .padding(horizontal = 13.dp, vertical = 8.dp)
+                    ) { Text(filter.label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+                }
+            }
+        }
+
+            }
+        }
+
+        if (selectedSearchTab == 0) {
+            when {
+                state.searchQuery.isBlank() -> item {
+                    Text(
+                        "Search for a song, artist, album, or playlist to see results here.",
+                        color = Color.White.copy(alpha = 0.62f),
+                        fontSize = 13.sp,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 20.dp)
+                    )
+                }
+                state.isSearching -> item {
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 20.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        CircularProgressIndicator(color = accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text("Searching music…", color = Color.White.copy(alpha = 0.72f), fontSize = 13.sp)
+                    }
+                }
+                displayList.isEmpty() -> item {
+                    Text(
+                        "No results found. Try another search.",
+                        color = Color.White.copy(alpha = 0.62f),
+                        fontSize = 13.sp,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 20.dp)
+                    )
+                }
+            }
+            if (displayList.isNotEmpty()) item { SettingsSectionHeader("SONGS") }
+            itemsIndexed(displayList, key = { _, song -> "search-song-${song.videoId.ifBlank { song.id }}" }) { _, song ->
+                BitchordSongRowItem(
+                    song = song,
+                    isCurrent = state.activeSong.id == song.id,
+                    onClick = { vm.playSongFromShelf(song, displayList) },
+                    vm = vm
                 )
             }
-        }
-        KiloSection("ADVANCED FILTERS", accent = accent)
-        LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(SearchEnhancer.quickFilters()) { filter ->
-                val shape = RoundedCornerShape(50)
-                Box(
-                    Modifier.clip(shape).background(primaryPanelColor(skin))
-                        .border(1.dp, accent.copy(alpha = 0.35f), shape)
-                        .clickable {
-                            val applied = if (filter.queryTerm.startsWith("(")) {
-                                if (state.searchQuery.isBlank()) "${filter.label} songs" else "${state.searchQuery} ${filter.queryTerm}"
-                            } else if (state.searchQuery.isBlank()) filter.queryTerm else "${state.searchQuery} ${filter.queryTerm}"
-                            vm.onSearchQueryChanged(applied)
-                        }
-                        .padding(horizontal = 13.dp, vertical = 8.dp)
-                ) { Text(filter.label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+        } else if (selectedSearchTab == 1) {
+            if (state.searchQuery.isNotBlank() && !state.isSearching && state.artistSearchResults.isEmpty()) {
+                item { Text("No artists found for this search.", color = Color.White.copy(alpha = 0.62f), modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp)) }
             }
-        }
-        if (state.searchQuery.isNotBlank() && state.searchSuggestions.isNotEmpty()) {
-            KiloSection("SUGGESTIONS", accent = accent)
-            LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(state.searchSuggestions) { suggestion ->
-                    val shape = RoundedCornerShape(50)
+            itemsIndexed(state.artistSearchResults, key = { _, artist -> "artist-tab-${artist.id}" }) { _, artist ->
+                ArtistSearchRow(artist, artist.name in state.listenerProfile.followedArtists, { vm.toggleFollowedArtist(artist.name) }) { vm.openArtist(artist) }
+            }
+        } else if (selectedSearchTab == 2) {
+            if (!state.isSearching && !state.isSearchingYouTubePlaylists && !hasPlaylistResults) {
+                item {
+                    val emptyMessage = if (playlistQuery.isBlank()) {
+                        "Your saved and YouTube Music playlists will appear here."
+                    } else {
+                        "No playlists found. Try another search."
+                    }
+                    Text(emptyMessage, color = Color.White.copy(alpha = 0.62f), modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp))
+                }
+            }
+            if (state.isSearchingYouTubePlaylists && !hasPlaylistResults) {
+                item {
                     Row(
-                        Modifier.clip(shape).background(Color.White.copy(alpha = 0.045f))
-                            .border(1.dp, Color.White.copy(alpha = 0.08f), shape)
-                            .clickable { vm.onSearchQueryChanged(suggestion) }
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 20.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Icon(Icons.Default.History, contentDescription = null, tint = accent, modifier = Modifier.size(14.dp))
-                        Text(suggestion, color = Color.White.copy(alpha = 0.88f), fontSize = 11.sp, maxLines = 1)
+                        CircularProgressIndicator(color = accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text("Searching YouTube playlists…", color = Color.White.copy(alpha = 0.72f), fontSize = 13.sp)
                     }
                 }
             }
-        }
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            listOf("Songs", "Artists", "Community playlists").forEachIndexed { index, title ->
-                val selected = selectedSearchTab == index
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(if (selected) accent else primaryPanelColor(skin))
-                        .clickable { selectedSearchTab = index }
-                        .padding(horizontal = 15.dp, vertical = 9.dp)
-                ) {
-                    Text(
-                        when (index) {
-                            1 -> if (state.artistSearchResults.isNotEmpty()) "$title (${state.artistSearchResults.size})" else title
-                            2 -> if (state.communityPlaylistResults.isNotEmpty()) "$title (${state.communityPlaylistResults.size})" else title
-                            else -> title
-                        },
-                        color = if (selected) Color.Black else Color.White,
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.SemiBold
-                    )
+            if (savedPlaylistResults.isNotEmpty()) {
+                item { SettingsSectionHeader("KILO PLAYLISTS") }
+                items(savedPlaylistResults, key = { "kilo-search-playlist-${it.id}" }) { playlist ->
+                    SavedPlaylistSearchRow(playlist) {
+                        playlist.songs.firstOrNull()?.let { vm.playSongFromShelf(it, playlist.songs, "phone_playlist") }
+                    }
                 }
             }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        val displayList = if (state.searchQuery.isBlank()) state.playlist else state.searchResults
-
-        LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-            if (selectedSearchTab == 0) {
-                if (state.artistSearchResults.isNotEmpty()) {
-                    item { SettingsSectionHeader("ARTISTS") }
-                    itemsIndexed(state.artistSearchResults.take(5), key = { _, artist -> "search-artist-${artist.id}" }) { _, artist ->
-                        ArtistSearchRow(artist, artist.name in state.listenerProfile.followedArtists, { vm.toggleFollowedArtist(artist.name) }) { vm.openArtist(artist) }
+            if (youtubePlaylistResults.isNotEmpty()) {
+                item { SettingsSectionHeader("YOUR YOUTUBE MUSIC PLAYLISTS") }
+                items(youtubePlaylistResults, key = { "youtube-search-playlist-${it.playlistId}" }) { playlist ->
+                    CommunityPlaylistSearchRow(playlist, subtitleLabel = "Your YouTube Music playlist") {
+                        vm.playSongFromShelf(playlist, state.youtubeMusicPlaylists, "phone_playlist")
                     }
-                    item { SettingsSectionHeader("SONGS") }
                 }
-                itemsIndexed(displayList) { _, song ->
-                    BitchordSongRowItem(
-                        song = song,
-                        isCurrent = state.activeSong.id == song.id,
-                        onClick = { vm.playSongFromShelf(song, displayList) },
-                        vm = vm
-                    )
+            }
+            if (youtubeSearchPlaylistResults.isNotEmpty()) {
+                item { SettingsSectionHeader("YOUTUBE PLAYLISTS") }
+                items(youtubeSearchPlaylistResults, key = { "youtube-public-playlist-${it.playlistId}" }) { playlist ->
+                    CommunityPlaylistSearchRow(playlist, subtitleLabel = "${playlist.artist} · YouTube playlist") {
+                        vm.playSongFromShelf(playlist, listOf(playlist), "phone_youtube_playlist_search")
+                    }
                 }
-            } else if (selectedSearchTab == 1) {
-                itemsIndexed(state.artistSearchResults, key = { _, artist -> artist.id }) { _, artist ->
-                    ArtistSearchRow(artist, artist.name in state.listenerProfile.followedArtists, { vm.toggleFollowedArtist(artist.name) }) { vm.openArtist(artist) }
-                }
-            } else {
-                itemsIndexed(state.communityPlaylistResults, key = { _, playlist -> playlist.id }) { _, playlist ->
+            }
+            if (communityPlaylistResults.isNotEmpty()) {
+                item { SettingsSectionHeader("COMMUNITY PLAYLISTS") }
+                itemsIndexed(communityPlaylistResults, key = { _, playlist -> "community-playlist-${playlist.id}" }) { _, playlist ->
                     CommunityPlaylistSearchRow(playlist) {
-                        vm.playSongFromShelf(playlist, listOf(playlist))
+                        vm.playSongFromShelf(playlist, listOf(playlist), "phone_playlist_search")
                     }
                 }
             }
         }
+
+    }
+
+    if (showRecognitionDisclosure) {
+        AlertDialog(
+            onDismissRequest = { showRecognitionDisclosure = false },
+            title = { Text("Song recognition", fontWeight = FontWeight.Bold) },
+            text = {
+                Text("When you choose Recognize, KILO records about five seconds from your microphone and sends that sample to AudD to identify the music. KILO asks for microphone access only when you start recognition.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    disclosurePreferences.edit().putBoolean("song_recognition_disclosure_seen", true).apply()
+                    showRecognitionDisclosure = false
+                    showRecognitionTokenDialog = true
+                }) { Text("Continue", color = accent) }
+            },
+            dismissButton = { TextButton(onClick = { showRecognitionDisclosure = false }) { Text("Not now") } },
+            containerColor = Color(0xFF17131F),
+            titleContentColor = Color.White,
+            textContentColor = Color.White.copy(alpha = 0.82f)
+        )
+    }
+
+    if (showRecognitionTokenDialog) {
+        AlertDialog(
+            onDismissRequest = { showRecognitionTokenDialog = false },
+            title = { Text("Recognize a song", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Enter your AudD API token. KILO saves it encrypted on this device.", color = Color.White.copy(alpha = 0.74f), fontSize = 13.sp)
+                    OutlinedTextField(
+                        value = recognitionToken,
+                        onValueChange = { recognitionToken = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        label = { Text("AudD API token") },
+                        visualTransformation = PasswordVisualTransformation()
+                    )
+                    if (state.recognitionMessage != null && !state.isRecognizingSong) {
+                        Text(state.recognitionMessage.orEmpty(), color = Color.White.copy(alpha = 0.68f), fontSize = 12.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = recognitionToken.isNotBlank() && !state.isRecognizingSong,
+                    onClick = {
+                        if (!vm.saveRecognitionToken(recognitionToken)) {
+                            Toast.makeText(context, "Could not securely save that token.", Toast.LENGTH_SHORT).show()
+                            return@TextButton
+                        }
+                        showRecognitionTokenDialog = false
+                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                            vm.recognizeSong()
+                        } else {
+                            microphonePermission.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    }
+                ) { Text(if (state.isRecognizingSong) "Listening…" else "Recognize", color = accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRecognitionTokenDialog = false }) { Text("Cancel") }
+            },
+            containerColor = Color(0xFF17131F),
+            titleContentColor = Color.White,
+            textContentColor = Color.White.copy(alpha = 0.82f)
+        )
     }
 }
 
@@ -9079,10 +10370,33 @@ fun ArtistDetailScreen(vm: MainViewModel) {
 }
 
 @Composable
-private fun CommunityPlaylistSearchRow(playlist: SongItemClean, onClick: () -> Unit) {
+private fun SavedPlaylistSearchRow(playlist: SavedPlaylist, onClick: () -> Unit) {
+    KiloPlaylistCard(
+        title = playlist.name,
+        subtitle = "${playlist.songs.size} songs · KILO playlist",
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+        artworkSize = 64.dp,
+        onClick = onClick,
+        trailingContent = { Icon(Icons.Default.PlayArrow, contentDescription = "Play playlist", tint = Color.White) }
+    ) {
+        val artwork = playlist.songs.firstOrNull()?.coverUrl
+        if (!artwork.isNullOrBlank()) {
+            AsyncImage(model = artwork, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+        } else {
+            Icon(Icons.Default.QueueMusic, contentDescription = null, tint = Color.White.copy(alpha = 0.78f), modifier = Modifier.align(Alignment.Center))
+        }
+    }
+}
+
+@Composable
+private fun CommunityPlaylistSearchRow(
+    playlist: SongItemClean,
+    subtitleLabel: String? = null,
+    onClick: () -> Unit
+) {
     KiloPlaylistCard(
         title = playlist.title,
-        subtitle = playlist.artist.ifBlank { "Community playlist" },
+        subtitle = playlist.artist.ifBlank { subtitleLabel ?: "Community playlist" },
         modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
         artworkSize = 64.dp,
         onClick = onClick,
@@ -9097,37 +10411,30 @@ fun LibraryScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val skin = state.activeSkin
     val accent = skin.highlight
-    val allSongs = (state.playlist + state.quickPicks + Favorites.songs() + state.downloadedSongs).distinctBy { it.id }
     val favorites = Favorites.songs()
-    val downloaded = state.downloadedSongs
-    val history = remember(state.activeSong.id) { SessionStore.recentSongs() }
-    val albums = allSongs.filter { it.album.isNotBlank() && it.album != "YouTube Music" }
-        .groupBy { it.album.trim() }.toList().sortedBy { it.first.lowercase(Locale.ROOT) }
-    val followedArtists = state.listenerProfile.followedArtists.toList()
-    val artists = (followedArtists + allSongs.map { it.artist }.filter(String::isNotBlank))
-        .distinctBy { it.trim().lowercase(Locale.ROOT) }
+    val followedArtists = state.listenerProfile.followedArtists
+        .map(String::trim).filter(String::isNotBlank).distinctBy { it.lowercase(Locale.ROOT) }
+    val artistArtworkSongs = (favorites + state.savedPlaylists.flatMap { it.songs })
+        .distinctBy { it.id }
 
     Column(modifier = Modifier.fillMaxSize().background(primaryBackdrop(skin)).padding(top = 16.dp)) {
         Text(when (skin.layoutFamily) { 0 -> "Your collection"; 1 -> "Your Library"; 2 -> "Library"; 3 -> "Your music"; else -> "My collection" }, color = Color.White, fontSize = if (skin.layoutFamily == 3) 30.sp else 28.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(horizontal = 20.dp))
         Spacer(modifier = Modifier.height(12.dp))
 
         val libTabs = listOf(
-            "All (${allSongs.size})",
-            "Liked Songs (${favorites.size})",
-            "Downloads (${downloaded.size})",
-            "Playlists (${state.savedPlaylists.size + state.youtubeMusicPlaylists.size})",
-            "Albums (${albums.size})",
-            "Artists (${artists.size})",
-            "History (${history.size})"
+            1 to "Liked Songs (${favorites.size})",
+            3 to "Playlists (${state.savedPlaylists.size + state.youtubeMusicPlaylists.size})",
+            5 to "Artists (${followedArtists.size})"
         )
+        val activeLibraryTab = state.libraryTab.takeIf { it in setOf(1, 3, 5) } ?: 1
         LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            itemsIndexed(libTabs) { idx, tabName ->
-                val active = state.libraryTab == idx
+            items(libTabs) { (tabIndex, tabName) ->
+                val active = activeLibraryTab == tabIndex
                 Box(
                     modifier = Modifier
                         .clip(primaryCardShape(skin))
                         .background(if (active) accent else primaryPanelColor(skin))
-                        .clickable { vm.setLibraryTab(idx) }
+                        .clickable { vm.setLibraryTab(tabIndex) }
                         .padding(horizontal = 16.dp, vertical = 8.dp)
                 ) {
                     Text(tabName, color = if (active) Color.Black else Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
@@ -9137,51 +10444,20 @@ fun LibraryScreen(vm: MainViewModel) {
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        val displayedSongs = when (state.libraryTab) {
-            1 -> favorites
-            2 -> downloaded
-            3 -> emptyList()
-            6 -> history
-            else -> allSongs
-        }
+        val displayedSongs = if (activeLibraryTab == 1) favorites else emptyList()
 
-        if (state.libraryTab == 4) {
-            if (albums.isEmpty()) {
-                Box(Modifier.fillMaxSize().padding(horizontal = 32.dp), contentAlignment = Alignment.Center) {
-                    Text("Albums will appear here as KILO builds your collection.", color = Color.Gray, textAlign = TextAlign.Center)
-                }
-            } else LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                items(albums, key = { "library_album_${it.first}" }) { (albumTitle, songs) ->
-                    val firstSong = songs.first()
-                    Row(
-                        Modifier.fillMaxWidth().clickable { vm.playSongFromShelf(firstSong, songs) }
-                            .padding(horizontal = 20.dp, vertical = 9.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        AsyncImage(model = firstSong.coverUrl, contentDescription = null, contentScale = ContentScale.Crop,
-                            modifier = Modifier.size(58.dp).clip(RoundedCornerShape(14.dp)))
-                        Column(Modifier.weight(1f)) {
-                            Text(albumTitle, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text("${songs.size} tracks · ${songs.first().artist}", color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        }
-                        Icon(Icons.Default.PlayArrow, contentDescription = "Play album", tint = accent)
-                    }
-                }
-            }
-        } else if (state.libraryTab == 5) {
-            if (artists.isEmpty()) {
+        if (activeLibraryTab == 5) {
+            if (followedArtists.isEmpty()) {
                 Box(Modifier.fillMaxSize().padding(horizontal = 32.dp), contentAlignment = Alignment.Center) {
                     Text("Follow artists in Personalisation to build your artist library.", color = Color.Gray, textAlign = TextAlign.Center)
                 }
             } else LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                items(artists, key = { "library_artist_${it.lowercase(Locale.ROOT)}" }) { name ->
-                    val representative = allSongs.firstOrNull { it.artist.equals(name, true) }
+                items(followedArtists, key = { "library_artist_${it.lowercase(Locale.ROOT)}" }) { name ->
+                    val representative = artistArtworkSongs.firstOrNull { it.artist.equals(name, true) }
                     ArtistSearchRow(
-                        ArtistItem("library:${name.lowercase(Locale.ROOT)}", name,
-                            if (followedArtists.any { it.equals(name, true) }) "Followed artist" else "From your library",
+                        ArtistItem("library:${name.lowercase(Locale.ROOT)}", name, "Followed artist",
                             representative?.coverUrl.orEmpty()),
-                        following = followedArtists.any { it.equals(name, true) },
+                        following = true,
                         onFollow = { vm.toggleFollowedArtist(name) },
                         onClick = { vm.openArtistByName(name) }
                     )
@@ -9423,6 +10699,7 @@ private fun musicRegionOptions(): List<Pair<String, String>> =
 @Composable
 fun BitChordSetupWizard(vm: MainViewModel) {
     val state by vm.state.collectAsState()
+    val context = LocalContext.current
 
     Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF0A0B10)) {
         Column(
@@ -9474,7 +10751,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
 
                     1 -> WizardStepContent(
                         "Choose your source",
-                        "You can browse public music immediately. Sign in only if you want your personal YouTube Music library and mixes."
+                        "Public music is ready without an account. You can optionally connect YouTube Music now, or skip sign-in and connect later in Settings."
                     ) {
                         Column(
                             modifier = Modifier.fillMaxWidth(),
@@ -9513,6 +10790,11 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                                     Text("Connect YouTube Music (optional)")
                                 }
                             }
+                            Text(
+                                "An account is optional; you can start listening without signing in.",
+                                color = Color.White.copy(alpha = 0.55f),
+                                fontSize = 12.sp
+                            )
                         }
                     }
 
@@ -9566,7 +10848,11 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                         colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight)
                     ) {
                         Text(
-                            if (state.setupStep >= 2) "Start listening" else "Continue",
+                            when {
+                                state.setupStep >= 2 -> "Start listening"
+                                state.setupStep == 1 && !state.isLoggedIn -> "Skip for now"
+                                else -> "Continue"
+                            },
                             color = Color.Black,
                             fontWeight = FontWeight.ExtraBold
                         )

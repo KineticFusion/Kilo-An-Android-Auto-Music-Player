@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 23
-        versionName = "2.7.1"
+        versionCode = 25
+        versionName = "2.8.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -61,6 +61,7 @@ androidComponents {
         implementation("androidx.appcompat:appcompat:1.7.0")
         implementation(project(":core-streaming"))
         implementation(project(":core-profile"))
+        implementation(project(":core-mood"))
         implementation(project(":core-search"))
         implementation(project(":core-ui"))
         implementation(project(":core-androidauto"))
@@ -70,6 +71,15 @@ androidComponents {
         implementation(project(":core-discoveryradar"))
         implementation(project(":core-timemachine"))
         implementation(project(":core-updates"))
+        implementation(project(":audioanalysis"))
+        implementation(project(":djmode"))
+        implementation(project(":songrecognition"))
+        implementation(project(":casting"))
+        implementation(project(":playbackcache"))
+        implementation(project(":buffermanager"))
+        implementation(project(":sourceprefetch"))
+        implementation(project(":networkmonitor"))
+        implementation(project(":playbackrecovery"))
         implementation(libs.androidx.lifecycle.runtime.ktx)
         implementation(libs.androidx.room.runtime)
         ksp(libs.androidx.room.compiler)

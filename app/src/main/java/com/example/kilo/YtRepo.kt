@@ -7,10 +7,15 @@ import com.example.kilo.streaming.StreamInfo
 import okhttp3.OkHttpClient
 import org.json.JSONArray
 import org.json.JSONObject
+import org.schabi.newpipe.extractor.playlist.PlaylistInfo
+import org.schabi.newpipe.extractor.playlist.PlaylistInfoItem
+import org.schabi.newpipe.extractor.search.SearchInfo
 import org.schabi.newpipe.extractor.NewPipe
 import org.schabi.newpipe.extractor.ServiceList
 import org.schabi.newpipe.extractor.stream.DeliveryMethod
+import org.schabi.newpipe.extractor.stream.StreamInfoItem
 import org.schabi.newpipe.extractor.stream.StreamInfo as NPStreamInfo
+import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeSearchQueryHandlerFactory
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -277,6 +282,40 @@ object YtRepo {
         return parseCommunityPlaylistResults(fallback)
     }
 
+    /** Searches regular public YouTube playlists, separately from YouTube Music community playlists. */
+    fun searchYouTubePlaylists(query: String): List<SongItemClean> {
+        if (query.isBlank()) return emptyList()
+        return runCatching {
+            val service = ServiceList.YouTube
+            val handler = service.searchQHFactory.fromQuery(
+                query,
+                listOf(YoutubeSearchQueryHandlerFactory.PLAYLISTS),
+                null
+            )
+            SearchInfo.getInfo(service, handler).relatedItems
+                .filterIsInstance<PlaylistInfoItem>()
+                .mapIndexedNotNull { index, item ->
+                    val playlistId = Regex("[?&]list=([^&]+)").find(item.url)
+                        ?.groupValues?.getOrNull(1)
+                        ?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{10,}")) }
+                        ?: return@mapIndexedNotNull null
+                    val artwork = item.thumbnails.maxByOrNull { it.width.toLong() * it.height }?.url.orEmpty()
+                    SongItemClean(
+                        id = "yt_playlist_$playlistId",
+                        playlistId = playlistId,
+                        title = item.name,
+                        artist = item.uploaderName.orEmpty().ifBlank { "YouTube" },
+                        album = "YouTube playlist",
+                        coverUrl = artwork,
+                        themeColor = paletteColors[index % paletteColors.size]
+                    )
+                }
+                .distinctBy { it.playlistId }
+                .take(20)
+        }.onFailure { Log.w(TAG, "YouTube playlist search failed", it) }
+            .getOrDefault(emptyList())
+    }
+
     private fun parseCommunityPlaylistResults(json: JSONObject): List<SongItemClean> {
         val twoRowItems = mutableListOf<JSONObject>()
         collect(json, "musicTwoRowItemRenderer", twoRowItems)
@@ -403,7 +442,8 @@ object YtRepo {
             JSONObject().put("playlistId", playlistId)
                 .put("enablePersistentPlaylistPanel", true)
                 .put("isAudioOnly", true)
-        ) ?: return emptyList()
+        )
+        if (json == null) return fetchPublicYouTubePlaylistTracks(playlistId)
         val tracks = mutableListOf<SongItemClean>()
         var pages = 0
         while (json != null && pages < 20) {
@@ -436,8 +476,29 @@ object YtRepo {
             )
             pages++
         }
-        return tracks.distinctBy { it.videoId }
+        return tracks.distinctBy { it.videoId }.ifEmpty { fetchPublicYouTubePlaylistTracks(playlistId) }
     }
+
+    private fun fetchPublicYouTubePlaylistTracks(playlistId: String): List<SongItemClean> = runCatching {
+        val url = "https://www.youtube.com/playlist?list=$playlistId"
+        val info = PlaylistInfo.getInfo(ServiceList.YouTube, url)
+        info.relatedItems.filterIsInstance<StreamInfoItem>().mapIndexedNotNull { index, item ->
+            val videoId = Regex("(?:[?&]v=|youtu\\.be/)([A-Za-z0-9_-]{11})")
+                .find(item.url)?.groupValues?.getOrNull(1) ?: return@mapIndexedNotNull null
+            val artwork = item.thumbnails.maxByOrNull { it.width.toLong() * it.height }?.url.orEmpty()
+            SongItemClean(
+                id = videoId,
+                videoId = videoId,
+                title = item.name,
+                artist = item.uploaderName.orEmpty().ifBlank { "Unknown artist" },
+                album = "YouTube playlist",
+                coverUrl = artwork,
+                themeColor = paletteColors[index % paletteColors.size],
+                durationMs = item.duration.coerceAtLeast(0L) * 1_000L
+            )
+        }.distinctBy { it.videoId }
+    }.onFailure { Log.w(TAG, "YouTube playlist loading failed for $playlistId", it) }
+        .getOrDefault(emptyList())
 
     /** Best-effort YouTube Music lyrics lookup via the song's Lyrics browse tab. */
     fun fetchLyrics(song: SongItemClean): List<LyricLine> {

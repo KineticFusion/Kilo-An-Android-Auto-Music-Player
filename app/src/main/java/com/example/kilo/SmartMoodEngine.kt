@@ -1,6 +1,7 @@
 package com.example.kilo
 
 import java.util.Locale
+import com.example.kilo.audioanalysis.TrackAnalysisEntity
 
 data class SmartMoodProfile(
     val name: String, val genres: List<String>, val energy: Int, val tempo: Int,
@@ -35,10 +36,30 @@ object SmartMoodEngine {
         p("Happy", "Pop|Funk|Disco|Dance", 75, 75, 50, 75, 20, 95, 60, 2000, "Vocal Focus", "Sunrise", 0xFFFFC857, "Upbeat quick mix"),
         p("Sad", "Acoustic|Indie|Soul|Alternative", 25, 35, 25, 75, 35, 95, 75, 4000, "Vocal Focus", "Blue Hour", 0xFF778FE8, "Calm listening mix"),
         p("Romantic", "R&B|Soul|Pop|Jazz", 35, 45, 30, 80, 30, 95, 70, 3500, "Vocal Focus", "Rose", 0xFFFF7898, "Calm listening mix"),
-        p("Nostalgic", "Classic Pop|80s|90s|Rock", 55, 60, 20, 95, 25, 90, 90, 3000, "Audiophile", "Retro", 0xFFDAA567, "Familiar favorites mix")
+        p("Nostalgic", "Classic Pop|80s|90s|Rock", 55, 60, 20, 95, 25, 90, 90, 3000, "Audiophile", "Retro", 0xFFDAA567, "Familiar favorites mix"),
+        p("Devotional", "Devotional|Classical|Ambient|Instrumental", 35, 30, 25, 85, 70, 80, 75, 3500, "Balanced", "Dawn", 0xFFFFC875, "Calm listening mix"),
+        p("Spiritual Morning", "Devotional|Ambient|Classical|Acoustic", 40, 35, 35, 85, 65, 85, 70, 3500, "Balanced", "Dawn", 0xFFFFC875, "Calm listening mix")
     ).associateBy { it.name.lowercase(Locale.ROOT) }
 
-    fun profile(name: String): SmartMoodProfile? = profiles[name.trim().lowercase(Locale.ROOT)]
+    private val moodAliases = linkedMapOf(
+        "Hype Mode" to "High Energy",
+        "Chill" to "Relax",
+        "Gym" to "Workout",
+        "Rainy Day" to "Rain Drive",
+        "Heartbreak" to "Sad"
+    )
+
+    fun profile(name: String): SmartMoodProfile? {
+        val key = name.trim().lowercase(Locale.ROOT)
+        return profiles[key] ?: moodAliases.entries.firstOrNull { it.key.lowercase(Locale.ROOT) == key }
+            ?.let { profiles[it.value.lowercase(Locale.ROOT)] }
+    }
+
+    /** Complete user-facing catalogue, including familiar names backed by existing mood profiles. */
+    fun allMoodNames(): List<String> = buildList {
+        addAll(moodAliases.keys)
+        addAll(profiles.values.map { it.name })
+    }.distinctBy { it.lowercase(Locale.ROOT) }
 
     fun queryModifiers(name: String): List<String> {
         val mood = profile(name) ?: return emptyList()
@@ -52,7 +73,8 @@ object SmartMoodEngine {
         mood: String,
         playedIds: Set<String> = emptySet(),
         likedIds: Set<String> = emptySet(),
-        preferredArtists: Set<String> = emptySet()
+        preferredArtists: Set<String> = emptySet(),
+        audioAnalysis: Map<String, TrackAnalysisEntity> = emptyMap()
     ): List<SongItemClean> {
         val profile = profile(mood) ?: return songs
         val artistPreferences = preferredArtists.map { it.trim().lowercase(Locale.ROOT) }.filter(String::isNotBlank)
@@ -64,8 +86,15 @@ object SmartMoodEngine {
             val words = "${song.title} ${song.artist} ${song.album}".lowercase()
             val genreMatches = profile.genres.count { words.contains(it.lowercase()) }
             val artistMatches = artistPreferences.count { song.artist.lowercase(Locale.ROOT).contains(it) }
+            val analysis = audioAnalysis[song.id] ?: audioAnalysis[song.videoId]
+            val audioFit = analysis?.let { measured ->
+                val energyFit = 1.0 - kotlin.math.abs(measured.energy - profile.energy) / 100.0
+                val targetBpm = 55.0 + profile.tempo * 1.45
+                val tempoFit = measured.bpm?.let { 1.0 - (kotlin.math.abs(it - targetBpm) / 145.0).coerceIn(0.0, 1.0) } ?: 0.0
+                energyFit.coerceIn(0.0, 1.0) * 0.24 + tempoFit.coerceIn(0.0, 1.0) * 0.16
+            } ?: 0.0
             (if (played) profile.familiarity * 0.008 + profile.replayBias * 0.004 else profile.discovery * 0.012) +
-                (if (liked) profile.familiarity * 0.008 else 0.0) + genreMatches * 0.18 + artistMatches * 2.5 - row.index * 0.0001
+                (if (liked) profile.familiarity * 0.008 else 0.0) + genreMatches * 0.18 + artistMatches * 2.5 + audioFit - row.index * 0.0001
         }.map { it.value }
     }
 

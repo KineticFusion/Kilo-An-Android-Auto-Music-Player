@@ -25,3 +25,6 @@ dependencyResolutionManagement {
 
 rootProject.name = "Kilo"
 include(":app", ":core-streaming", ":core-profile", ":core-search", ":core-ui", ":core-androidauto", ":core-companion", ":core-journeys", ":core-sounddna", ":core-discoveryradar", ":core-timemachine", ":core-updates")
+include(":audioanalysis", ":djmode", ":songrecognition", ":casting")
+include(":playbackcache", ":buffermanager", ":sourceprefetch", ":networkmonitor", ":playbackrecovery")
+include(":core-mood")
