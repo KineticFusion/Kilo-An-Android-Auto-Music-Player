@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 25
-        versionName = "2.8.0"
+        versionCode = 27
+        versionName = "2.9.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -71,6 +71,14 @@ androidComponents {
         implementation(project(":core-discoveryradar"))
         implementation(project(":core-timemachine"))
         implementation(project(":core-updates"))
+        implementation(project(":core:observability"))
+        implementation(project(":playback:prepared"))
+        implementation(project(":playback:source"))
+        implementation(project(":playback:warmup"))
+        implementation(project(":playback:predictor"))
+        implementation(project(":playback:stability"))
+        implementation(project(":playback:cache"))
+        implementation(project(":androidauto:performance"))
         implementation(project(":audioanalysis"))
         implementation(project(":djmode"))
         implementation(project(":songrecognition"))
@@ -80,6 +88,7 @@ androidComponents {
         implementation(project(":sourceprefetch"))
         implementation(project(":networkmonitor"))
         implementation(project(":playbackrecovery"))
+        implementation(project(":playbackoptimization"))
         implementation(libs.androidx.lifecycle.runtime.ktx)
         implementation(libs.androidx.room.runtime)
         ksp(libs.androidx.room.compiler)

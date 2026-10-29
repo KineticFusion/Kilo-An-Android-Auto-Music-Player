@@ -9,10 +9,16 @@ object SourcePrefetchManager {
         val count = player.mediaItemCount
         val current = player.currentMediaItemIndex
         if (current !in 0 until count) return emptyList()
+        val wrapQueue = player.repeatMode == Player.REPEAT_MODE_ALL
         val ids = LinkedHashSet<String>()
         var offset = 1
         while (offset < count && ids.size < limit) {
-            val id = runCatching { player.getMediaItemAt((current + offset) % count).mediaId }.getOrNull()
+            var index = current + offset
+            if (index >= count) {
+                if (!wrapQueue) break
+                index %= count
+            }
+            val id = runCatching { player.getMediaItemAt(index).mediaId }.getOrNull()
             if (!id.isNullOrBlank() && !id.startsWith("radio:")) ids.add(id)
             offset++
         }

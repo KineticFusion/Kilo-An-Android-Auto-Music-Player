@@ -101,13 +101,19 @@ private object AndroidAutoDatabaseView {
 
 object AutoBrowseCache {
     fun read(context: Context, parentId: String): List<MediaItem> {
+        val memory = BrowseTreeCache.get(parentId)
+        if (memory.isNotEmpty()) return memory
         val startedAt = SystemClock.elapsedRealtime()
         var succeeded = false
         var count = 0
         return try {
             AndroidAutoRecoveryManager.fallback("browse database parent=$parentId", emptyList()) {
                 AndroidAutoDatabaseView.children(context, parentId).map { it.toMediaItem() }
-            }.also { count = it.size; succeeded = true }
+            }.also {
+                count = it.size
+                succeeded = true
+                if (it.isNotEmpty()) BrowseTreeCache.put(parentId, it)
+            }
         } finally {
             AndroidAutoMetrics.recordDatabaseRead(SystemClock.elapsedRealtime() - startedAt, count, succeeded)
         }
@@ -146,6 +152,7 @@ object AutoBrowseCache {
             )
         }
         AndroidAutoDatabaseView.replaceChildren(context, parentId, rows)
+        BrowseTreeCache.put(parentId, items)
     }
 
     private fun AutoBrowseItemEntity.toMediaItem(): MediaItem {

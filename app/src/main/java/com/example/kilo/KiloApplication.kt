@@ -13,6 +13,7 @@ class KiloApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         appContext = applicationContext
+        PlaybackMainThreadMonitor.start()
         PlaybackWarmupManager.initialize(this)
     }
 }

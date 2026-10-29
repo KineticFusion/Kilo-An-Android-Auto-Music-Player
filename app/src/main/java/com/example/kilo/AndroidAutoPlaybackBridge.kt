@@ -7,6 +7,9 @@ import android.util.LruCache
 import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import com.example.kilo.androidauto.performance.AndroidAutoCacheManager
+import com.example.kilo.androidauto.performance.AndroidAutoWarmupManager
+import com.example.kilo.playbackoptimization.PlaybackCriticalPathAnalyzer
 
 /** Validates Android Auto items while retaining KILO's existing Media3 stream route. */
 object AndroidAutoPlaybackBridge {
@@ -16,11 +19,29 @@ object AndroidAutoPlaybackBridge {
     private val validatedBrowseItems = object : LruCache<String, ValidatedBrowseItem>(128) {}
 
     fun validate(item: MediaItem, callback: String): MediaItem? {
-        val searchResult = SearchPlaybackCoordinator.adaptSearchItem(item, callback) ?: return null
-        return validateNormalized(searchResult, callback)
+        val startedAt = SystemClock.elapsedRealtime()
+        val searchResult = SearchPlaybackCoordinator.adaptSearchItem(item, callback)
+        if (searchResult == null) {
+            PlaybackCriticalPathAnalyzer.phaseDuration(
+                item.mediaId,
+                "url_validation",
+                SystemClock.elapsedRealtime() - startedAt,
+                "route=android_auto result=invalid_search_item"
+            )
+            return null
+        }
+        val validated = validateNormalized(searchResult, callback)
+        PlaybackCriticalPathAnalyzer.phaseDuration(
+            searchResult.mediaId,
+            "url_validation",
+            SystemClock.elapsedRealtime() - startedAt,
+            "route=android_auto result=${if (validated == null) "invalid" else "valid"}"
+        )
+        return validated
     }
 
     private fun validateNormalized(item: MediaItem, callback: String): MediaItem? {
+        AndroidAutoWarmupManager.onBrowseActivity()
         val id = item.mediaId.trim()
         if (id.isBlank()) {
             Log.w(TAG, "reject callback=$callback reason=empty_media_id")
@@ -81,10 +102,17 @@ object AndroidAutoPlaybackBridge {
             if (art.scheme?.lowercase() in setOf("http", "https", "content", "android.resource")) {
                 metadata.setArtworkUri(art)
             }
+            if (art.scheme?.lowercase() in setOf("http", "https")) {
+                AndroidAutoCacheManager.warmArtwork(art.toString())
+            }
         }
-        sourceMetadata.artworkData?.let { data ->
-            metadata.setArtworkData(data, sourceMetadata.artworkDataType)
-        }
+        val artworkData = sourceMetadata.artworkData
+            ?: sourceMetadata.artworkUri?.let { art ->
+                if (art.scheme?.lowercase() in setOf("http", "https")) {
+                    AndroidAutoCacheManager.cachedArtwork(art.toString())
+                } else null
+            }
+        artworkData?.let { data -> metadata.setArtworkData(data, sourceMetadata.artworkDataType) }
         val ready = item.buildUpon()
             .setMediaId(id)
             .setMediaMetadata(metadata.build())

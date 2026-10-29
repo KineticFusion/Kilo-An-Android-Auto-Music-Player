@@ -1,3 +1,24 @@
+# KILO 2.9.0
+
+## Playback startup improvements
+
+- Prepares a short audio lead-in for a bounded set of visible tracks, so playback can start from KILO's existing cache.
+- Refreshes rejected or expired stream URLs sooner instead of retrying the same failing URL.
+- Reduces the initial startup buffer while keeping the larger rebuffer cushion for stable playback.
+- Preserves the existing Media3 player, queue, source resolver, and Android Auto playback path.
+
+---
+
+# KILO 2.8.1 Hotfix
+
+## What's fixed
+
+- Fixed a false early-track recovery that could replay a song and pause after a normal transition when its catalog duration was inaccurate.
+- Early-end recovery now uses Media3's measured duration for the previous track and stays out of the way when that duration is unavailable.
+- Preserved the existing Media3 player, queue, source resolver, Android Auto playback, and normal autoplay behavior.
+
+---
+
 # KILO 2.8.0
 
 ## What's new

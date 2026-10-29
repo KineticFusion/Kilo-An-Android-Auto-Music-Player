@@ -8,6 +8,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
+import com.example.kilo.playback.stability.MediaSourceAudit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -158,7 +159,9 @@ class VybeViewModel(application: Application) : AndroidViewModel(application) {
                 val mediaItem = MediaItem.fromUri(playableUrl)
 
                 withContext(Dispatchers.Main) {
+                    MediaSourceAudit.beforeMutation("set_media_source:vybe_view_model", player, song.videoId.ifBlank { song.id })
                     player.setMediaSource(mediaSourceFactory.createMediaSource(mediaItem))
+                    MediaSourceAudit.beforeMutation("prepare:vybe_view_model", player, song.videoId.ifBlank { song.id })
                     player.prepare()
                     if (autoPlay) {
                         player.play()
@@ -205,6 +208,7 @@ class VybeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        MediaSourceAudit.beforeMutation("release:vybe_view_model", player)
         player.release()
     }
 }

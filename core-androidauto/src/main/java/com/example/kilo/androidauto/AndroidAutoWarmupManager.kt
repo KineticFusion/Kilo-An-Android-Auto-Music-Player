@@ -22,14 +22,18 @@ object AndroidAutoWarmupManager {
             Thread(task, "KiloAndroidAutoWarmup").apply { isDaemon = true }
         }
         executor = worker
-        ArtworkCacheManager.initialize(context)
-        ArtworkCacheManager.preload(context, worker)
-        ConnectionReliabilityManager.startMonitoring(context)
-        BrowsePreloadEngine.preload(context, worker) { parentId ->
-            loadCachedBrowseData(parentId)
-            Log.d(TAG, "browse_preloaded parent=$parentId")
+        worker.execute {
+            runCatching {
+                ArtworkCacheManager.initialize(context)
+                ArtworkCacheManager.preload(context, worker)
+                ConnectionReliabilityManager.startMonitoring(context)
+                BrowsePreloadEngine.preload(context, worker) { parentId ->
+                    loadCachedBrowseData(parentId)
+                    Log.d(TAG, "browse_preloaded parent=$parentId")
+                }
+                AndroidAutoMetrics.logMemorySnapshot()
+            }.onFailure { Log.w(TAG, "deferred Android Auto warmup skipped", it) }
         }
-        worker.execute { AndroidAutoMetrics.logMemorySnapshot() }
     }
 
     /** Revisit warm caches after a car reconnect; never starts or changes playback. */

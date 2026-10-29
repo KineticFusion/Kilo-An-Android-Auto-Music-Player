@@ -43,6 +43,7 @@ data class LyricLine(val timeMs: Long, val text: String)
 object LyricsRepository {
     private const val TAG = "KiloLyrics"
     private const val ORDER_KEY = "lyrics_provider_order"
+    private const val SPOTIFY_API_BASE_URL_KEY = "spotify_lyrics_api_base_url"
     data class Provider(val id: String, val title: String)
     val providers = listOf(
         Provider("betterlyrics", "Better Lyrics"),
@@ -50,11 +51,14 @@ object LyricsRepository {
         Provider("youtube_music", "YouTube Music"),
         Provider("lrclib", "LRCLIB"),
         Provider("kugou", "KuGou"),
-        Provider("lyrics_ovh", "Lyrics.ovh")
+        Provider("lyrics_ovh", "Lyrics.ovh"),
+        Provider("spotify_lyrics_api", "Spotify Lyrics API (self-hosted)")
     )
     private val cache = java.util.concurrent.ConcurrentHashMap<String, List<LyricLine>>()
+    @Volatile private var appContext: Context? = null
 
     fun providerOrder(context: Context): List<String> {
+        appContext = context.applicationContext
         val saved = context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
             .getString(ORDER_KEY, null)?.split(',').orEmpty()
         return (saved.filter { id -> providers.any { it.id == id } } + providers.map { it.id })
@@ -62,10 +66,35 @@ object LyricsRepository {
     }
 
     fun saveProviderOrder(context: Context, order: List<String>) {
+        appContext = context.applicationContext
         val normalized = (order.filter { id -> providers.any { it.id == id } } + providers.map { it.id }).distinct()
         context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE).edit()
             .putString(ORDER_KEY, normalized.joinToString(",")).apply()
         cache.clear()
+    }
+
+    fun spotifyApiBaseUrl(context: Context): String {
+        appContext = context.applicationContext
+        return context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
+            .getString(SPOTIFY_API_BASE_URL_KEY, "").orEmpty()
+    }
+
+    /** The API's SP_DC credential remains on the user's own server and is never stored in KILO. */
+    fun saveSpotifyApiBaseUrl(context: Context, value: String): Boolean {
+        val input = value.trim().trimEnd('/')
+        if (input.isNotEmpty()) {
+            val url = runCatching { URL(input) }.getOrNull() ?: return false
+            val secure = url.protocol.equals("https", ignoreCase = true)
+            val localHttp = url.protocol.equals("http", ignoreCase = true) &&
+                url.host.lowercase() in setOf("localhost", "127.0.0.1", "10.0.2.2", "::1")
+            if ((!secure && !localHttp) || url.userInfo != null || url.query != null || url.ref != null) return false
+        }
+        appContext = context.applicationContext
+        context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE).edit()
+            .putString(SPOTIFY_API_BASE_URL_KEY, input)
+            .apply()
+        cache.clear()
+        return true
     }
 
     private val lookupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -87,7 +116,7 @@ object LyricsRepository {
     }
 
     private fun cacheKey(song: SongItemClean) =
-        song.title.trim().lowercase() + "|" + song.artist.trim().lowercase()
+        song.title.trim().lowercase() + "|" + song.artist.trim().lowercase() + "|" + song.spotifyTrackId.trim()
 
     private fun lookup(song: SongItemClean, key: String): Deferred<List<LyricLine>> {
         inFlight[key]?.let { return it }
@@ -114,7 +143,8 @@ object LyricsRepository {
                 "youtube_music" to YtRepo::fetchLyrics,
                 "lrclib" to ::findLrclib,
                 "kugou" to ::findKugou,
-                "lyrics_ovh" to ::findLyricsOvh
+                "lyrics_ovh" to ::findLyricsOvh,
+                "spotify_lyrics_api" to ::findSpotifyLyricsApi
             )
             var bestCandidate: List<LyricLine> = emptyList()
             var bestProvider = ""
@@ -391,6 +421,62 @@ object LyricsRepository {
             .filter(String::isNotEmpty)
             .map { LyricLine(-1L, it) }
             .toList()
+    }
+
+    /**
+     * Optional adapter for the upstream Spotify Lyrics API template. It requires a user's
+     * self-hosted endpoint and an explicit Spotify track ID; it never guesses IDs from YT IDs.
+     */
+    private fun findSpotifyLyricsApi(song: SongItemClean): List<LyricLine> {
+        val endpoint = appContext?.let(::spotifyApiBaseUrl)?.trimEnd('/')?.takeIf(String::isNotBlank)
+            ?: return emptyList()
+        val trackId = spotifyTrackId(song) ?: resolveSpotifyTrackId(song) ?: return emptyList()
+        val root = request("$endpoint/?trackid=${enc(trackId)}&format=lrc") as? JSONObject ?: return emptyList()
+        if (root.optBoolean("error", false)) return emptyList()
+        val syncType = root.optString("syncType").uppercase()
+        if (syncType.isNotBlank() && syncType != "LINE_SYNCED") return emptyList()
+        val lines = root.optJSONArray("lines")
+            ?: root.optJSONObject("data")?.optJSONArray("lines")
+            ?: root.optJSONObject("lyrics")?.optJSONArray("lines")
+            ?: return emptyList()
+        return (0 until lines.length()).mapNotNull { index ->
+            val line = lines.optJSONObject(index) ?: return@mapNotNull null
+            val text = line.optString("words", line.optString("text")).trim()
+            val startMs = line.optString("startTimeMs").toLongOrNull()
+                ?: parseTimeTag(line.optString("timeTag"))
+                ?: line.optString("time").toLongOrNull()
+            if (text.isBlank() || startMs == null || startMs < 0L) null else LyricLine(startMs, text)
+        }.sortedBy { it.timeMs }
+    }
+
+    private fun spotifyTrackId(song: SongItemClean): String? {
+        val candidates = listOf(song.spotifyTrackId, song.id, song.videoId)
+        val idPattern = Regex("^[A-Za-z0-9]{22}$")
+        for (candidate in candidates) {
+            val value = candidate.trim()
+            val explicitId = when {
+                idPattern.matches(value) -> value
+                else -> Regex("^spotify:track:([A-Za-z0-9]{22})$").find(value)?.groupValues?.getOrNull(1)
+            }
+            val urlId = Regex("open\\.spotify\\.com/track/([A-Za-z0-9]{22})")
+                .find(value)?.groupValues?.getOrNull(1)
+            val id = explicitId ?: urlId
+            if (id != null && idPattern.matches(id)) return id
+        }
+        return null
+    }
+
+    private fun resolveSpotifyTrackId(song: SongItemClean): String? {
+        if (song.title.isBlank()) return null
+        val query = enc(listOf(song.artist, song.title).filter(String::isNotBlank).joinToString(" - "))
+        val search = runCatching {
+            request("https://lyrics.paxsenix.org/spotify/search?q=$query") as? JSONObject
+        }.getOrNull() ?: runCatching {
+            request("https://lyrics.paxsenix.org/spotify/search?query=$query") as? JSONObject
+        }.getOrNull() ?: return null
+        val url = findSpotifyUrl(search) ?: return null
+        return Regex("open\\.spotify\\.com/track/([A-Za-z0-9]{22})")
+            .find(url)?.groupValues?.getOrNull(1)
     }
 
     private fun request(url: String): Any {

@@ -22,6 +22,8 @@ import java.net.URL
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.Locale
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 data class HomeCatalogFetch(val shelves: List<HomeShelf>, val complete: Boolean)
@@ -83,13 +85,21 @@ object YtRepo {
         )
     )
 
+    /** A bounded race for the two legacy player clients; never serially waits on both. */
+    private val legacyStreamPool = Executors.newFixedThreadPool(2) { task ->
+        Thread(task, "kilo-legacy-stream").apply { isDaemon = true }
+    }
+
     init {
         try {
             NewPipe.init(
                 NewPipeDownloader(
                     OkHttpClient.Builder()
-                        .connectTimeout(15, TimeUnit.SECONDS)
-                        .readTimeout(30, TimeUnit.SECONDS)
+                        // The old 15s/30s limits leaked into playback extraction and
+                        // could leave the first selection waiting through a long cold path.
+                        .connectTimeout(5, TimeUnit.SECONDS)
+                        .readTimeout(7, TimeUnit.SECONDS)
+                        .callTimeout(9, TimeUnit.SECONDS)
                         .build()
                 )
             )
@@ -535,9 +545,17 @@ object YtRepo {
     }
 
     fun fetchStream(videoId: String): StreamInfo? {
+        val startedAt = System.nanoTime()
         fetchStreamNewPipe(videoId)?.let { return it }
-        Log.w(TAG, "NewPipe failed for $videoId, trying legacy clients")
-        return fetchStreamLegacy(videoId)
+        Log.w(TAG, "streamResolve stage=newpipe_miss id=$videoId durationMs=${(System.nanoTime() - startedAt) / 1_000_000L}; trying bounded legacy race")
+        val fallbackStartedAt = System.nanoTime()
+        return fetchStreamLegacy(videoId).also { result ->
+            Log.i(
+                TAG,
+                "streamResolve stage=legacy_race id=$videoId durationMs=${(System.nanoTime() - fallbackStartedAt) / 1_000_000L} " +
+                    "result=${if (result == null) "miss" else "ready"} totalMs=${(System.nanoTime() - startedAt) / 1_000_000L}"
+            )
+        }
     }
 
     private fun userAgentFor(url: String): String {
@@ -578,72 +596,86 @@ object YtRepo {
     }
 
     private fun fetchStreamLegacy(videoId: String): StreamInfo? {
-        for (client in streamClients) {
-            try {
-                val conn = (URL("$ORIGIN/youtubei/v1/player?prettyPrint=false")
-                    .openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    doOutput = true
-                    connectTimeout = 5000
-                    readTimeout = 5000
-                    setRequestProperty("Content-Type", "application/json")
-                    setRequestProperty("User-Agent", client.userAgent)
-                    setRequestProperty("X-Goog-Api-Format-Version", "2")
-                    setRequestProperty("X-YouTube-Client-Name", client.clientId)
-                    setRequestProperty("X-YouTube-Client-Version", client.version)
-                }
-                val clientJson = JSONObject().apply {
-                    put("clientName", client.name)
-                    put("clientVersion", client.version)
-                    put("hl", "en")
-                    put("gl", "IN")
-                    client.extra.forEach { (k, v) -> put(k, v) }
-                }
-                val payload = JSONObject().apply {
-                    put("videoId", videoId)
-                    put("contentCheckOk", true)
-                    put("racyCheckOk", true)
-                    put("context", JSONObject().put("client", clientJson))
-                }
-                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
-                val code = conn.responseCode
-                val text = (if (code in 200..299) conn.inputStream else conn.errorStream)
-                    ?.bufferedReader()?.readText().orEmpty()
-                if (code !in 200..299) {
-                    Log.e(TAG, "player(${client.name}) HTTP $code")
-                    continue
-                }
-                val res = JSONObject(text)
-                val status = res.optJSONObject("playabilityStatus")?.optString("status")
-                if (status != "OK") {
-                    Log.e(TAG, "player(${client.name}) status=$status for $videoId")
-                    continue
-                }
-                val formats = res.optJSONObject("streamingData")?.optJSONArray("adaptiveFormats") ?: continue
-                var bestUrl = ""
-                var bestBitrate = -1
-                var label = ""
-                for (i in 0 until formats.length()) {
-                    val f = formats.getJSONObject(i)
-                    val mime = f.optString("mimeType")
-                    val url = f.optString("url")
-                    val br = f.optInt("bitrate", 0)
-                    if (mime.startsWith("audio/") && url.isNotEmpty() && br > bestBitrate) {
-                        bestBitrate = br
-                        bestUrl = url
-                        val kbps = (br / 1000).coerceAtLeast(128)
-                        label = if (mime.contains("opus")) "Opus • 48.0 kHz • $kbps kbps • Stereo"
-                        else "AAC • 44.1 kHz • $kbps kbps • Stereo"
-                    }
-                }
-                if (bestUrl.isNotEmpty()) return StreamInfo(
-                    bestUrl, label, client.userAgent, bitrateKbps = bestBitrate / 1_000
-                )
-            } catch (e: Exception) {
-                Log.e(TAG, "player(${client.name}) failed", e)
+        val calls = streamClients.map { client ->
+            Callable {
+                fetchStreamLegacy(videoId, client) ?: throw IllegalStateException("${client.name}: no playable stream")
             }
         }
-        return null
+        return runCatching {
+            legacyStreamPool.invokeAny(calls, 4_500, TimeUnit.MILLISECONDS)
+        }.getOrElse { error ->
+            Log.w(TAG, "legacy stream clients timed out or failed id=$videoId", error)
+            null
+        }
+    }
+
+    private fun fetchStreamLegacy(videoId: String, client: StreamClient): StreamInfo? {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL("$ORIGIN/youtubei/v1/player?prettyPrint=false")
+                .openConnection() as HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                connectTimeout = 3_500
+                readTimeout = 3_500
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("User-Agent", client.userAgent)
+                setRequestProperty("X-Goog-Api-Format-Version", "2")
+                setRequestProperty("X-YouTube-Client-Name", client.clientId)
+                setRequestProperty("X-YouTube-Client-Version", client.version)
+            }
+            val clientJson = JSONObject().apply {
+                put("clientName", client.name)
+                put("clientVersion", client.version)
+                put("hl", "en")
+                put("gl", "IN")
+                client.extra.forEach { (k, v) -> put(k, v) }
+            }
+            val payload = JSONObject().apply {
+                put("videoId", videoId)
+                put("contentCheckOk", true)
+                put("racyCheckOk", true)
+                put("context", JSONObject().put("client", clientJson))
+            }
+            OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                Log.e(TAG, "player(${client.name}) HTTP $code")
+                return null
+            }
+            val text = conn.inputStream.bufferedReader().use { it.readText() }
+            val res = JSONObject(text)
+            val status = res.optJSONObject("playabilityStatus")?.optString("status")
+            if (status != "OK") {
+                Log.e(TAG, "player(${client.name}) status=$status for $videoId")
+                return null
+            }
+            val formats = res.optJSONObject("streamingData")?.optJSONArray("adaptiveFormats") ?: return null
+            var bestUrl = ""
+            var bestBitrate = -1
+            var label = ""
+            for (i in 0 until formats.length()) {
+                val f = formats.getJSONObject(i)
+                val mime = f.optString("mimeType")
+                val url = f.optString("url")
+                val br = f.optInt("bitrate", 0)
+                if (mime.startsWith("audio/") && url.isNotEmpty() && br > bestBitrate) {
+                    bestBitrate = br
+                    bestUrl = url
+                    val kbps = (br / 1000).coerceAtLeast(128)
+                    label = if (mime.contains("opus")) "Opus • 48.0 kHz • $kbps kbps • Stereo"
+                    else "AAC • 44.1 kHz • $kbps kbps • Stereo"
+                }
+            }
+            bestUrl.takeIf(String::isNotEmpty)?.let {
+                StreamInfo(it, label, client.userAgent, bitrateKbps = bestBitrate / 1_000)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "player(${client.name}) failed", e)
+            null
+        } finally {
+            conn?.disconnect()
+        }
     }
 
     private fun collect(node: Any?, key: String, out: MutableList<JSONObject>) {

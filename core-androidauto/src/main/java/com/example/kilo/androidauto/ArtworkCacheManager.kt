@@ -88,6 +88,10 @@ object ArtworkCacheManager {
 
     fun cachedArtworkBytes(key: String): ByteArray? = memoryCache.get(normalizeKey(key))
 
+    fun cachedMemoryEntries(): Int = memoryCache.snapshot().size
+
+    fun cachedMemoryBytes(): Int = memoryCache.size()
+
     private fun loadOrRender(context: Context, key: String): ByteArray? {
         memoryCache.get(key)?.let { return it }
         val startedAt = android.os.SystemClock.elapsedRealtime()

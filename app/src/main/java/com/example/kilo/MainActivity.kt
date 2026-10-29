@@ -77,10 +77,18 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewModelScope
+import com.example.kilo.playback.prepared.ClickToPlayCoordinator
+import com.example.kilo.playback.prepared.PreparedPlaybackLayer
+import com.example.kilo.playback.stability.MediaSourceAudit
+import com.example.kilo.search.preparation.SearchPlaybackCoordinator
+import com.example.kilo.search.preparation.SearchWarmupEngine
+import com.example.kilo.search.preparation.SearchResultCache
+import com.example.kilo.mood.preparation.MoodWarmupEngine
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
@@ -104,6 +112,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import com.example.kilo.streaming.*
+import com.example.kilo.playbackoptimization.PlaybackCriticalPathAnalyzer
 import com.example.kilo.profile.*
 import com.example.kilo.companion.CompanionContext
 import com.example.kilo.companion.CompanionProfile
@@ -133,6 +142,8 @@ import com.example.kilo.search.SearchEnhancer
 import com.example.kilo.search.SearchAnalytics
 import com.example.kilo.audioanalysis.AudioAnalysisDatabaseProvider
 import com.example.kilo.audioanalysis.RecognitionHistoryEntity
+import com.example.kilo.audio.engine.AudioEngine
+import com.example.kilo.audio.profiles.SoundProfileRepository
 import com.example.kilo.djmode.DjModeController
 import com.example.kilo.djmode.DjModeSettings
 import com.example.kilo.djmode.DjTrack
@@ -423,7 +434,9 @@ data class SongItemClean(
     val durationMs: Long = 215000L,
     val codecInfo: String = "AAC • 44.1 kHz • 256 kbps • Stereo",
     val isDownloaded: Boolean = false,
-    val isExplicit: Boolean = false
+    val isExplicit: Boolean = false,
+    /** Optional source identity used only when a lyrics provider supplies a Spotify track ID. */
+    val spotifyTrackId: String = ""
 )
 
 data class HomeShelf(val title: String, val songs: List<SongItemClean>, val isList: Boolean)
@@ -1411,14 +1424,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val currentPositionMs = PlayerHolder.lastPlaybackPosition(
                     previousSong.videoId.ifBlank { previousSong.id }
                 )
-                val observedDurationMs = _state.value.currentDurationMs.takeIf { it > 90_000L } ?: expectedMs
-                val catalogLooksEarly = currentPositionMs < expectedMs * 0.75f
-                val playerDurationLooksEarly = currentPositionMs < observedDurationMs * 0.75f
-                if (expectedMs > 90_000L && catalogLooksEarly && playerDurationLooksEarly) {
+                // Do not treat catalog metadata as evidence that a stream ended early:
+                // _state.currentDurationMs is populated from the same catalog value,
+                // so comparing both values made this check effectively duplicate and
+                // caused short/mislabelled tracks to be replayed and then paused.
+                // Use only Media3's duration for the previous timeline window. If it is
+                // unknown, let the normal transition and player-error recovery proceed.
+                val previousIndex = _state.value.currentIndex
+                val timeline = player.currentTimeline
+                val observedDurationMs = if (
+                    !timeline.isEmpty && previousIndex in 0 until timeline.windowCount
+                ) {
+                    timeline.getWindow(previousIndex, Timeline.Window()).durationMs
+                        .takeIf { it != C.TIME_UNSET && it > 90_000L }
+                } else null
+                val endedMateriallyEarly = observedDurationMs != null &&
+                    currentPositionMs < observedDurationMs * 0.75f
+                if (expectedMs > 90_000L && endedMateriallyEarly) {
                     Log.w(
                         "VybeVM",
                         "Early automatic track transition: ${previousSong.videoId} at ${currentPositionMs}ms; " +
-                            "catalog duration=${expectedMs}ms player duration=${observedDurationMs}ms"
+                            "catalog duration=${expectedMs}ms Media3 duration=${observedDurationMs}ms"
                     )
                     PlaybackSleepTimer.retargetAfterTrackRetry(previousSong.videoId.ifBlank { previousSong.id }, id)
                     val previousIndex = _state.value.currentIndex
@@ -1427,6 +1453,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         // Rebuild the affected MediaSource on retry. Reusing the
                         // prepared queue here would keep its already-resolved URL,
                         // defeating the stream invalidation above.
+                        PlaybackRepository.invalidateResolvedStream(previousSong.videoId.ifBlank { previousSong.id })
                         LosslessSource.invalidate(previousSong.videoId.ifBlank { previousSong.id })
                         FastStream.invalidate(previousSong.videoId)
                         loadTrack(
@@ -1435,18 +1462,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             startPositionMs = resumePositionMs,
                             retryingEarlyEnd = true
                         )
+                        return
                     } else {
-                        player.pause()
-                        player.setMediaItem(previousSong.toMediaItem(), resumePositionMs)
-                        _state.value = _state.value.copy(
-                            playlist = listOf(previousSong), currentIndex = 0,
-                            progress = (resumePositionMs.toFloat() / previousSong.durationMs.coerceAtLeast(1L)).coerceIn(0f, 1f),
-                            currentPosMs = resumePositionMs,
-                            isPlaying = false, isLoadingStream = false
+                        // A second premature end should not strand playback on a paused
+                        // retry item. Keep the already selected next queue item and let
+                        // the normal transition handler continue autoplay.
+                        earlyEndRetries.remove(previousSong.id)
+                        Log.w(
+                            "VybeVM",
+                            "Track ended early again after retry; continuing queue at id=$id"
                         )
-                        Toast.makeText(getApplication(), "This track ended early. Tap play to retry it.", Toast.LENGTH_LONG).show()
                     }
-                    return
                 }
             }
             val stopAfterCurrentTrack = PlaybackSleepTimer.finishAfterTrackIfNeeded(id, acknowledgeStop = true)
@@ -1725,7 +1751,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun prefetchStream(videoId: String) {
         if (videoId.isBlank()) return
-        PlayerHolder.prefetch(getApplication(), videoId)
+        // Route every caller through the same bounded scheduler as service-level
+        // look-ahead so a queue transition cannot launch duplicate cache writers.
+        QueuePreloader.enqueue(getApplication(), listOf(videoId))
     }
 
     private fun prefetchNextStream(index: Int) {
@@ -2084,6 +2112,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 currentIndex = 0,
                 isSearching = false
             )
+            prepareVisibleTracks(displayShelves.flatMap { it.songs }, "home")
             refreshCompanionFeatures(
                 candidateSongs = all + homeSongs + dormantDiscovered + _state.value.downloadedSongs,
                 events = recentEvents
@@ -2198,7 +2227,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             val results = coroutineScope {
-                val songsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchSongs(cleanQuery) }.getOrDefault(emptyList()) }
+                val cachedSongs = SearchResultCache.get(cleanQuery)
+                val songsRequest = async(Dispatchers.IO) {
+                    cachedSongs ?: runCatching { YtRepo.searchSongs(cleanQuery) }.getOrDefault(emptyList())
+                }
                 val playlistsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchCommunityPlaylists(cleanQuery) }.getOrDefault(emptyList()) }
                 val artistsRequest = async(Dispatchers.IO) { runCatching { YtRepo.searchArtists(cleanQuery) }.getOrDefault(emptyList()) }
                 SearchWorkResult(songsRequest.await(), playlistsRequest.await(), artistsRequest.await())
@@ -2211,6 +2243,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 artistSearchResults = results.artists,
                 isSearching = false
             )
+            prepareVisibleTracks(visibleResults, "search")
             SearchAnalytics.record(cleanQuery)
             visibleResults.take(3).forEach { song ->
                 LosslessSource.register(song)
@@ -2232,11 +2265,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         key = { it.videoId.ifBlank { it.id } }
                     )
                     _state.value = _state.value.copy(searchResults = merged)
+                    prepareVisibleTracks(merged, "search_supplemental")
                     supplemental.take(3).forEach { song ->
                         LosslessSource.register(song)
                         song.videoId.takeIf(String::isNotBlank)?.let(::prefetchStream)
                     }
                 }
+            }
+        }
+    }
+
+    /** Bounded pre-resolution for songs the user can already see; never runs on the UI thread. */
+    private fun prepareVisibleTracks(songs: List<SongItemClean>, section: String) {
+        if (songs.isEmpty()) return
+        val candidates = songs.asSequence()
+            .filter { it.videoId.isNotBlank() && !it.videoId.startsWith("radio:") }
+            .distinctBy { it.videoId.ifBlank { it.id } }
+            .take(if (section.startsWith("search")) 40 else 20)
+            .toList()
+        val visible = candidates.take(if (section.startsWith("search")) 10 else 20)
+        if (visible.isEmpty()) return
+        val searchQuery = _state.value.searchQuery
+        val moodName = _state.value.browseCategoryTitle
+        viewModelScope.launch(Dispatchers.Default) {
+            runCatching {
+                PlaybackRepository.rememberAll(visible)
+                when {
+                    section.startsWith("search") -> SearchWarmupEngine.prepare(
+                        getApplication(), searchQuery, candidates
+                    )
+                    section.startsWith("mood") -> MoodWarmupEngine.prepare(
+                        getApplication(), moodName, visible
+                    )
+                    else -> PlaybackPerformanceLayer.prepareVisible(getApplication(), visible, section)
+                }
+            }.onFailure { error ->
+                Log.d("KiloWarmup", "visible preparation skipped section=$section", error)
             }
         }
     }
@@ -2254,6 +2318,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 activeArtist = catalog.first, artistAlbums = catalog.second, artistSongs = catalog.third,
                 isSearching = false
             )
+            prepareVisibleTracks(catalog.third, "artist")
         }
     }
 
@@ -2281,6 +2346,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val tracks = withContext(Dispatchers.IO) { YtRepo.fetchAlbumTracks(album.albumBrowseId, artist.name) }
             if (_state.value.activeArtist?.id == artist.id) {
                 _state.value = _state.value.copy(artistSongs = tracks, isSearching = false)
+                prepareVisibleTracks(tracks, "artist_album")
             }
         }
     }
@@ -2292,6 +2358,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val catalog = withContext(Dispatchers.IO) { YtRepo.fetchArtistCatalog(artist) }
             if (_state.value.activeArtist?.id == artist.id) {
                 _state.value = _state.value.copy(artistSongs = catalog.third, isSearching = false)
+                prepareVisibleTracks(catalog.third, "artist_songs")
             }
         }
     }
@@ -2336,9 +2403,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             return
         }
-        val queue = shelfList.filter { it.videoId.isNotEmpty() }.ifEmpty { listOf(song) }
+        val directTrackId = song.videoId.ifBlank { song.id }
+        val loadedSong = PlaybackRepository.remember(song)
+        PlaybackCriticalPathAnalyzer.userSelected(directTrackId, selectionSource ?: "phone_selection")
+        val queueBuildStartedAt = SystemClock.elapsedRealtime()
+        val queue = shelfList.filter { it.videoId.isNotEmpty() }
+            .map { PlaybackRepository.remember(it) }
+            .ifEmpty { listOf(loadedSong) }
+        PlaybackCriticalPathAnalyzer.phaseDuration(
+            directTrackId,
+            "queue_creation",
+            SystemClock.elapsedRealtime() - queueBuildStartedAt,
+            "items=${queue.size}"
+        )
         queue.forEach { LosslessSource.register(it) }
-        val index = queue.indexOfFirst { it.id == song.id }.coerceAtLeast(0)
+        val trackLookupStartedAt = SystemClock.elapsedRealtime()
+        val index = queue.indexOfFirst { PlaybackRepository.trackKey(it) == directTrackId }.coerceAtLeast(0)
+        PlaybackCriticalPathAnalyzer.phaseDuration(
+            directTrackId,
+            "track_lookup",
+            SystemClock.elapsedRealtime() - trackLookupStartedAt,
+            "index=$index"
+        )
         _state.value = _state.value.copy(playlist = queue, currentIndex = index)
         loadTrack(index, autoPlay = true, selectionSource = selectionSource)
     }
@@ -2416,13 +2502,20 @@ _state.value = _state.value.copy(
                     SystemClock.elapsedRealtime() - serviceStartedAt
                 )
                 val mediaItemStartedAt = SystemClock.elapsedRealtime()
-                val mediaItems = list.map { it.toMediaItem() }
+                val useSearchPreparation = profilerSource.equals("phone_search", ignoreCase = true) ||
+                    _state.value.currentScreen == ScreenNav.SEARCH
+                val mediaItems = list.map { queuedSong ->
+                    val queuedId = queuedSong.videoId.ifBlank { queuedSong.id }
+                    val searchPrepared = if (useSearchPreparation) SearchPlaybackCoordinator.preparedItem(queuedId) else null
+                    searchPrepared ?: ClickToPlayCoordinator.mediaItemOrNull(queuedId) ?: queuedSong.toMediaItem()
+                }
                 PlaybackStartupMetrics.mediaItemsBuilt(
                     metricTrackId,
                     SystemClock.elapsedRealtime() - mediaItemStartedAt,
                     mediaItems.size
                 )
                 val setItemsStartedAt = SystemClock.elapsedRealtime()
+                MediaSourceAudit.beforeMutation("set_media_items:phone_selection", player, metricTrackId)
                 player.setMediaItems(mediaItems, idx, startPositionMs)
                 PlaybackStartupMetrics.mediaItemsSet(
                     metricTrackId,
@@ -2439,6 +2532,7 @@ _state.value = _state.value.copy(
                 if (autoPlay) player.play()
                 PlaybackMetrics.onPlayerPrepare(metricTrackId, "phone_track_load")
                 val prepareStartedAt = SystemClock.elapsedRealtime()
+                MediaSourceAudit.beforeMutation("prepare:phone_track_load", player, metricTrackId)
                 player.prepare()
                 PlaybackStartupMetrics.prepareCall(
                     metricTrackId,
@@ -2541,6 +2635,7 @@ _state.value = _state.value.copy(
         runCatching {
             val app = getApplication<Application>()
             app.sendBroadcast(Intent(ACTION_CLOSE_APP).setPackage(app.packageName))
+            MediaSourceAudit.beforeMutation("stop:close_app", player)
             player.stop()
         }
         exitProcess(0)
@@ -2796,6 +2891,12 @@ _state.value = _state.value.copy(
                     browseCategorySongs = results,
                     isLoadingBrowseCategory = false
                 )
+                val preparationSection = when (kind) {
+                    BrowseCategoryKind.MOOD -> "mood_category"
+                    BrowseCategoryKind.GENRE -> "genre_category"
+                    BrowseCategoryKind.LANGUAGE -> "language_category"
+                }
+                prepareVisibleTracks(results, preparationSection)
             }
         }
     }
@@ -3434,9 +3535,11 @@ _state.value = _state.value.copy(
                         MergingMediaSource(videoSource, mediaFactory.createMediaSource(MediaItem.fromUri(audioUrl)))
                     } ?: videoSource
                 }
+                MediaSourceAudit.beforeMutation("set_media_source:video_mode", player)
                 player.setMediaSource(source)
                 if (positionMs > 0L) player.seekTo(positionMs)
                 if (shouldPlay) player.play() else player.pause()
+                MediaSourceAudit.beforeMutation("prepare:video_mode", player)
                 player.prepare()
                 // Video mode reuses the same ExoPlayer session; attach the saved
                 // equalizer profile to its audio output as soon as the source changes.
@@ -3980,6 +4083,13 @@ _state.value = _state.value.copy(
         setScreen(ScreenNav.EQUALIZER)
     }
 
+    fun setSoundProfile(profileId: String) {
+        if (profileId == SoundProfileRepository.ORIGINAL) {
+            _state.value = _state.value.copy(equalizerSnapshot = equalizerController.setEnabled(false))
+        }
+        AudioEngine.selectProfile(getApplication<Application>(), profileId)
+    }
+
     fun setEqualizerEnabled(enabled: Boolean) {
         _state.value = _state.value.copy(equalizerSnapshot = equalizerController.setEnabled(enabled))
     }
@@ -4351,8 +4461,10 @@ _state.value = _state.value.copy(
                 val mediaSource = DefaultMediaSourceFactory(dataSourceFactory)
                     .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(5))
                     .createMediaSource(item)
+                MediaSourceAudit.beforeMutation("set_media_source:radio", player, station.id)
                 player.setMediaSource(mediaSource)
                 player.play()
+                MediaSourceAudit.beforeMutation("prepare:radio", player, station.id)
                 player.prepare()
                 _state.value = _state.value.copy(isLoadingStream = true, isPlaying = true)
             } catch (cancelled: CancellationException) {
@@ -5308,7 +5420,7 @@ private fun ProfileChoiceGrid(
             horizontalArrangement = Arrangement.spacedBy(7.dp),
             verticalArrangement = Arrangement.spacedBy(7.dp)
         ) {
-            items(options.size, key = { options[it] }) { index ->
+            items(options.size, key = { "layout_option_${options[it]}" }, contentType = { "layout_option" }) { index ->
                 val value = options[index]
                 val isSelected = value in selected
                 Box(
@@ -5654,7 +5766,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
 
         item(key = "home_category_tabs") {
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                items(homeTabs) { label ->
+                items(homeTabs, key = { "home_tab_$it" }, contentType = { "tab" }) { label ->
                     val selected = activeHomeTab == label
                     val chipShape = if (family == 2) RoundedCornerShape(50) else primaryCardShape(skin)
                     Box(
@@ -5678,7 +5790,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                     Text("Follow artists in Personalization to see them here.", color = Color.White.copy(alpha = 0.68f), modifier = Modifier.padding(20.dp))
                 }
             } else {
-                items(homeArtists, key = { "home_artist_${it.name.lowercase()}" }) { artist ->
+                items(homeArtists, key = { "home_artist_${it.name.lowercase()}" }, contentType = { "artist" }) { artist ->
                     ArtistSearchRow(
                         artist = artist,
                         following = followedArtistNames.any { it.equals(artist.name, ignoreCase = true) },
@@ -5712,7 +5824,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                 }
             }
             if (family == 4 || shelf.isList || skin.ordinal == 7 || skin.ordinal == 10 || skin.ordinal == 12) {
-                itemsIndexed(visibleSongs, key = { _, song -> "wave_${index}_${song.id}" }) { _, song ->
+                itemsIndexed(visibleSongs, key = { row, song -> "wave_${index}_${song.videoId.ifBlank { song.id }}_$row" }, contentType = { _, _ -> "song_row" }) { _, song ->
                     BitchordSongRowItem(song, state.activeSong.id == song.id, { vm.playSongFromShelf(song, visibleSongs) }, vm)
                 }
             } else if (family == 1 || skin.ordinal == 13) {
@@ -5728,7 +5840,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
             } else {
                 item(key = "shelf_row_$index") {
                     LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(if (family == 0) 13.dp else 11.dp)) {
-                        items(visibleSongs, key = { "art_${index}_${it.id}" }) { song ->
+                        items(visibleSongs, key = { "art_${index}_${it.videoId.ifBlank { it.id }}" }, contentType = { "song_card" }) { song ->
                             PrimaryArtworkTile(song, skin, if (skin.ordinal == 9) 3 else family) { vm.playSongFromShelf(song, visibleSongs) }
                         }
                     }
@@ -5761,14 +5873,14 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                         }
                     }
                 } else if (family == 4 || skin.ordinal == 7 || skin.ordinal == 10 || skin.ordinal == 12) {
-                    itemsIndexed(allQuickPicks, key = { _, song -> "all_quick_list_${song.id}" }) { _, song ->
+                    itemsIndexed(allQuickPicks, key = { row, song -> "all_quick_list_${song.videoId.ifBlank { song.id }}_$row" }, contentType = { _, _ -> "song_row" }) { _, song ->
                         BitchordSongRowItem(song, state.activeSong.id == song.id,
                             { vm.playSongFromShelf(song, allQuickPicks) }, vm)
                     }
                 } else {
                     item(key = "all_quick_picks_row") {
                         LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-                            items(allQuickPicks, key = { "all_quick_art_${it.id}" }) { song ->
+                            items(allQuickPicks, key = { "all_quick_art_${it.videoId.ifBlank { it.id }}" }, contentType = { "song_card" }) { song ->
                                 PrimaryArtworkTile(song, skin, family) { vm.playSongFromShelf(song, allQuickPicks) }
                             }
                         }
@@ -5820,14 +5932,14 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                         KiloSection("QUICK PICKS", accent = accent)
                     }
                     if (family == 4 || selectedCategoryShelf?.isList == true || skin.ordinal == 7 || skin.ordinal == 10 || skin.ordinal == 12) {
-                        itemsIndexed(categoryQuickPicks, key = { _, song -> "category_quick_${song.id}" }) { _, song ->
+                        itemsIndexed(categoryQuickPicks, key = { row, song -> "category_quick_${song.videoId.ifBlank { song.id }}_$row" }, contentType = { _, _ -> "song_row" }) { _, song ->
                             BitchordSongRowItem(song, state.activeSong.id == song.id,
                                 { vm.playSongFromShelf(song, categoryQuickPicks) }, vm)
                         }
                     } else {
                         item(key = "category_quick_picks_row") {
                             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-                                items(categoryQuickPicks, key = { "category_quick_art_${it.id}" }) { song ->
+                                items(categoryQuickPicks, key = { "category_quick_art_${it.videoId.ifBlank { it.id }}" }, contentType = { "song_card" }) { song ->
                                     PrimaryArtworkTile(song, skin, family) { vm.playSongFromShelf(song, categoryQuickPicks) }
                                 }
                             }
@@ -5865,7 +5977,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
         if (state.journeyPreviews.isNotEmpty()) item(key = "v250_music_journeys") {
             KiloSection("MUSIC JOURNEYS", accent = accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(state.journeyPreviews, key = { it.id }) { journey ->
+                items(state.journeyPreviews, key = { "journey_${it.id}" }, contentType = { "journey" }) { journey ->
                     val journeyAccent = Color(journey.accentArgb.toInt())
                     KiloCard(
                         modifier = Modifier.width(236.dp).clickable { vm.playJourney(journey.id) },
@@ -5898,7 +6010,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                     }
                 }
                 LazyRow(contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-                    items(radarSongs, key = { "radar_${section.id}_${it.id}" }) { song ->
+                    items(radarSongs, key = { "radar_${section.id}_${it.videoId.ifBlank { it.id }}" }, contentType = { "song_card" }) { song ->
                         PrimaryArtworkTile(song, skin, family) { vm.playDiscoveryTrack(song.id, section.title) }
                     }
                 }
@@ -5908,7 +6020,7 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
         if (state.timeCapsules.isNotEmpty()) item(key = "v250_time_machine") {
             KiloSection("TIME MACHINE", accent = accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                items(state.timeCapsules, key = { it.id }) { capsule ->
+                items(state.timeCapsules, key = { "time_capsule_${it.id}" }, contentType = { "time_capsule" }) { capsule ->
                     KiloCard(
                         modifier = Modifier.width(205.dp).clickable { vm.playTimeCapsule(capsule.id) },
                         shape = primaryCardShape(skin),
@@ -6026,7 +6138,7 @@ private fun TripBuilderDialog(
                     modifier = Modifier.fillMaxWidth().height(46.dp),
                     horizontalArrangement = Arrangement.spacedBy(7.dp)
                 ) {
-                    items(moods) { option ->
+                    items(moods, key = { "trip_mood_$it" }, contentType = { "mood" }) { option ->
                         FilterChip(
                             selected = mood == option,
                             onClick = { onMoodSelected(option) },
@@ -6385,7 +6497,7 @@ private fun LegacyFreshFriendlyHomeScreen(vm: MainViewModel) {
                 contentPadding = PaddingValues(horizontal = 20.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                itemsIndexed(tabs) { _, tab ->
+                itemsIndexed(tabs, key = { _, tab -> "home_category_tab_$tab" }, contentType = { _, _ -> "tab" }) { _, tab ->
                     val active = state.activeHomeTab == tab
                     Box(
                         modifier = Modifier
@@ -6461,7 +6573,11 @@ private fun LegacyFreshFriendlyHomeScreen(vm: MainViewModel) {
                                 contentPadding = PaddingValues(horizontal = 20.dp),
                                 horizontalArrangement = Arrangement.spacedBy(14.dp)
                             ) {
-                                itemsIndexed(visibleSongs) { _, song ->
+                                itemsIndexed(
+                                    visibleSongs,
+                                    key = { songIndex, song -> "home_shelf_${song.videoId.ifBlank { song.id }}_$songIndex" },
+                                    contentType = { _, _ -> "song_card" }
+                                ) { _, song ->
                                     if (idx == 0) {
                                         BitchordLargeQuickPickCard(
                                             song = song,
@@ -6909,6 +7025,7 @@ fun BitchordFloatingMiniPlayer(
     onExpand: () -> Unit
 ) {
     val song = state.activeSong
+    val showLoading = state.isLoadingStream && !PreparedPlaybackLayer.isPlaybackReady(song.videoId.ifBlank { song.id })
     val custom = LocalUiCustomizations.current
     val skin = state.activeSkin
     val compact = custom["compactPlayer"] == true
@@ -6967,7 +7084,7 @@ fun BitchordFloatingMiniPlayer(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = if (state.isLoadingStream) "Loading song…" else song.artist,
+                        text = if (showLoading) "Loading song…" else song.artist,
                         color = Color.White.copy(alpha = 0.68f),
                         fontSize = 12.sp,
                         maxLines = 1,
@@ -6992,7 +7109,7 @@ fun BitchordFloatingMiniPlayer(
                         .clip(playerControlShape(playerStyle))
                         .background(playerAccent)
                 ) {
-                    if (state.isLoadingStream) {
+                    if (showLoading) {
                         CircularProgressIndicator(color = Color.Black, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
                     } else {
                         Icon(
@@ -7199,7 +7316,11 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                 Text("Up Next Queue", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
                                 Spacer(modifier = Modifier.height(10.dp))
                                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    itemsIndexed(state.playlist) { idx, item ->
+                                    itemsIndexed(
+                                        state.playlist,
+                                        key = { index, item -> "queue_${item.videoId.ifBlank { item.id }}_$index" },
+                                        contentType = { _, _ -> "queue_song" }
+                                    ) { idx, item ->
                                         Row(
                                             modifier = Modifier
                                                 .fillMaxWidth()
@@ -7759,7 +7880,7 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                 contentPadding = PaddingValues(horizontal = 18.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(homeCategoryTabs, key = { "home_category_$it" }) { category ->
+                items(homeCategoryTabs, key = { "home_category_$it" }, contentType = { "category_tab" }) { category ->
                     val selected = category == activeHomeCategory
                     Box(
                         Modifier.clip(RoundedCornerShape(16.dp))
@@ -7875,7 +7996,7 @@ private fun HomeSongCarousel(title: String, songs: List<SongItemClean>, skin: Sk
     if (songs.isEmpty()) return
     HomeSectionHeading(title, subtitle, skin.highlight)
     LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        items(songs.take(12), key = { "${title}_${it.id}" }) { song ->
+        items(songs.take(12), key = { "${title}_${it.videoId.ifBlank { it.id }}" }, contentType = { "song_card" }) { song ->
             PrimaryArtworkTile(song, skin, skin.layoutFamily) { vm.playSongFromShelf(song, songs) }
         }
     }
@@ -8344,7 +8465,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
         item {
             HomeSectionHeading("Moods", "Pick the feeling; KILO will find the sound", accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                itemsIndexed(moodNames) { index, mood ->
+                itemsIndexed(moodNames, key = { _, mood -> "browse_mood_$mood" }, contentType = { _, _ -> "mood_card" }) { index, mood ->
                     BrowseVisualCard(
                         title = mood, subtitle = "Mood mix", artwork = coverArts.getOrNull(index),
                         tint = listOf(Color(0xFF4B2B85), Color(0xFF087C89), Color(0xFF9B4C34), Color(0xFF344D8A))[index % 4],
@@ -8356,7 +8477,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
         item {
             HomeSectionHeading("Genres", "Explore the sounds you love", accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                itemsIndexed(genreNames) { index, genre ->
+                itemsIndexed(genreNames, key = { _, genre -> "browse_genre_$genre" }, contentType = { _, _ -> "genre_card" }) { index, genre ->
                     BrowseVisualCard(
                         title = genre, subtitle = "Genre", artwork = coverArts.getOrNull((index + 3) % coverArts.size.coerceAtLeast(1)),
                         tint = listOf(Color(0xFF7B263D), Color(0xFF155C73), Color(0xFF5C3B83), Color(0xFF73602B))[index % 4],
@@ -8368,7 +8489,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
         item {
             HomeSectionHeading("Languages", "Browse a separate song page for each language", accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                itemsIndexed(languages) { index, language ->
+                itemsIndexed(languages, key = { _, language -> "browse_language_$language" }, contentType = { _, _ -> "language_card" }) { index, language ->
                     BrowseVisualCard(
                         title = language,
                         subtitle = "Language",
@@ -8394,7 +8515,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
         item {
             HomeSectionHeading("Curated Collections", "Handpicked routes into your next listen", accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                itemsIndexed(collections) { index, title ->
+                itemsIndexed(collections, key = { _, title -> "browse_collection_$title" }, contentType = { _, _ -> "collection_card" }) { index, title ->
                     BrowseVisualCard(title, "Curated for you", coverArts.getOrNull(index + 5), listOf(Color(0xFF254C6E), Color(0xFF6A356D), Color(0xFF6C4825))[index % 3], Modifier.width(174.dp).height(142.dp)) {
                         browseSearch(when (title) {
                             "Hidden Gems" -> "hidden gem songs"
@@ -8410,7 +8531,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
         item {
             HomeSectionHeading("Seasonal & Moments", "Collections for what’s happening now", accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                itemsIndexed(seasonal) { index, title ->
+                itemsIndexed(seasonal, key = { _, title -> "browse_seasonal_$title" }, contentType = { _, _ -> "collection_card" }) { index, title ->
                     BrowseVisualCard(title, "A KILO collection", coverArts.getOrNull(index + 8), listOf(Color(0xFF174F4E), Color(0xFF6A3B40), Color(0xFF5E4A2D), Color(0xFF283D67))[index], Modifier.width(174.dp).height(142.dp)) {
                         browseSearch("$title music")
                     }
@@ -8459,7 +8580,7 @@ private fun ArtistsBrowseScreen(vm: MainViewModel) {
         LazyColumn(contentPadding = PaddingValues(bottom = 28.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             if (followedArtists.isNotEmpty()) {
                 item { HomeSectionHeading("Following", "Your artists, always at the top", accent) }
-                items(followedArtists, key = { "browse_followed_${it.lowercase(Locale.ROOT)}" }) { name ->
+                items(followedArtists, key = { "browse_followed_${it.lowercase(Locale.ROOT)}" }, contentType = { "artist" }) { name ->
                     val representative = artworkByArtist.firstOrNull { it.artist.equals(name, true) }
                     ArtistSearchRow(
                         ArtistItem("followed:${name.lowercase(Locale.ROOT)}", name, "Followed artist", representative?.coverUrl.orEmpty()),
@@ -8518,7 +8639,7 @@ private fun ArtistsBrowseScreen(vm: MainViewModel) {
                 }
             } else if (state.artistBrowseResults.isNotEmpty()) {
                 item { HomeSectionHeading(if (query.isBlank()) "Picked for your sound" else "Results", "Open an artist or follow them", accent) }
-                items(state.artistBrowseResults, key = { "browse_artist_${it.id}" }) { artist ->
+                items(state.artistBrowseResults, key = { "browse_artist_${it.id}" }, contentType = { "artist" }) { artist ->
                     ArtistSearchRow(
                         artist = artist,
                         following = followedArtists.any { it.equals(artist.name, true) },
@@ -8608,7 +8729,11 @@ private fun BrowseCategoryResultsScreen(vm: MainViewModel) {
                     }
                 }
                 LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                    itemsIndexed(songs, key = { index, song -> "browse-category-${song.videoId.ifBlank { song.id }}-$index" }) { _, song ->
+                    itemsIndexed(
+                        songs,
+                        key = { index, song -> "browse-category-${song.videoId.ifBlank { song.id }}-$index" },
+                        contentType = { _, _ -> "song" }
+                    ) { _, song ->
                         BitchordSongRowItem(
                             song = song,
                             isCurrent = state.activeSong.id == song.id,
@@ -8647,6 +8772,7 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val context = LocalContext.current
     var lyricProviderOrder by remember { mutableStateOf(LyricsRepository.loadProviderOrder(context)) }
+    var spotifyLyricsApiUrl by remember { mutableStateOf(LyricsRepository.spotifyApiBaseUrl(context)) }
     var losslessSourceUrl by remember(state.losslessSourceUrl) { mutableStateOf(state.losslessSourceUrl) }
     var losslessSourceToken by remember { mutableStateOf("") }
     var regionMenuExpanded by remember { mutableStateOf(false) }
@@ -8874,6 +9000,31 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
                 }
                 if (index < lyricProviderOrder.lastIndex) HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
             }
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            Text(
+                "Optional, self-hosted provider. KILO looks up a matching Spotify track ID, then requests synced lyrics from this server. Keep the Spotify session credential on your own server; KILO never asks for or stores it.",
+                color = Color.White.copy(alpha = 0.68f), fontSize = 13.sp,
+                modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+            )
+            OutlinedTextField(
+                value = spotifyLyricsApiUrl,
+                onValueChange = { spotifyLyricsApiUrl = it },
+                label = { Text("Spotify Lyrics API URL") },
+                placeholder = { Text("https://your-server.example") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+            )
+            Button(
+                onClick = {
+                    val saved = LyricsRepository.saveSpotifyApiBaseUrl(context, spotifyLyricsApiUrl)
+                    Toast.makeText(
+                        context,
+                        if (saved) "Lyrics API address saved" else "Use an HTTPS address (or localhost for testing)",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                },
+                modifier = Modifier.align(Alignment.End).padding(horizontal = 16.dp, vertical = 8.dp)
+            ) { Text("Save API address") }
         }
 
         SettingsSectionHeader("LOSSLESS STREAMING")
@@ -9057,6 +9208,7 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
 @Composable
 fun EqualizerScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
+    val soundEngine by AudioEngine.state.collectAsState()
     val eq = state.equalizerSnapshot
     val accent = state.activeSkin.highlight
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
@@ -9069,6 +9221,21 @@ fun EqualizerScreen(vm: MainViewModel) {
                 Text("Kilo Equalizer", color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.ExtraBold)
             }
         }
+        SettingsSectionHeader("SOUND PROFILE")
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(horizontal = 2.dp)) {
+            items(SoundProfileRepository.profiles, key = { it.id }) { profile ->
+                FilterChip(
+                    selected = soundEngine.selectedProfileId == profile.id,
+                    onClick = { vm.setSoundProfile(profile.id) },
+                    label = { Text(profile.title) }
+                )
+            }
+        }
+        Text(
+            "${soundEngine.output.kind.label} · ${soundEngine.message}",
+            color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp,
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+        )
         SettingsGroupCard {
             Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -9081,7 +9248,7 @@ fun EqualizerScreen(vm: MainViewModel) {
         if (eq.presets.isNotEmpty()) {
             SettingsSectionHeader("PRESETS")
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(horizontal = 2.dp)) {
-                itemsIndexed(eq.presets) { index, preset ->
+                itemsIndexed(eq.presets, key = { index, preset -> "eq_preset_${index}_$preset" }, contentType = { _, _ -> "preset" }) { index, preset ->
                     FilterChip(
                         selected = eq.selectedPreset == index,
                         onClick = { vm.applyEqualizerPreset(index) },
@@ -9827,7 +9994,7 @@ fun ExploreScreen(vm: MainViewModel) {
         KiloSection("QUICK BROWSE", accent = accent)
         LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             val genres = listOf("Discover", "Global Top 50", "80s & 90s Classics", "Synthwave", "Indie Chill", "Alternative", "Electronic", "R&B")
-            itemsIndexed(genres) { _, mood ->
+            itemsIndexed(genres, key = { index, mood -> "radio_category_${index}_$mood" }, contentType = { _, _ -> "genre_chip" }) { _, mood ->
                 Box(
                     modifier = Modifier
                         .clip(primaryCardShape(skin))
@@ -9852,7 +10019,11 @@ fun ExploreScreen(vm: MainViewModel) {
         }
         Spacer(modifier = Modifier.height(16.dp))
         LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-            itemsIndexed(state.playlist) { idx, song ->
+            itemsIndexed(
+                state.playlist,
+                key = { index, song -> "radio_song_${song.videoId.ifBlank { song.id }}_$index" },
+                contentType = { _, _ -> "song" }
+            ) { idx, song ->
                 BitchordSongRowItem(
                     song = song,
                     isCurrent = idx == state.currentIndex,
@@ -9879,7 +10050,7 @@ private fun BrowseCategoryTags(
             contentPadding = PaddingValues(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(9.dp)
         ) {
-            items(tags.distinct(), key = { "$title:$it" }) { tag ->
+            items(tags.distinct(), key = { "$title:$it" }, contentType = { "tag" }) { tag ->
                 val selected = selectedCategory.equals(tag, ignoreCase = true)
                 Box(
                     modifier = Modifier
@@ -10026,7 +10197,11 @@ fun SearchScreen(vm: MainViewModel) {
             contentPadding = PaddingValues(horizontal = 20.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            itemsIndexed(listOf("Songs", "Artists", "Playlists")) { index, title ->
+            itemsIndexed(
+                listOf("Songs", "Artists", "Playlists"),
+                key = { _, title -> "search_result_tab_$title" },
+                contentType = { _, _ -> "tab" }
+            ) { index, title ->
                 val selected = selectedSearchTab == index
                 val titleWithCount = when (index) {
                     1 -> if (state.artistSearchResults.isNotEmpty()) "$title (${state.artistSearchResults.size})" else title
@@ -10054,7 +10229,7 @@ fun SearchScreen(vm: MainViewModel) {
         if (state.searchQuery.isBlank() && state.searchSuggestions.isNotEmpty()) {
             KiloSection("RECENT SEARCHES", accent = accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(state.searchSuggestions.take(8)) { recent ->
+                items(state.searchSuggestions.take(8), key = { "recent_search_$it" }, contentType = { "search_suggestion" }) { recent ->
                     FilterChip(selected = false, onClick = { vm.onSearchQueryChanged(recent) }, label = { Text(recent, maxLines = 1) })
                 }
             }
@@ -10062,7 +10237,7 @@ fun SearchScreen(vm: MainViewModel) {
         if (state.searchQuery.isBlank() && state.recognitionHistory.isNotEmpty()) {
             KiloSection("RECENTLY RECOGNIZED", accent = accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(state.recognitionHistory.take(8), key = { "recognition_${it.id}" }) { item ->
+                items(state.recognitionHistory.take(8), key = { "recognition_${it.id}" }, contentType = { "recognition" }) { item ->
                     FilterChip(
                         selected = false,
                         onClick = { vm.onSearchQueryChanged("${item.title} ${item.artist}") },
@@ -10074,7 +10249,11 @@ fun SearchScreen(vm: MainViewModel) {
         if (state.searchQuery.isBlank()) {
             KiloSection("TRENDING SEARCHES", accent = accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(listOf("New music", "Night Drive", "Tamil Hits", "Hip-Hop", "Throwback Hits", "Workout Mix")) { query ->
+                items(
+                    listOf("New music", "Night Drive", "Tamil Hits", "Hip-Hop", "Throwback Hits", "Workout Mix"),
+                    key = { "trending_search_$it" },
+                    contentType = { "search_suggestion" }
+                ) { query ->
                     FilterChip(selected = false, onClick = { vm.onSearchQueryChanged(query) }, label = { Text(query) })
                 }
             }
@@ -10082,7 +10261,11 @@ fun SearchScreen(vm: MainViewModel) {
         if (state.searchQuery.isBlank()) {
             KiloSection("SEARCH TYPES", accent = accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(listOf("Songs", "Artists", "Albums", "Playlists", "Podcasts", "Languages", "Moods", "Genres")) { type ->
+                items(
+                    listOf("Songs", "Artists", "Albums", "Playlists", "Podcasts", "Languages", "Moods", "Genres"),
+                    key = { "search_type_$it" },
+                    contentType = { "search_type" }
+                ) { type ->
                     FilterChip(
                         selected = false,
                         onClick = { vm.onSearchQueryChanged(listOf(state.searchQuery, type).filter(String::isNotBlank).joinToString(" ")) },
@@ -10092,7 +10275,11 @@ fun SearchScreen(vm: MainViewModel) {
             }
             KiloSection("ADVANCED FILTERS", accent = accent)
             LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(SearchEnhancer.quickFilters()) { filter ->
+                itemsIndexed(
+                    SearchEnhancer.quickFilters(),
+                    key = { index, filter -> "search_filter_${index}_${filter.label}" },
+                    contentType = { _, _ -> "search_filter" }
+                ) { _, filter ->
                     val shape = RoundedCornerShape(50)
                     Box(
                         Modifier.clip(shape).background(primaryPanelColor(skin))
@@ -10142,7 +10329,11 @@ fun SearchScreen(vm: MainViewModel) {
                 }
             }
             if (displayList.isNotEmpty()) item { SettingsSectionHeader("SONGS") }
-            itemsIndexed(displayList, key = { _, song -> "search-song-${song.videoId.ifBlank { song.id }}" }) { _, song ->
+            itemsIndexed(
+                displayList,
+                key = { index, song -> "search-song-${song.videoId.ifBlank { song.id }}-$index" },
+                contentType = { _, _ -> "song" }
+            ) { _, song ->
                 BitchordSongRowItem(
                     song = song,
                     isCurrent = state.activeSong.id == song.id,
@@ -10154,7 +10345,7 @@ fun SearchScreen(vm: MainViewModel) {
             if (state.searchQuery.isNotBlank() && !state.isSearching && state.artistSearchResults.isEmpty()) {
                 item { Text("No artists found for this search.", color = Color.White.copy(alpha = 0.62f), modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp)) }
             }
-            itemsIndexed(state.artistSearchResults, key = { _, artist -> "artist-tab-${artist.id}" }) { _, artist ->
+            itemsIndexed(state.artistSearchResults, key = { _, artist -> "artist-tab-${artist.id}" }, contentType = { _, _ -> "artist" }) { _, artist ->
                 ArtistSearchRow(artist, artist.name in state.listenerProfile.followedArtists, { vm.toggleFollowedArtist(artist.name) }) { vm.openArtist(artist) }
             }
         } else if (selectedSearchTab == 2) {
@@ -10182,7 +10373,7 @@ fun SearchScreen(vm: MainViewModel) {
             }
             if (savedPlaylistResults.isNotEmpty()) {
                 item { SettingsSectionHeader("KILO PLAYLISTS") }
-                items(savedPlaylistResults, key = { "kilo-search-playlist-${it.id}" }) { playlist ->
+                items(savedPlaylistResults, key = { "kilo-search-playlist-${it.id}" }, contentType = { "playlist" }) { playlist ->
                     SavedPlaylistSearchRow(playlist) {
                         playlist.songs.firstOrNull()?.let { vm.playSongFromShelf(it, playlist.songs, "phone_playlist") }
                     }
@@ -10190,7 +10381,7 @@ fun SearchScreen(vm: MainViewModel) {
             }
             if (youtubePlaylistResults.isNotEmpty()) {
                 item { SettingsSectionHeader("YOUR YOUTUBE MUSIC PLAYLISTS") }
-                items(youtubePlaylistResults, key = { "youtube-search-playlist-${it.playlistId}" }) { playlist ->
+                items(youtubePlaylistResults, key = { "youtube-search-playlist-${it.playlistId}" }, contentType = { "playlist" }) { playlist ->
                     CommunityPlaylistSearchRow(playlist, subtitleLabel = "Your YouTube Music playlist") {
                         vm.playSongFromShelf(playlist, state.youtubeMusicPlaylists, "phone_playlist")
                     }
@@ -10198,7 +10389,7 @@ fun SearchScreen(vm: MainViewModel) {
             }
             if (youtubeSearchPlaylistResults.isNotEmpty()) {
                 item { SettingsSectionHeader("YOUTUBE PLAYLISTS") }
-                items(youtubeSearchPlaylistResults, key = { "youtube-public-playlist-${it.playlistId}" }) { playlist ->
+                items(youtubeSearchPlaylistResults, key = { "youtube-public-playlist-${it.playlistId}" }, contentType = { "playlist" }) { playlist ->
                     CommunityPlaylistSearchRow(playlist, subtitleLabel = "${playlist.artist} · YouTube playlist") {
                         vm.playSongFromShelf(playlist, listOf(playlist), "phone_youtube_playlist_search")
                     }
@@ -10206,7 +10397,7 @@ fun SearchScreen(vm: MainViewModel) {
             }
             if (communityPlaylistResults.isNotEmpty()) {
                 item { SettingsSectionHeader("COMMUNITY PLAYLISTS") }
-                itemsIndexed(communityPlaylistResults, key = { _, playlist -> "community-playlist-${playlist.id}" }) { _, playlist ->
+                itemsIndexed(communityPlaylistResults, key = { _, playlist -> "community-playlist-${playlist.id}" }, contentType = { _, _ -> "playlist" }) { _, playlist ->
                     CommunityPlaylistSearchRow(playlist) {
                         vm.playSongFromShelf(playlist, listOf(playlist), "phone_playlist_search")
                     }
@@ -10342,7 +10533,7 @@ fun ArtistDetailScreen(vm: MainViewModel) {
                 item { SettingsSectionHeader("ALBUMS & SINGLES") }
                 item {
                     LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        itemsIndexed(state.artistAlbums, key = { _, album -> album.albumBrowseId }) { _, album ->
+                        itemsIndexed(state.artistAlbums, key = { _, album -> album.albumBrowseId }, contentType = { _, _ -> "album" }) { _, album ->
                             Column(Modifier.width(132.dp).clickable { vm.openArtistAlbum(album) }) {
                                 AsyncImage(model = album.coverUrl, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.size(132.dp).clip(RoundedCornerShape(14.dp)))
                                 Spacer(Modifier.height(6.dp))
@@ -10359,7 +10550,7 @@ fun ArtistDetailScreen(vm: MainViewModel) {
                     if (state.selectedArtistAlbumTitle != null) TextButton(onClick = vm::showAllArtistSongs) { Text("All songs", color = accent) }
                 }
             }
-            itemsIndexed(state.artistSongs, key = { _, song -> song.id }) { _, song ->
+            itemsIndexed(state.artistSongs, key = { index, song -> "artist_song_${song.videoId.ifBlank { song.id }}_$index" }, contentType = { _, _ -> "song" }) { _, song ->
                 BitchordSongRowItem(song, state.activeSong.id == song.id, onClick = { vm.playSongFromShelf(song, state.artistSongs) }, vm = vm)
             }
             if (!state.isSearching && state.artistAlbums.isEmpty() && state.artistSongs.isEmpty()) {
@@ -10428,7 +10619,7 @@ fun LibraryScreen(vm: MainViewModel) {
         )
         val activeLibraryTab = state.libraryTab.takeIf { it in setOf(1, 3, 5) } ?: 1
         LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(libTabs) { (tabIndex, tabName) ->
+            items(libTabs, key = { "library_tab_${it.second}" }, contentType = { "tab" }) { (tabIndex, tabName) ->
                 val active = activeLibraryTab == tabIndex
                 Box(
                     modifier = Modifier
@@ -10452,7 +10643,7 @@ fun LibraryScreen(vm: MainViewModel) {
                     Text("Follow artists in Personalisation to build your artist library.", color = Color.Gray, textAlign = TextAlign.Center)
                 }
             } else LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                items(followedArtists, key = { "library_artist_${it.lowercase(Locale.ROOT)}" }) { name ->
+                items(followedArtists, key = { "library_artist_${it.lowercase(Locale.ROOT)}" }, contentType = { "artist" }) { name ->
                     val representative = artistArtworkSongs.firstOrNull { it.artist.equals(name, true) }
                     ArtistSearchRow(
                         ArtistItem("library:${name.lowercase(Locale.ROOT)}", name, "Followed artist",
@@ -10507,7 +10698,7 @@ fun LibraryScreen(vm: MainViewModel) {
                             }
                         }
                     }
-                    itemsIndexed(savedPlaylist.songs, key = { _, song -> "${savedPlaylist.id}_${song.id}" }) { _, song ->
+                    itemsIndexed(savedPlaylist.songs, key = { index, song -> "${savedPlaylist.id}_${song.videoId.ifBlank { song.id }}_$index" }, contentType = { _, _ -> "song" }) { _, song ->
                         BitchordSongRowItem(
                             song = song,
                             isCurrent = state.activeSong.id == song.id,
@@ -10520,7 +10711,7 @@ fun LibraryScreen(vm: MainViewModel) {
                     item(key = "youtube_playlists_heading") {
                         KiloSection("YOUR YOUTUBE MUSIC PLAYLISTS", accent = accent)
                     }
-                    items(state.youtubeMusicPlaylists, key = { "youtube_playlist_${it.playlistId}" }) { remotePlaylist ->
+                    items(state.youtubeMusicPlaylists, key = { "youtube_playlist_${it.playlistId}" }, contentType = { "playlist" }) { remotePlaylist ->
                         CommunityPlaylistSearchRow(remotePlaylist) {
                             vm.playSongFromShelf(remotePlaylist, state.youtubeMusicPlaylists, "phone_playlist")
                         }
@@ -10529,7 +10720,11 @@ fun LibraryScreen(vm: MainViewModel) {
             }
         } else {
             LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
-                itemsIndexed(displayedSongs) { _, song ->
+                itemsIndexed(
+                    displayedSongs,
+                    key = { index, song -> "library_song_${song.videoId.ifBlank { song.id }}_$index" },
+                    contentType = { _, _ -> "song" }
+                ) { _, song ->
                     BitchordSongRowItem(
                         song = song,
                         isCurrent = state.activeSong.id == song.id,
@@ -10546,6 +10741,12 @@ fun LibraryScreen(vm: MainViewModel) {
 fun OfflineMusicScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val downloadedTracks = state.downloadedSongs
+    val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        vm.setDownloadDirectory(uri)
+    }
+    val downloadFolderName = state.downloadDirectoryUri?.let { value ->
+        runCatching { DocumentsContract.getTreeDocumentId(Uri.parse(value)).substringAfterLast(':') }.getOrNull()
+    }?.takeIf { it.isNotBlank() } ?: "Choose where KILO saves downloads"
     val importFlacPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let(vm::importFlac)
     }
@@ -10571,6 +10772,24 @@ fun OfflineMusicScreen(vm: MainViewModel) {
             }
         }
         Spacer(modifier = Modifier.height(12.dp))
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(Color.White.copy(alpha = 0.06f))
+                .clickable { folderPicker.launch(null) }
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Default.Folder, contentDescription = null, tint = state.activeSkin.highlight)
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text("Download folder", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                Text(downloadFolderName, color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
+            TextButton(onClick = { folderPicker.launch(null) }) { Text("Choose") }
+        }
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
             "Import a FLAC file you’re authorized to use. KILO keeps it in its current location and adds it to your offline library.",
             color = Color.White.copy(alpha = 0.62f),
@@ -10612,7 +10831,11 @@ fun OfflineMusicScreen(vm: MainViewModel) {
                     }
                 }
             }
-            itemsIndexed(downloadedTracks) { _, song ->
+            itemsIndexed(
+                downloadedTracks,
+                key = { index, song -> "downloaded_song_${song.videoId.ifBlank { song.id }}_$index" },
+                contentType = { _, _ -> "song" }
+            ) { _, song ->
                 BitchordSongRowItem(
                     song = song,
                     isCurrent = state.activeSong.id == song.id,

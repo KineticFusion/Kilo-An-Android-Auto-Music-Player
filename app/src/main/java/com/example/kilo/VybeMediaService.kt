@@ -55,6 +55,8 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.analytics.AnalyticsListener
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import androidx.media3.session.CommandButton
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
@@ -71,6 +73,11 @@ import com.google.common.util.concurrent.SettableFuture
 import com.example.kilo.audioanalysis.AudioAnalysisDatabaseProvider
 import com.example.kilo.audioanalysis.AudioAnalysisService
 import com.example.kilo.audioanalysis.TrackAnalysisEntity
+import com.example.kilo.playback.stability.MediaSourceAudit
+import com.example.kilo.playback.stability.PlaybackStabilityManager
+import com.example.kilo.playback.stability.RecoveryCoordinator
+import com.example.kilo.search.preparation.SearchWarmupEngine
+import com.example.kilo.mood.preparation.MoodWarmupEngine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -108,6 +115,39 @@ private const val TAB_PLAYLISTS = "tab_playlists"
 private const val TAB_LISTEN_AGAIN = "tab_listen_again"
 private const val TAB_HEARD_SHORTS = "tab_heard_shorts"
 private const val TAB_TRENDING = "tab_trending"
+
+/**
+ * Expired/rejected stream URLs are not transient. Invalidate their resolution and let
+ * PlayerHolder rebuild the MediaItem/MediaSource. Retrying the failed byte range in-place
+ * is unsafe because a refreshed URL can select a different container (for example, Opus
+ * in WebM -> AAC in MP4) while the existing extractor still expects the original format.
+ */
+private class PlaybackLoadErrorPolicy : DefaultLoadErrorHandlingPolicy(5) {
+    override fun getRetryDelayMsFor(loadErrorInfo: LoadErrorHandlingPolicy.LoadErrorInfo): Long {
+        var cause: Throwable? = loadErrorInfo.exception
+        while (cause != null) {
+            val status = (cause as? HttpDataSource.InvalidResponseCodeException)?.responseCode
+            if (status == 403 || status == 410) {
+                // A rejected signed URL is recoverable, but must be retried by rebuilding
+                // the source. A DataSource-level retry reuses the open extractor and its
+                // byte position; the refreshed resolver may return another container.
+                val mediaId = PlayerHolder.refreshRejectedStreamSource(loadErrorInfo.loadEventInfo.dataSpec)
+                val canRebuildSource = mediaId != null && loadErrorInfo.errorCount == 1
+                Log.w(
+                    "KiloPlayback",
+                    "http=$status rejectedSource id=${mediaId.orEmpty()} " +
+                        "attempt=${loadErrorInfo.errorCount} rebuildSource=$canRebuildSource"
+                )
+                // Propagate immediately to PlayerHolder.onPlayerError. Its existing
+                // recovery replaces only the current item and preserves queue, position,
+                // and playWhenReady while Media3 creates an extractor for the new format.
+                return C.TIME_UNSET
+            }
+            cause = cause.cause
+        }
+        return super.getRetryDelayMsFor(loadErrorInfo)
+    }
+}
 private const val TAB_RADIO = "tab_radio"
 private const val TAB_RADIO_BROWSE = "tab_radio_browse"
 private const val TAB_RADIO_FAVORITES = "tab_radio_favorites"
@@ -164,8 +204,10 @@ private class AndroidAutoLyricsSessionPlayer(delegate: Player) : ForwardingPlaye
 fun SongItemClean.toMediaItem(): MediaItem {
     val vid = videoId.ifEmpty { id }
     LosslessSource.register(this, vid)
+    PlaybackRepository.remember(this)
     val fingerprint = listOf(title, artist, album, durationMs.toString(), coverUrl).joinToString("\u001f")
-    return MediaItemCache.getOrCreate(vid, fingerprint) {
+    PlaybackRepository.mediaItem(vid, fingerprint)?.let { return it }
+    val item = MediaItemCache.getOrCreate(vid, fingerprint) {
         PlaybackMetrics.onMediaItemCreated(vid)
         val meta = MediaMetadata.Builder()
             .setTitle(title)
@@ -185,6 +227,8 @@ fun SongItemClean.toMediaItem(): MediaItem {
             .setMediaMetadata(meta.build())
             .build()
     }
+    PlaybackRepository.rememberMediaItem(vid, fingerprint, item)
+    return item
 }
 
 fun MediaItem.toSong(idx: Int = 0): SongItemClean {
@@ -468,6 +512,7 @@ object HomeCache {
 
 object PlayerHolder {
     private const val MAX_PLAYBACK_RETRIES = 2
+    private const val STARTUP_WARM_BYTES = 96L * 1024L
     private data class ErrorRecovery(val positionMs: Long, val shouldResume: Boolean, val attempt: Int)
     private var player: ExoPlayer? = null
     private var bandwidthMeter: DefaultBandwidthMeter? = null
@@ -577,13 +622,15 @@ object PlayerHolder {
             .setBandwidthMeter(meter)
             .setLoadControl(
                 DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(30_000, 90_000, 2_500, 5_000)
+                    // Keep the generous rebuffer target for stable playback, but start
+                    // the first audio sooner once 1.5 seconds are safely buffered.
+                    .setBufferDurationsMs(30_000, 90_000, 1_500, 5_000)
                     .build()
             )
             .setMediaSourceFactory(
                 DefaultMediaSourceFactory(
                     ResolvingDataSource.Factory(cachedFactory, resolver)
-                )
+                ).setLoadErrorHandlingPolicy(PlaybackLoadErrorPolicy())
             )
             .setAudioAttributes(
                 AudioAttributes.Builder()
@@ -636,6 +683,7 @@ object PlayerHolder {
             )
         }
 
+        var lastObservedPlaybackState = p.playbackState
         p.addListener(object : Player.Listener {
             override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
                 val currentId = p.currentMediaItem?.mediaId
@@ -657,6 +705,8 @@ object PlayerHolder {
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
+                val previousPlaybackState = lastObservedPlaybackState
+                lastObservedPlaybackState = playbackState
                 logPlaybackSnapshot("stateChanged")
                 PlaybackPerformanceLayer.onPlayerState(app, p, playbackState, p.isPlaying)
                 PlaybackStartupMetrics.playerState(
@@ -667,7 +717,11 @@ object PlayerHolder {
                 }
                 if (playbackState == Player.STATE_READY) {
                     val id = p.currentMediaItem?.mediaId
+                    id?.let { idleRecoveryAttempts.remove(it) }
                     val recovery = id?.let { pendingErrorRecoveries.remove(it) }
+                    if (id != null && RecoveryCoordinator.state(id) == RecoveryCoordinator.State.RECOVERING) {
+                        RecoveryCoordinator.markRecovered(id)
+                    }
                     if (id != null && recovery != null) {
                         val duration = p.duration.takeIf { it > 0L && it != C.TIME_UNSET }
                         val targetPosition = recovery.positionMs.coerceAtLeast(0L).let { position ->
@@ -687,7 +741,7 @@ object PlayerHolder {
                 }
                 if (playbackState == Player.STATE_IDLE) {
                     p.currentMediaItem?.mediaId?.let { id ->
-                        scheduleUnexpectedIdleRecovery(p, id, positionHandler)
+                        scheduleUnexpectedIdleRecovery(p, id, positionHandler, previousPlaybackState)
                     }
                 }
             }
@@ -789,7 +843,17 @@ object PlayerHolder {
                 pendingErrorRecoveries.remove(id)
                 Log.e("KiloPlayback", "Playback error ${error.errorCodeName} code=${error.errorCode} for $id", error)
                 logPlaybackSnapshot("playerError")
+                if (!RecoveryCoordinator.beginExistingRecovery(
+                        id,
+                        "owner=player_error code=${error.errorCode} name=${error.errorCodeName} " +
+                            "carMode=${com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(app)}"
+                    )
+                ) {
+                    Log.w("KiloPlayback", "playerError recovery suppressed id=$id reason=recovery_already_active")
+                    return
+                }
                 if (!id.startsWith("radio:")) {
+                    PlaybackRepository.invalidateResolvedStream(id)
                     LosslessSource.invalidate(id)
                     FastStream.invalidate(id)
                     QueuePreloader.forget(id)
@@ -819,11 +883,14 @@ object PlayerHolder {
                         }
                     if (nextIndex != null) {
                         Log.w("KiloPlayback", "Skipping unavailable stream id=$id; continuing at queue index=$nextIndex")
+                        RecoveryCoordinator.markFailed(id, "unavailable_stream_skipped")
+                        MediaSourceAudit.beforeMutation("prepare:skip_unavailable", p, id)
                         p.seekTo(nextIndex, 0L)
                         p.prepare()
                         if (shouldResume) p.play()
                     } else {
                         Log.e("KiloPlayback", "No other playable queue item after stream failure id=$id")
+                        RecoveryCoordinator.markFailed(id, "unavailable_stream_and_no_queue_candidate")
                         p.pause()
                     }
                     return
@@ -844,17 +911,21 @@ object PlayerHolder {
                         val retryItem = failedItem.buildUpon().apply {
                             if (originalUri?.scheme == "vybe") setUri(originalUri)
                         }.build()
+                        MediaSourceAudit.beforeMutation("replace_media_item:player_error_recovery", p, id)
                         p.replaceMediaItem(currentIndex, retryItem)
                         p.seekTo(currentIndex, resumePositionMs)
                         // Preserve Media3's playWhenReady intent across source recovery.
                         // An explicit pause here adds a dead-air gap and can lose autoplay.
                         if (shouldResumeNow && !p.playWhenReady) p.play()
+                        MediaSourceAudit.beforeMutation("prepare:player_error_recovery", p, id)
                         p.prepare()
                         Log.w(
                             "KiloPlayback",
                             "errorRecoveryPrepared id=$id attempt=$attempt positionMs=$resumePositionMs " +
                                 "wasPlaying=$shouldResumeNow uriScheme=${originalUri?.scheme.orEmpty()}"
                         )
+                    } else {
+                        RecoveryCoordinator.cancelExistingRecovery(id, "track_or_queue_changed_before_retry")
                     }
                 }, retryDelay)
             }
@@ -896,14 +967,50 @@ object PlayerHolder {
         }
     }
 
-    private fun scheduleUnexpectedIdleRecovery(p: ExoPlayer, id: String, handler: Handler) {
+    private fun scheduleUnexpectedIdleRecovery(
+        p: ExoPlayer,
+        id: String,
+        handler: Handler,
+        previousState: Int
+    ) {
+        val appContext = analysisAppContext ?: return
         val hadStarted = id == lastAudibleTrackId || id == lastAutoplayReadyTrackId ||
             p.currentPosition > 0L || (lastKnownPositionMs[id] ?: 0L) > 0L
-        if (!hadStarted || !p.playWhenReady || p.playerError != null || p.mediaItemCount == 0) return
-        if (!idleRecoveryScheduled.add(id)) return
+        // A cold-path failure can fall from BUFFERING back to IDLE before the first
+        // audible frame. The old guard only recovered tracks that had already played,
+        // leaving the first selection permanently stuck with playWhenReady=true.
+        val failedDuringStartup = !hadStarted && previousState == Player.STATE_BUFFERING
+        if ((!hadStarted && !failedDuringStartup) || !p.playWhenReady || p.playerError != null || p.mediaItemCount == 0) return
+        if (idleRecoveryScheduled.contains(id)) return
+        val protection = PlaybackStabilityManager.unexpectedIdleRecoveryDecision(id)
+        if (protection.shouldBlock) {
+            Log.w(
+                "KiloPlayback",
+                "unexpectedIdleRecovery suppressed id=$id reason=${protection.reason} " +
+                    "lastHealthyPositionMs=${protection.latestHealthyPositionMs} " +
+                    "lastHealthyBufferedMs=${protection.latestHealthyBufferedMs} " +
+                    "carMode=${com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(appContext)}"
+            )
+            return
+        }
+        if (!RecoveryCoordinator.beginExistingRecovery(
+                id,
+                "owner=unexpected_idle previousState=$previousState carMode=" +
+                    com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(appContext)
+            )
+        ) {
+            Log.w("KiloPlayback", "unexpectedIdleRecovery suppressed id=$id reason=recovery_already_active")
+            return
+        }
+        if (!idleRecoveryScheduled.add(id)) {
+            RecoveryCoordinator.cancelExistingRecovery(id, "duplicate_idle_recovery_request")
+            return
+        }
         val attempt = idleRecoveryAttempts.merge(id, 1) { previous, increment -> previous + increment } ?: 1
-        if (attempt > 3) {
+        val maxAttempts = if (failedDuringStartup) 1 else 3
+        if (attempt > maxAttempts) {
             idleRecoveryScheduled.remove(id)
+            RecoveryCoordinator.markFailed(id, "unexpected_idle_recovery_attempt_limit")
             Log.e(
                 "KiloPlayback",
                 "unexpectedIdleRecovery exhausted id=" + id +
@@ -915,27 +1022,43 @@ object PlayerHolder {
         val resumePositionMs = maxOf(lastKnownPositionMs[id] ?: 0L, p.currentPosition.coerceAtLeast(0L))
         Log.w(
             "KiloPlayback",
-            "unexpectedIdleRecovery scheduled id=$id attempt=$attempt positionMs=$resumePositionMs"
+            "unexpectedIdleRecovery scheduled id=$id attempt=$attempt startup=$failedDuringStartup " +
+                "previousState=$previousState positionMs=$resumePositionMs"
         )
         handler.postDelayed({
             idleRecoveryScheduled.remove(id)
-            if (p.currentMediaItem?.mediaId != id || !p.playWhenReady ||
-                p.playbackState != Player.STATE_IDLE || p.playerError != null
-            ) return@postDelayed
+            if (p.currentMediaItem?.mediaId != id) {
+                RecoveryCoordinator.cancelExistingRecovery(id, "track_changed_before_idle_recovery")
+                return@postDelayed
+            }
+            if (!p.playWhenReady || p.playbackState != Player.STATE_IDLE || p.playerError != null) {
+                if (p.playbackState == Player.STATE_READY && p.isPlaying) {
+                    RecoveryCoordinator.markRecovered(id)
+                } else {
+                    RecoveryCoordinator.cancelExistingRecovery(id, "idle_recovery_no_longer_applicable")
+                }
+                return@postDelayed
+            }
             runCatching {
                 p.seekTo(resumePositionMs)
+                MediaSourceAudit.beforeMutation("prepare:unexpected_idle_recovery", p, id)
                 p.prepare()
                 p.play()
                 Log.w("KiloPlayback", "unexpectedIdleRecovery started id=$id attempt=$attempt positionMs=$resumePositionMs")
             }.onFailure { error ->
+                RecoveryCoordinator.markFailed(id, "unexpected_idle_recovery_exception:${error.javaClass.simpleName}")
                 Log.e("KiloPlayback", "unexpectedIdleRecovery failed id=$id attempt=$attempt", error)
             }
-        }, 100L * (attempt - 1))
+        }, if (failedDuringStartup) 650L else 100L * (attempt - 1))
     }
 
-    fun prefetch(ctx: Context, videoId: String, onComplete: (() -> Unit)? = null) {
-        if (videoId.isBlank()) return
+    fun prefetch(ctx: Context, videoId: String, onComplete: ((Boolean) -> Unit)? = null) {
+        if (videoId.isBlank()) {
+            onComplete?.invoke(false)
+            return
+        }
         bgPool.execute {
+            var succeeded = false
             try {
                 val info = resolveStreamInfo(ctx, videoId) ?: return@execute
                 val prefetchFailure = AudioCache.prefetch(ctx, videoId, info)
@@ -944,6 +1067,7 @@ object PlayerHolder {
                     .firstOrNull()
                 if (responseCode == 403) {
                     Log.w("KiloPlayback", "prefetch stream rejected id=$videoId http=403; refreshing before selection")
+                    PlaybackRepository.invalidateResolvedStream(videoId)
                     LosslessSource.invalidate(videoId)
                     FastStream.invalidate(videoId)
                     QueuePreloader.forget(videoId)
@@ -951,6 +1075,7 @@ object PlayerHolder {
                     if (refreshed != null) {
                         val retryFailure = AudioCache.prefetch(ctx, videoId, refreshed)
                         if (retryFailure == null) {
+                            succeeded = true
                             Log.i("KiloPlayback", "prefetch refresh ready id=$videoId")
                         } else {
                             Log.w("KiloPlayback", "prefetch refresh failed id=$videoId", retryFailure)
@@ -960,11 +1085,13 @@ object PlayerHolder {
                     }
                 } else if (prefetchFailure != null) {
                     Log.w("KiloPlayback", "prefetch failed id=$videoId", prefetchFailure)
+                } else {
+                    succeeded = true
                 }
             } catch (error: Throwable) {
                 Log.w("KiloPlayback", "prefetch failed id=$videoId", error)
             } finally {
-                onComplete?.invoke()
+                onComplete?.invoke(succeeded)
             }
         }
     }
@@ -972,12 +1099,103 @@ object PlayerHolder {
     fun resolveForWarmup(ctx: Context, videoId: String): StreamInfo? =
         resolveStreamInfo(ctx.applicationContext, videoId)
 
+    /**
+     * Prepare the same small first-audio range the player will read. This moves
+     * stale-URL detection and the first bytes off the tap-to-audio critical path.
+     */
+    fun prepareSourceForWarmup(ctx: Context, videoId: String): StreamInfo? {
+        val app = ctx.applicationContext
+        var info = resolveStreamInfo(app, videoId) ?: return null
+        var failure = AudioCache.prefetch(app, videoId, info, STARTUP_WARM_BYTES)
+        var status = httpStatusCode(failure)
+
+        if (status == 403 || status == 410) {
+            Log.w("KiloPlayback", "startupWarmSourceRejected id=$videoId http=$status; refreshing once")
+            invalidateStreamSource(videoId)
+            info = resolveStreamInfo(app, videoId) ?: return null
+            failure = AudioCache.prefetch(app, videoId, info, STARTUP_WARM_BYTES)
+            status = httpStatusCode(failure)
+        }
+
+        if (failure == null) {
+            Log.i("KiloPlayback", "startupAudioBytesReady id=$videoId bytes=$STARTUP_WARM_BYTES")
+        } else {
+            Log.d("KiloPlayback", "startupAudioWarmMiss id=$videoId http=${status ?: -1}", failure)
+            if (status == 403 || status == 410) {
+                invalidateStreamSource(videoId)
+                return null
+            }
+        }
+        return info
+    }
+
+    private fun httpStatusCode(error: Throwable?): Int? {
+        var cause = error
+        while (cause != null) {
+            (cause as? HttpDataSource.InvalidResponseCodeException)?.let { return it.responseCode }
+            cause = cause.cause
+        }
+        return null
+    }
+
+    private fun invalidateStreamSource(videoId: String) {
+        PlaybackRepository.invalidateResolvedStream(videoId)
+        LosslessSource.invalidate(videoId)
+        FastStream.invalidate(videoId)
+        QueuePreloader.forget(videoId)
+    }
+
+    /**
+     * Refresh a rejected URL before Media3 retries its load. The original URI is normally
+     * still vybe://; the cache key is a fallback for loads whose event reports the resolved
+     * HTTP URI instead.
+     */
+    fun refreshRejectedStreamSource(dataSpec: DataSpec): String? {
+        val videoId = dataSpec.uri
+            .takeIf { it.scheme.equals("vybe", ignoreCase = true) }
+            ?.lastPathSegment
+            ?.takeIf { it.isNotBlank() }
+            ?: dataSpec.key?.let { key ->
+                Regex("^(.+)-[0-9a-fA-F]{8}-[^-]+-full-v\\d+$")
+                    .matchEntire(key)
+                    ?.groupValues
+                    ?.getOrNull(1)
+            }
+            ?.takeIf { it.isNotBlank() }
+            ?: return null
+        invalidateStreamSource(videoId)
+        return videoId
+    }
+
     private fun resolveStreamInfo(ctx: Context, videoId: String): StreamInfo? {
-        val cacheHit = ResolvedTrackCache.peek(videoId) != null
+        // Prefer the repository's already-resolved stream for this loaded track. It is
+        // process-local and expiry-checked, so the existing resolver remains the fallback.
+        val repositoryCandidate = PlaybackRepository.resolvedStream(videoId)
+        val repositoryHit = repositoryCandidate?.takeIf(FastStream::validate)
+        if (repositoryCandidate != null && repositoryHit == null) {
+            Log.w("KiloPlayback", "cached stream URL rejected id=$videoId; resolving a fresh source")
+            PlaybackRepository.invalidateResolvedStream(videoId)
+            LosslessSource.invalidate(videoId)
+            FastStream.invalidate(videoId)
+        }
+        val cacheHit = repositoryHit != null || ResolvedTrackCache.peek(videoId) != null
         PlaybackMetrics.onResolverStarted(videoId, cacheHit)
         val startedAt = SystemClock.elapsedRealtime()
+        repositoryHit?.let { cached ->
+            PlaybackMetrics.onResolverFinished(videoId, startedAt, cached)
+            PlaybackWarmupManager.onResolverReady()
+            return cached
+        }
         val resolver = StreamResolver(listOf(
-            StreamSource { id -> LosslessSource.peek(id) ?: LosslessSource.resolve(ctx, id) },
+            StreamSource { id ->
+                val candidate = LosslessSource.peek(id) ?: LosslessSource.resolve(ctx, id)
+                if (candidate == null || FastStream.validate(candidate)) candidate
+                else {
+                    Log.w("KiloPlayback", "lossless stream URL rejected id=$id; trying existing fallback")
+                    LosslessSource.invalidate(id)
+                    null
+                }
+            },
             StreamSource { id -> FastStream.get(id, { YtRepo.fetchStream(it) }, ctx) }
         ))
         val info = try {
@@ -987,6 +1205,7 @@ object PlayerHolder {
             PlaybackWarmupManager.onResolverReady()
             throw error
         }
+        if (info != null) PlaybackRepository.rememberResolvedStream(videoId, info)
         PlaybackMetrics.onResolverFinished(videoId, startedAt, info)
         PlaybackWarmupManager.onResolverReady()
         return info
@@ -1119,6 +1338,48 @@ class VybeMediaService : MediaLibraryService() {
             .filter { it.timeMs >= 0L && it.timeMs <= positionMs && it.text.isNotBlank() }
             .maxByOrNull { it.timeMs }
         lyricsSessionPlayer?.setCurrentLyric(currentLine?.text)
+    }
+
+    /** Warm a bounded page of visible Android Auto tracks off the browse callback. */
+    private fun warmVisibleAndroidAutoTracks(items: List<MediaItem>, section: String) {
+        val visible = items.asSequence()
+            .filter { item ->
+                item.mediaMetadata.isPlayable == true &&
+                    item.mediaId.isNotBlank() && !item.mediaId.startsWith("radio:")
+            }
+            .distinctBy { it.mediaId }
+            .take(8)
+            .toList()
+        if (visible.isEmpty()) return
+        runCatching {
+            io.execute {
+                val songs = visible.mapNotNull { item -> runCatching { item.toSong() }.getOrNull() }
+                if (songs.isNotEmpty()) {
+                    // The existing visible-source warmer resolves/cache-warms only 96 KB
+                    // per track and caps concurrent work; queue and player stay untouched.
+                    when {
+                        section.contains("search", ignoreCase = true) -> SearchWarmupEngine.prepare(
+                            applicationContext,
+                            section.substringAfter("search:", section).take(160),
+                            songs
+                        )
+                        section.contains("mood", ignoreCase = true) -> MoodWarmupEngine.prepare(
+                            applicationContext,
+                            section.substringAfter("mood:", section).take(80),
+                            songs
+                        )
+                        else -> PlaybackPerformanceLayer.prepareVisible(
+                            applicationContext,
+                            songs,
+                            "android_auto:$section"
+                        )
+                    }
+                    Log.d(TAG, "VISIBLE_TRACK_WARMUP section=$section count=${songs.size} bytes=98304")
+                }
+            }
+        }.onFailure { error ->
+            Log.d(TAG, "visible track warmup skipped section=$section", error)
+        }
     }
 
     private val notifReceiver = object : BroadcastReceiver() {
@@ -1311,6 +1572,7 @@ class VybeMediaService : MediaLibraryService() {
             wifiLock?.let { if (it.isHeld) it.release() }
             session?.player?.let {
                 SessionStore.save(it)
+                MediaSourceAudit.beforeMutation("stop:close_app", it)
                 it.stop()
             }
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -1352,6 +1614,7 @@ class VybeMediaService : MediaLibraryService() {
         getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
             .unregisterOnSharedPreferenceChangeListener(carBrowsePreferenceListener)
         AndroidAutoWarmupManager.shutdown()
+        session?.player?.let { MediaSourceAudit.beforeMutation("release:media_library_session", it) }
         session?.release()
         session = null
         lyricsSessionPlayer = null
@@ -2592,12 +2855,14 @@ class VybeMediaService : MediaLibraryService() {
                             if (resumeItems.isNotEmpty()) {
                                 val startIndex = restored?.index?.coerceIn(0, resumeItems.lastIndex) ?: 0
                                 val startPosition = if (restored != null) restored.posMs else 0L
+                                MediaSourceAudit.beforeMutation("set_media_items:session_restore", player)
                                 player.setMediaItems(resumeItems, startIndex, startPosition)
                             }
                         }
                         if (player.mediaItemCount > 0) {
                             player.play()
                             if (player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) {
+                                MediaSourceAudit.beforeMutation("prepare:session_restore", player)
                                 player.prepare()
                             }
                         }
@@ -2746,8 +3011,10 @@ class VybeMediaService : MediaLibraryService() {
                         try {
                             val player = mediaSession.player
                             PlaybackMetrics.onPlayerPrepare(ready.first().mediaId, "android_auto_mood")
+                            MediaSourceAudit.beforeMutation("set_media_items:android_auto_mood", player)
                             player.setMediaItems(ready, 0, 0L)
                             player.play()
+                            MediaSourceAudit.beforeMutation("prepare:android_auto_mood", player)
                             player.prepare()
                             SessionStore.save(player)
                             Log.i(TAG, "Android Auto mood action started mood=${suggestion.mood} track=${ready.first().mediaId}")
@@ -2802,6 +3069,7 @@ class VybeMediaService : MediaLibraryService() {
                 val safeItems = childrenFromCache(parentId)
                 val paged = safeItems.pageSafely(page, pageSize)
                 Log.i(TAG, "Browse parent=$parentId total=${safeItems.size} page=$page pageSize=$pageSize returned=${paged.size}")
+                warmVisibleAndroidAutoTracks(paged, parentId)
                 val childStyle = AndroidAutoUiModule.childStyle(parentId)
                 logLibraryResult("onGetChildren parent=$parentId", LibraryResult.ofItemList(ImmutableList.copyOf(paged), listStyleLibraryParams(params, childStyle)))
                 } catch (error: Throwable) {
@@ -2878,6 +3146,7 @@ class VybeMediaService : MediaLibraryService() {
                     .ifEmpty { emptyList() }
                 register(all)
                 val paged = all.pageSafely(page, pageSize)
+                warmVisibleAndroidAutoTracks(paged, "search:$query")
                 logLibraryResult("onGetSearchResult query=$query", LibraryResult.ofItemList(ImmutableList.copyOf(paged), listStyleLibraryParams(params)))
             }
         override fun onAddMediaItems(

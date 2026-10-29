@@ -27,6 +27,9 @@ import java.util.concurrent.atomic.AtomicLong
 
 object FastStream {
     private const val TAG = "VybeFast"
+    private const val URL_VALIDATION_TIMEOUT_MS = 1_800
+    private const val URL_VALIDATION_SUCCESS_TTL_MS = 60_000L
+    private const val URL_VALIDATION_FAILURE_TTL_MS = 5_000L
 
     /*
     private class Client(
@@ -62,17 +65,23 @@ object FastStream {
     private val cache = ResolvedStreamCache()
     private val inflight = ConcurrentHashMap<String, FutureTask<StreamInfo?>>()
     private val preferFallbackOnNextResolve = ConcurrentHashMap<String, Boolean>()
+    private data class UrlValidation(val playable: Boolean, val expiresAtMs: Long)
+    private val urlValidation = ConcurrentHashMap<String, UrlValidation>()
     private val pool = Executors.newCachedThreadPool()
 
     fun peek(videoId: String): StreamInfo? =
         cache.get(videoId)
 
     fun invalidate(videoId: String) {
+        cache.get(videoId)?.let { urlValidation.remove(it.url) }
         cache.invalidate(videoId)
         // If this stream failed, try the NewPipe/legacy resolver on the next
         // request instead of selecting the same fast-client URL again.
         preferFallbackOnNextResolve[videoId] = true
     }
+
+    /** Bounded range probe used before a URL reaches Media3; successful probes are reused briefly. */
+    fun validate(info: StreamInfo): Boolean = validateStreamUrl(info)
 
     fun warmUp() {
         pool.execute {
@@ -86,7 +95,11 @@ object FastStream {
     }
 
     fun get(videoId: String, fallback: (String) -> StreamInfo?, context: Context? = null): StreamInfo? {
-        peek(videoId)?.let { return it }
+        peek(videoId)?.let { cached ->
+            if (validateStreamUrl(cached)) return cached
+            Log.w(TAG, "resolve stage=cached_url_rejected id=$videoId; refreshing source")
+            invalidate(videoId)
+        }
         var owner = false
         val task = inflight.computeIfAbsent(videoId) {
             owner = true
@@ -148,8 +161,12 @@ object FastStream {
 
     private fun resolve(videoId: String, fallback: (String) -> StreamInfo?, targetBitrateKbps: Int): StreamInfo? {
         if (preferFallbackOnNextResolve.remove(videoId) == true) {
-            fallback(videoId)?.let { return it }
+            val fallbackStartedAt = System.nanoTime()
+            val fallbackInfo = fallback(videoId)
+            if (fallbackInfo != null && validateStreamUrl(fallbackInfo)) return fallbackInfo
+            Log.w(TAG, "resolve stage=forced_fallback_miss id=$videoId durationMs=${(System.nanoTime() - fallbackStartedAt) / 1_000_000L}")
         }
+        val fastStartedAt = System.nanoTime()
         val calls = clients.map { c ->
             Callable<StreamInfo> { fromClient(c, videoId, targetBitrateKbps) ?: throw IOException("${c.name}: no stream") }
         }
@@ -158,8 +175,90 @@ object FastStream {
         } catch (_: Exception) {
             null
         }
-        if (fast != null) return fast
-        return fallback(videoId)
+        val fastDurationMs = (System.nanoTime() - fastStartedAt) / 1_000_000L
+        if (fast != null && validateStreamUrl(fast)) {
+            Log.d(TAG, "resolve stage=parallel_clients id=$videoId durationMs=$fastDurationMs result=ready")
+            return fast
+        }
+        Log.w(TAG, "resolve stage=parallel_clients id=$videoId durationMs=$fastDurationMs result=${if (fast == null) "miss" else "url_rejected"}; entering repository fallback")
+        val fallbackStartedAt = System.nanoTime()
+        val fallbackInfo = fallback(videoId)
+        val result = fallbackInfo?.takeIf(::validateStreamUrl)
+        return result.also {
+            Log.i(
+                TAG,
+                "resolve stage=repository_fallback id=$videoId durationMs=${(System.nanoTime() - fallbackStartedAt) / 1_000_000L} " +
+                    "result=${if (result == null) "miss" else "ready"}"
+            )
+        }
+    }
+
+    private fun validateStreamUrl(info: StreamInfo): Boolean {
+        if (info.url.isBlank()) return false
+        val now = System.currentTimeMillis()
+        urlValidation[info.url]?.takeIf { it.expiresAtMs > now }?.let { return it.playable }
+
+        var responseCode = -1
+        val startedAt = System.nanoTime()
+        val playable = try {
+            val streamUri = Uri.parse(info.url)
+            val declaredLength = streamUri.getQueryParameter("clen")?.toLongOrNull()
+            val durationMs = info.durationMs.takeIf { it > 0L }
+                ?: streamUri.getQueryParameter("dur")?.toDoubleOrNull()?.let { (it * 1_000.0).toLong() }
+            val estimatedLength = declaredLength ?: durationMs?.takeIf { it > 0L }
+                ?.let { it * info.bitrateKbps.coerceAtLeast(1) * 1_000L / 8_000L }
+            // Probe the first byte range that playback will reach after its small warm
+            // buffer. Some signed URLs accept byte 0 but reject later ranges with 403,
+            // causing an audible stall about a minute into the track.
+            val probePosition = if (estimatedLength == null || estimatedLength > 1_048_578L) {
+                1_048_576L
+            } else 0L
+            val connection = (URL(info.url).openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = URL_VALIDATION_TIMEOUT_MS
+                readTimeout = URL_VALIDATION_TIMEOUT_MS
+                instanceFollowRedirects = true
+                useCaches = false
+                info.userAgent.takeIf(String::isNotBlank)?.let { setRequestProperty("User-Agent", it) }
+                info.requestHeaders.forEach { (name, value) -> setRequestProperty(name, value) }
+                val host = url.host.orEmpty()
+                if ((host.endsWith("youtube.com") || host.endsWith("googlevideo.com")) &&
+                    getRequestProperty("Referer").isNullOrBlank()
+                ) {
+                    setRequestProperty("Referer", "https://www.youtube.com/")
+                }
+                setRequestProperty("Accept-Encoding", "identity")
+                setRequestProperty("Range", "bytes=$probePosition-${probePosition + 1L}")
+            }
+            try {
+                responseCode = connection.responseCode
+                val contentRange = connection.getHeaderField("Content-Range").orEmpty()
+                val returnedStart = Regex("(?i)^bytes\\s+(\\d+)-")
+                    .find(contentRange)?.groupValues?.getOrNull(1)?.toLongOrNull()
+                val rangeAccepted = responseCode != 206 || returnedStart == probePosition
+                val accepted = responseCode in 200..299 && rangeAccepted
+                val body = if (accepted) connection.inputStream else connection.errorStream
+                body?.use { if (accepted) it.read() else Unit }
+                accepted
+            } finally {
+                connection.disconnect()
+            }
+        } catch (error: Exception) {
+            Log.d(TAG, "stream URL validation failed (${error.javaClass.simpleName})")
+            false
+        }
+        val ttl = if (playable) URL_VALIDATION_SUCCESS_TTL_MS else URL_VALIDATION_FAILURE_TTL_MS
+        urlValidation[info.url] = UrlValidation(playable, now + ttl)
+        if (urlValidation.size > 256) {
+            urlValidation.entries.removeIf { it.value.expiresAtMs <= now }
+            while (urlValidation.size > 256) urlValidation.keys.firstOrNull()?.let(urlValidation::remove) ?: break
+        }
+        Log.i(
+            TAG,
+            "resolve stage=url_validation durationMs=${(System.nanoTime() - startedAt) / 1_000_000L} " +
+                "http=$responseCode rangeProbe=midstream result=${if (playable) "playable" else "rejected"}"
+        )
+        return playable
     }
 
     private fun fromClient(client: Client, videoId: String, targetBitrateKbps: Int): StreamInfo? {
@@ -270,14 +369,18 @@ object AudioCache {
                     "Accept-Encoding" to "identity"
                 )
             } else emptyMap()
-            val source = dataSourceFactory(ctx, info.userAgent, info.requestHeaders + referer).createDataSource()
             val spec = DataSpec.Builder()
                 .setUri(Uri.parse(info.url))
                 .setKey(keyFor(videoId, info.url))
                 .setPosition(0)
                 .setLength(bytes)
                 .build()
-            CacheWriter(source, spec, null, null).cache()
+            CacheWriter(
+                dataSourceFactory(ctx, info.userAgent, info.requestHeaders + referer).createDataSource(),
+                spec,
+                null,
+                null
+            ).cache()
         }.exceptionOrNull()
 }
 
