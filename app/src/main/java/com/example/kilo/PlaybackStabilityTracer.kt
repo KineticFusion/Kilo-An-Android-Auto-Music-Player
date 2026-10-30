@@ -204,31 +204,14 @@ internal class PlaybackStabilityTracer(context: Context) : Player.Listener, Anal
         )
     }
 
-    fun reportErrorToRecoveryCoordinator(mediaId: String, code: Int, name: String) {
-        val active = player
-        val matchesCurrent = active?.currentMediaItem?.mediaId == mediaId
-        val bufferedMs = if (matchesCurrent) {
-            (active!!.bufferedPosition - active.currentPosition).coerceAtLeast(0L)
-        } else 0L
-        val sourceValid = sourceIsValid(mediaId, active?.currentMediaItem?.takeIf { matchesCurrent })
-        val positionAdvancing = if (matchesCurrent) {
-            val current = healthSnapshot(
-                active!!,
-                bufferedMs,
-                sourceValid,
-                SourceLifecycleManager.state(mediaId).name
-            )
-            RecoveryProtectionLayer.isHealthyProgress(PlaybackStabilityManager.latest(mediaId), current)
-        } else false
-        RecoveryCoordinator.recordPlayerError(
-            mediaId = mediaId,
-            errorCode = code,
-            detail = name,
-            playWhenReady = matchesCurrent && active!!.playWhenReady,
-            bufferedMs = bufferedMs,
-            sourceValid = sourceValid,
-            existingRecoveryActive = runCatching { PlayerHolder.isRetrying(mediaId) }.getOrDefault(false),
-            positionAdvancing = positionAdvancing
+    fun reportErrorToDiagnostics(mediaId: String, code: Int, name: String) {
+        // This listener observes the failure but must not claim the recovery slot. The
+        // existing PlayerHolder listener owns source invalidation, item replacement,
+        // retry timing, and queue continuation.
+        PlaybackDiagnostics.record(
+            "player_error_observed",
+            mediaId,
+            "code=$code name=$name recoveryOwner=PlayerHolder"
         )
     }
 

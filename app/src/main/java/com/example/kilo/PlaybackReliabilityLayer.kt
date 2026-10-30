@@ -13,7 +13,6 @@ import com.example.kilo.playbackcache.AudioSegmentCache
 import com.example.kilo.playbackcache.PlaybackCacheMetrics
 import com.example.kilo.playbackrecovery.PlaybackDiagnostics
 import com.example.kilo.playbackrecovery.PlaybackRecoveryObserver
-import com.example.kilo.playback.stability.RecoveryCoordinator
 import com.example.kilo.sourceprefetch.SourcePrefetchManager
 import com.example.kilo.streaming.AudioCache
 import com.example.kilo.playback.cache.DiskSourceCache
@@ -97,10 +96,14 @@ object PlaybackReliabilityLayer {
         item?.let(::inspectTrackCache)
     }
 
-    /** Sends error context to the wrapper-owned deduplicator; the current service remains authoritative. */
+    /** Records error telemetry only; PlayerHolder's existing listener owns recovery. */
     fun reportPlayerError(mediaId: String, code: Int, name: String) {
-        stabilityTracer?.reportErrorToRecoveryCoordinator(mediaId, code, name)
-            ?: RecoveryCoordinator.recordPlayerError(mediaId, code, name)
+        stabilityTracer?.reportErrorToDiagnostics(mediaId, code, name)
+            ?: PlaybackDiagnostics.record(
+                "player_error_observed",
+                mediaId,
+                "code=$code name=$name recoveryOwner=PlayerHolder"
+            )
     }
 
     fun diagnosticsReport(): String = PlaybackDiagnostics.exportReport() + "\n" + PlaybackPerformanceDashboard.report()

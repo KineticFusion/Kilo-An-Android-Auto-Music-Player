@@ -34,6 +34,14 @@ import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import com.example.kilo.notification.DynamicPaletteExtractor
+import com.example.kilo.notification.NotificationActionFactory
+import com.example.kilo.notification.NotificationArtworkRenderer
+import com.example.kilo.playback.background.BackgroundPlaybackCoordinator
+import com.example.kilo.playback.background.BackgroundPlaybackMetrics
+import com.example.kilo.playback.background.PlaybackLifecycleManager
+import com.example.kilo.playback.mediasession.MediaSessionCoordinator
+import com.example.kilo.playback.resume.ResumeCoordinator
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -165,9 +173,13 @@ const val ACTION_TOGGLE_PLAY = "com.example.kilo.ACTION_TOGGLE_PLAY"
 const val ACTION_NEXT_TRACK = "com.example.kilo.ACTION_NEXT_TRACK"
 const val ACTION_PREV_TRACK = "com.example.kilo.ACTION_PREV_TRACK"
 const val ACTION_CLOSE_APP = "com.example.kilo.ACTION_CLOSE_APP"
+const val ACTION_SEEK_BACK_15 = "com.example.kilo.ACTION_SEEK_BACK_15"
+const val ACTION_SEEK_FORWARD_15 = "com.example.kilo.ACTION_SEEK_FORWARD_15"
 private const val NOTIF_CHANNEL_ID = "vybe_playback_channel"
 private const val NOTIF_ID = 4041
 private const val MAX_ANDROID_AUTO_CHILD_PAGE_SIZE = 50
+private const val SESSION_SNAPSHOT_INTERVAL_MS = 10_000L
+private const val SERVICE_HEARTBEAT_INTERVAL_MS = 15_000L
 
 /** Exposes the active timed lyric as session subtitle metadata without replacing the player or queue. */
 private class AndroidAutoLyricsSessionPlayer(delegate: Player) : ForwardingPlayer(delegate) {
@@ -399,6 +411,11 @@ object SessionStore {
             .putInt("index", idx - start)
             .putLong("pos", player.currentPosition.coerceAtLeast(0L))
             .apply()
+    }
+
+    @Synchronized
+    fun clearQueue() {
+        prefs?.edit()?.remove("queue")?.remove("index")?.remove("pos")?.apply()
     }
 
     @Synchronized
@@ -843,15 +860,14 @@ object PlayerHolder {
                 pendingErrorRecoveries.remove(id)
                 Log.e("KiloPlayback", "Playback error ${error.errorCodeName} code=${error.errorCode} for $id", error)
                 logPlaybackSnapshot("playerError")
-                if (!RecoveryCoordinator.beginExistingRecovery(
-                        id,
-                        "owner=player_error code=${error.errorCode} name=${error.errorCodeName} " +
-                            "carMode=${com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(app)}"
-                    )
-                ) {
-                    Log.w("KiloPlayback", "playerError recovery suppressed id=$id reason=recovery_already_active")
-                    return
-                }
+                // A previous passive refresh may already have marked this track as
+                // recovering. The player-error owner must still replace the rejected
+                // source; the bounded retry counter below prevents recovery loops.
+                RecoveryCoordinator.beginPlayerErrorRecovery(
+                    id,
+                    "owner=player_error code=${error.errorCode} name=${error.errorCodeName} " +
+                        "carMode=${com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(app)}"
+                )
                 if (!id.startsWith("radio:")) {
                     PlaybackRepository.invalidateResolvedStream(id)
                     LosslessSource.invalidate(id)
@@ -1268,8 +1284,12 @@ class VybeMediaService : MediaLibraryService() {
     @Volatile private var autoPlayOnCarConnectHandled = false
     @Volatile private var notificationArtworkId: String? = null
     @Volatile private var notificationArtwork: Bitmap? = null
+    @Volatile private var notificationColor: Int = android.graphics.Color.rgb(68, 48, 102)
     @Volatile private var artworkLoadInProgress = false
     private var wifiLock: android.net.wifi.WifiManager.WifiLock? = null
+    private var backgroundPlaybackCoordinator: BackgroundPlaybackCoordinator? = null
+    private var lifecycleManager: PlaybackLifecycleManager? = null
+    private var servicePlayer: ExoPlayer? = null
 
     private val index = ConcurrentHashMap<String, MediaItem>()
     private val siblings = ConcurrentHashMap<String, List<MediaItem>>()
@@ -1315,6 +1335,29 @@ class VybeMediaService : MediaLibraryService() {
             val player = PlayerHolder.get(this@VybeMediaService)
             updateAndroidAutoLyricLine(player.currentMediaItem, player.currentPosition)
             main.postDelayed(this, 500L)
+        }
+    }
+
+    private val sessionSnapshotTicker = object : Runnable {
+        override fun run() {
+            val player = session?.player
+            if (player != null && player.mediaItemCount > 0) {
+                backgroundPlaybackCoordinator?.snapshot("service_snapshot_10s")
+            }
+            if (session != null) main.postDelayed(this, SESSION_SNAPSHOT_INTERVAL_MS)
+        }
+    }
+
+    private val serviceHeartbeat = object : Runnable {
+        override fun run() {
+            val player = servicePlayer
+            if (session != null && player?.isPlaying == true && player.currentMediaItem != null) {
+                BackgroundPlaybackMetrics.heartbeat(
+                    "queue=${player.mediaItemCount} positionMs=${player.currentPosition} " +
+                        "bufferedMs=${(player.bufferedPosition - player.currentPosition).coerceAtLeast(0L)}"
+                )
+            }
+            if (session != null) main.postDelayed(this, SERVICE_HEARTBEAT_INTERVAL_MS)
         }
     }
 
@@ -1386,7 +1429,10 @@ class VybeMediaService : MediaLibraryService() {
         override fun onReceive(context: Context?, intent: Intent?) {
             val p = session?.player ?: return
             when (intent?.action) {
-                ACTION_TOGGLE_PLAY -> if (p.isPlaying) p.pause() else p.play()
+                // Notification actions use the same MediaSession facade as Android Auto,
+                // Bluetooth and headset controls. The facade forwards into the background
+                // coordinator, which in turn commands the existing player.
+                ACTION_TOGGLE_PLAY -> if (p.playWhenReady) p.pause() else p.play()
                 ACTION_NEXT_TRACK -> if (p.mediaItemCount > 0) {
                     p.seekToNextMediaItem()
                     p.play()
@@ -1395,6 +1441,8 @@ class VybeMediaService : MediaLibraryService() {
                     p.seekToPreviousMediaItem()
                     p.play()
                 }
+                ACTION_SEEK_BACK_15 -> p.seekTo((p.currentPosition - 15_000L).coerceAtLeast(0L))
+                ACTION_SEEK_FORWARD_15 -> p.seekTo(p.currentPosition + 15_000L)
                 ACTION_CLOSE_APP -> closeAppCompletely()
             }
         }
@@ -1412,13 +1460,21 @@ class VybeMediaService : MediaLibraryService() {
             addAction(ACTION_TOGGLE_PLAY)
             addAction(ACTION_NEXT_TRACK)
             addAction(ACTION_PREV_TRACK)
+            addAction(ACTION_SEEK_BACK_15)
+            addAction(ACTION_SEEK_FORWARD_15)
             addAction(ACTION_CLOSE_APP)
         }
         ContextCompat.registerReceiver(this, notifReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
         val player = PlayerHolder.get(this)
+        servicePlayer = player
+        ResumeCoordinator.restoreQueueIfNeeded(this, player)
+        backgroundPlaybackCoordinator = BackgroundPlaybackCoordinator(this, player, main).also { it.attach() }
+        lifecycleManager = PlaybackLifecycleManager(player).also { it.serviceCreated() }
         currentTrackSnapshot = player.currentMediaItem
-        lyricsSessionPlayer = AndroidAutoLyricsSessionPlayer(player)
+        lyricsSessionPlayer = AndroidAutoLyricsSessionPlayer(
+            MediaSessionCoordinator(player, requireNotNull(backgroundPlaybackCoordinator))
+        )
         val open = PendingIntent.getActivity(
             this,
             0,
@@ -1447,9 +1503,12 @@ class VybeMediaService : MediaLibraryService() {
             .registerOnSharedPreferenceChangeListener(carBrowsePreferenceListener)
         updateLayout()
         postPlaybackNotification()
+        main.postDelayed(sessionSnapshotTicker, SESSION_SNAPSHOT_INTERVAL_MS)
+        main.postDelayed(serviceHeartbeat, SERVICE_HEARTBEAT_INTERVAL_MS)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        lifecycleManager?.serviceStarted(startId)
         postPlaybackNotification()
         return super.onStartCommand(intent, flags, startId)
     }
@@ -1482,27 +1541,21 @@ class VybeMediaService : MediaLibraryService() {
         if (item?.mediaId != notificationArtworkId) {
             notificationArtworkId = item?.mediaId
             notificationArtwork = null
+            notificationColor = android.graphics.Color.rgb(68, 48, 102)
         }
         if (artworkUri != null && notificationArtwork == null && !artworkLoadInProgress) {
             artworkLoadInProgress = true
             val requestedId = item?.mediaId
             io.execute {
                 val bitmap = runCatching {
-                    val connection = URL(artworkUri.toString()).openConnection() as HttpURLConnection
-                    connection.connectTimeout = 4000
-                    connection.readTimeout = 5000
-                    connection.instanceFollowRedirects = true
-                    try {
-                        connection.inputStream.use { stream -> BitmapFactory.decodeStream(stream) }
-                    } finally {
-                        connection.disconnect()
-                    }
+                    NotificationArtworkRenderer.load(this@VybeMediaService, artworkUri)
                 }.getOrNull()
                 main.post {
                     artworkLoadInProgress = false
                     if (requestedId != null && requestedId == session?.player?.currentMediaItem?.mediaId) {
                         notificationArtworkId = requestedId
                         notificationArtwork = bitmap
+                        notificationColor = DynamicPaletteExtractor.dominantColor(bitmap)
                         if (bitmap != null) postPlaybackNotification()
                     } else {
                         postPlaybackNotification()
@@ -1516,23 +1569,6 @@ class VybeMediaService : MediaLibraryService() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val prevPending = PendingIntent.getBroadcast(
-            this, 11, Intent(ACTION_PREV_TRACK).setPackage(packageName),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val playPausePending = PendingIntent.getBroadcast(
-            this, 12, Intent(ACTION_TOGGLE_PLAY).setPackage(packageName),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val nextPending = PendingIntent.getBroadcast(
-            this, 13, Intent(ACTION_NEXT_TRACK).setPackage(packageName),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        val closePending = PendingIntent.getBroadcast(
-            this, 14, Intent(ACTION_CLOSE_APP).setPackage(packageName),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
         val notification = NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentTitle(title)
@@ -1542,16 +1578,21 @@ class VybeMediaService : MediaLibraryService() {
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
             .setOnlyAlertOnce(true)
-            .setStyle(MediaStyleNotificationHelper.MediaStyle(activeSession).setShowActionsInCompactView(0, 1, 2))
-            .setLargeIcon(notificationArtwork)
-            .addAction(android.R.drawable.ic_media_previous, "Previous", prevPending)
-            .addAction(
+            .setColor(notificationColor)
+            .setStyle(MediaStyleNotificationHelper.MediaStyle(activeSession).setShowActionsInCompactView(0, 2, 4))
+            .setLargeIcon(notificationArtwork ?: NotificationArtworkRenderer.placeholder())
+            .addAction(NotificationActionFactory.action(this, android.R.drawable.ic_media_previous, "Previous", ACTION_PREV_TRACK, 11))
+            .addAction(NotificationActionFactory.action(this, android.R.drawable.ic_media_rew, "Back 15 seconds", ACTION_SEEK_BACK_15, 15))
+            .addAction(NotificationActionFactory.action(
+                this,
                 if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
                 if (isPlaying) "Pause" else "Play",
-                playPausePending
-            )
-            .addAction(android.R.drawable.ic_media_next, "Next", nextPending)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Close App", closePending)
+                ACTION_TOGGLE_PLAY,
+                12
+            ))
+            .addAction(NotificationActionFactory.action(this, android.R.drawable.ic_media_ff, "Forward 15 seconds", ACTION_SEEK_FORWARD_15, 16))
+            .addAction(NotificationActionFactory.action(this, android.R.drawable.ic_media_next, "Next", ACTION_NEXT_TRACK, 13))
+            .addAction(NotificationActionFactory.action(this, android.R.drawable.ic_menu_close_clear_cancel, "Close KILO", ACTION_CLOSE_APP, 14))
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -1571,6 +1612,7 @@ class VybeMediaService : MediaLibraryService() {
         runCatching {
             wifiLock?.let { if (it.isHeld) it.release() }
             session?.player?.let {
+                backgroundPlaybackCoordinator?.snapshot("close_app")
                 SessionStore.save(it)
                 MediaSourceAudit.beforeMutation("stop:close_app", it)
                 it.stop()
@@ -1589,6 +1631,8 @@ class VybeMediaService : MediaLibraryService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
+        lifecycleManager?.taskRemoved()
+        backgroundPlaybackCoordinator?.snapshot("task_removed")
         val activeSession = session
         val player = activeSession?.player
         val browserConnected = activeSession?.connectedControllers?.isNotEmpty() == true
@@ -1603,6 +1647,11 @@ class VybeMediaService : MediaLibraryService() {
     override fun onDestroy() {
         Log.i(TAG, "MediaLibraryService destroyed sessionAvailable=${session != null}")
         main.removeCallbacks(lyricMetadataPoller)
+        main.removeCallbacks(sessionSnapshotTicker)
+        main.removeCallbacks(serviceHeartbeat)
+        lifecycleManager?.serviceDestroyed()
+        backgroundPlaybackCoordinator?.close()
+        backgroundPlaybackCoordinator = null
         DriveRecapStore.serviceDestroyed(session?.player?.isPlaying == true)
         runCatching { unregisterReceiver(notifReceiver) }
         wifiLock?.let { if (it.isHeld) it.release() }
@@ -1618,6 +1667,7 @@ class VybeMediaService : MediaLibraryService() {
         session?.release()
         session = null
         lyricsSessionPlayer = null
+        servicePlayer = null
         io.shutdown()
         super.onDestroy()
     }
@@ -2909,6 +2959,7 @@ class VybeMediaService : MediaLibraryService() {
             bg("onPlaybackResumption controller=${controller.packageName}") {
                 ConnectionReliabilityManager.onQueueRestoreRequested(controller.packageName)
                 val player = mediaSession.player
+                ResumeCoordinator.applyModes(this@VybeMediaService, player)
                 if (player.mediaItemCount > 0 && player.currentMediaItem != null) {
                     val queue = (0 until player.mediaItemCount).map(player::getMediaItemAt)
                     ConnectionReliabilityManager.onQueueRestoreReady(controller.packageName, queue.size)
@@ -2943,13 +2994,7 @@ class VybeMediaService : MediaLibraryService() {
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                 }
                 QUEUE_NEXT_COMMAND.customAction -> {
-                    val player = session.player
-                    val current = player.currentMediaItem
-                    if (current != null && player.mediaItemCount > 0) {
-                        val insertAt = (player.currentMediaItemIndex.coerceAtLeast(0) + 1).coerceAtMost(player.mediaItemCount)
-                        player.addMediaItem(insertAt, current)
-                        SessionStore.save(player)
-                    }
+                    backgroundPlaybackCoordinator?.enqueueCurrentNext()
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                 }
                 CLOSE_APP_COMMAND.customAction -> {

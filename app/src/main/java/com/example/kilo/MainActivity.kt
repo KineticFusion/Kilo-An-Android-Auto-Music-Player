@@ -4207,7 +4207,10 @@ _state.value = _state.value.copy(
         val id = preferences.getLong(PENDING_UPDATE_DOWNLOAD_ID, -1L)
         if (id <= 0L) return
         val version = preferences.getString(PENDING_UPDATE_VERSION, "").orEmpty()
-        if (version.isNotBlank() && UpdateCenter.compareVersions(BuildConfig.VERSION_NAME, version) >= 0) {
+        // Use the package manager's installed version. BuildConfig can be stale when
+        // an APK was installed outside the current source/build configuration.
+        val installedVersion = installedVersionName()
+        if (version.isNotBlank() && UpdateCenter.compareVersions(installedVersion, version) >= 0) {
             clearPendingUpdatePreferences()
             _state.value = _state.value.copy(
                 updateAvailable = false,
@@ -4216,7 +4219,7 @@ _state.value = _state.value.copy(
                 updateDownloadProgress = null,
                 downloadedUpdateUri = null,
                 updateInstallerStarted = false,
-                updateCheckMessage = "You’re up to date · KILO ${BuildConfig.VERSION_NAME}"
+                updateCheckMessage = "You’re up to date · KILO ${installedVersion}"
             )
             viewModelScope.launch(Dispatchers.IO) { updateDownloader.remove(id) }
             return
@@ -4351,8 +4354,11 @@ _state.value = _state.value.copy(
             val hasPendingInstall = pendingVersion.isNotBlank() ||
                 _state.value.downloadedUpdateUri != null ||
                 installerWasStarted
+            val displayedUpdateAlreadyInstalled = _state.value.updateAvailable &&
+                expectedVersion.isNotBlank() &&
+                UpdateCenter.compareVersions(installedVersion, expectedVersion) >= 0
 
-            if (hasPendingInstall && expectedVersion.isNotBlank() &&
+            if ((hasPendingInstall || displayedUpdateAlreadyInstalled) && expectedVersion.isNotBlank() &&
                 UpdateCenter.compareVersions(installedVersion, expectedVersion) >= 0
             ) {
                 clearPendingUpdatePreferences()

@@ -90,6 +90,15 @@ object RecoveryCoordinator {
         return true
     }
 
+    /** Starts the authoritative player-error retry, even if a passive observer saw the error first. */
+    fun beginPlayerErrorRecovery(mediaId: String, detail: String) {
+        if (mediaId.isBlank()) return
+        synchronized(lock) {
+            records[mediaId] = RecoveryRecord(State.RECOVERING, System.currentTimeMillis())
+        }
+        PlaybackProfiler.record("player_error_recovery_started", mediaId, detail)
+    }
+
     fun cancelExistingRecovery(mediaId: String, reason: String) {
         if (mediaId.isBlank()) return
         synchronized(lock) { records[mediaId] = RecoveryRecord(State.IDLE, System.currentTimeMillis()) }
