@@ -17,6 +17,7 @@ import com.example.kilo.sourceprefetch.SourcePrefetchManager
 import com.example.kilo.streaming.AudioCache
 import com.example.kilo.playback.cache.DiskSourceCache
 import java.util.concurrent.Executors
+import com.example.kilo.playback.v5.PlaybackSupervisor
 
 /**
  * A wrapper around KILO's current Media3 path. Existing caches, queue prefetch and retry
@@ -43,6 +44,7 @@ object PlaybackReliabilityLayer {
     fun initialize(context: Context, player: Player) {
         val app = context.applicationContext
         applicationContext = app
+        (player as? ExoPlayer)?.let { PlaybackSupervisor.attach(app, it) }
         NetworkHealthMonitor.start(app)
         NetworkHealthMonitor.addListener(networkListener)
         synchronized(lock) {

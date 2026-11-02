@@ -17,11 +17,11 @@ import android.os.Handler
 
 /** Opportunistically keeps a short range ahead of the playhead in KILO's existing audio cache. */
 object StreamContinuityCache {
-    private const val MIN_BUFFERED_MS = 6_000L
-    private const val PREFETCH_AHEAD_MS = 18_000L
-    private const val PREFETCH_INTERVAL_MS = 8_000L
+    private const val PREFETCH_AHEAD_MS = 30_000L
+    private const val PREFETCH_INTERVAL_MS = 4_000L
     private const val PLAYER_POLL_INTERVAL_MS = 4_000L
     private const val MAX_PREFETCH_BYTES = 512L * 1024L
+    private const val PREFETCH_CHUNK_BYTES = 96L * 1024L
     private const val MAX_SCAN_BYTES = 32L * 1024L * 1024L
     private const val EXPIRY_REFRESH_WINDOW_MS = 30_000L
 
@@ -87,7 +87,7 @@ object StreamContinuityCache {
         bufferedMs: Long,
         source: StreamInfo
     ) {
-        if (trackId.isBlank() || trackId.startsWith("radio:") || bufferedMs < MIN_BUFFERED_MS) return
+        if (trackId.isBlank() || trackId.startsWith("radio:")) return
         val now = System.currentTimeMillis()
         if (source.expiresAtEpochMs > 0L && source.expiresAtEpochMs - now <= EXPIRY_REFRESH_WINDOW_MS) {
             var shouldRefresh = false
@@ -116,9 +116,12 @@ object StreamContinuityCache {
                     val cache = AudioCache.get(app)
                     val key = AudioCache.keyFor(trackId, source.url)
                     val contiguousEnd = AudioSegmentCache.cachedBytes(cache, key, MAX_SCAN_BYTES)
-                    val start = maxOf(playheadByte, contiguousEnd)
-                    val length = (targetEnd - start).coerceAtMost(MAX_PREFETCH_BYTES)
-                    if (length < 64L * 1024L) return@execute
+                    // Preserve a contiguous range from byte zero. Starting directly at
+                    // the playhead when the cache has a gap makes subsequent writes look
+                    // like zero progress and leaves the unbuffered gap unfixed.
+                    val start = contiguousEnd
+                    val boundedEnd = minOf(targetEnd, start + MAX_PREFETCH_BYTES)
+                    if (boundedEnd - start < 16L * 1024L) return@execute
 
                     val host = Uri.parse(source.url).host.orEmpty()
                     val headers = if (host.endsWith("youtube.com") || host.endsWith("googlevideo.com")) {
@@ -128,18 +131,28 @@ object StreamContinuityCache {
                             "Accept-Encoding" to "identity"
                         )
                     } else source.requestHeaders
-                    val spec = DataSpec.Builder()
-                        .setUri(Uri.parse(source.url))
-                        .setKey(key)
-                        .setPosition(start)
-                        .setLength(length)
-                        .build()
-                    val dataSource = AudioCache.dataSourceFactory(app, source.userAgent, headers).createDataSource()
-                    CacheWriter(dataSource, spec, null, null).cache()
+                    var cursor = start
+                    var chunks = 0
+                    while (cursor < boundedEnd && chunks < 12) {
+                        val requested = minOf(PREFETCH_CHUNK_BYTES, boundedEnd - cursor)
+                        val spec = DataSpec.Builder()
+                            .setUri(Uri.parse(source.url))
+                            .setKey(key)
+                            .setPosition(cursor)
+                            .setLength(requested)
+                            .build()
+                        val dataSource = AudioCache.dataSourceFactory(app, source.userAgent, headers).createDataSource()
+                        CacheWriter(dataSource, spec, null, null).cache()
+                        val newEnd = AudioSegmentCache.cachedBytes(cache, key, MAX_SCAN_BYTES)
+                        if (newEnd <= cursor) break
+                        cursor = minOf(newEnd, boundedEnd)
+                        chunks++
+                    }
                     PlaybackProfiler.record(
                         "continuity_cache_warmed",
                         trackId,
-                        "startByte=$start bytes=$length bufferedMs=$bufferedMs " +
+                        "startByte=$start bytes=${(cursor - start).coerceAtLeast(0L)} bufferedMs=$bufferedMs " +
+                            "targetAheadMs=$PREFETCH_AHEAD_MS chunks=$chunks " +
                             "durationMs=${android.os.SystemClock.elapsedRealtime() - startedAt}"
                     )
                 } catch (error: Exception) {

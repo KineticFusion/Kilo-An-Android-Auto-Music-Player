@@ -18,4 +18,13 @@
     <string name="action_like">Like</string>
     <string name="action_dislike">Dislike</string>
     <string name="now_playing">Now playing</string>
+    <string-array name="kiloAudioSearchQueries">
+        <item>play $songQuery</item>
+        <item>start playing $songQuery</item>
+    </string-array>
+    <string-array name="kiloPlaylistQueries">
+        <item>play playlist $playlistName</item>
+        <item>play my playlist $playlistName</item>
+        <item>start playlist $playlistName</item>
+    </string-array>
 </resources>

@@ -22,6 +22,7 @@ import com.example.kilo.playbackoptimization.PreparedTrackStore
 import com.example.kilo.playbackoptimization.SourceWarmupResolver
 import com.example.kilo.playbackoptimization.WarmedSourceMetadata
 import com.example.kilo.playback.source.SourceRefreshEngine
+import com.example.kilo.playback.v5.StreamLeaseRefreshCoordinator
 import com.example.kilo.observability.PlaybackProfiler
 import com.example.kilo.observability.QueueMetrics
 import com.example.kilo.observability.SourceMetrics
@@ -601,6 +602,7 @@ object PlaybackPerformanceLayer {
     fun onPlayerState(context: Context, player: Player, state: Int, isPlaying: Boolean) {
         PreparedPlaybackLayer.observeQueue(player)
         val currentId = player.currentMediaItem?.mediaId ?: return
+        StreamLeaseRefreshCoordinator.observePlayback(currentId, player.playWhenReady)
         PlaybackMetrics.onPlaybackState(currentId, state, isPlaying)
         if (isPlaying) SourceLifecycleManager.transition(currentId, SourceLifecycleState.ACTIVE)
         ContinuityManager.observe(player)
@@ -632,6 +634,7 @@ object PlaybackWarmupManager {
         runCatching { com.example.kilo.audio.engine.AudioEngine.initialize(app, player) }
             .onFailure { Log.w(TAG, "optional sound profile layer unavailable; original playback remains active", it) }
         PlaybackReliabilityLayer.initialize(app, player)
+        StreamLeaseRefreshCoordinator.install(app)
         runCatching { StreamContinuityCache.attach(app, player) }
         PlaybackMetrics.onPlayerReady()
         val playerItems = player.mediaItemCount

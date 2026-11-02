@@ -31,10 +31,20 @@ data class KiloThemeSpec(
 val LocalKiloDesign = staticCompositionLocalOf { KiloDesignTokens() }
 
 object KiloSpacing {
-    val compact = 8.dp
-    val standard = 16.dp
-    val spacious = 24.dp
-    val section = 32.dp
+    // Shared spacing scale used by both the existing UI and responsive layouts.
+    val xxs = 4.dp
+    val xs = 8.dp
+    val sm = 12.dp
+    val md = 16.dp
+    val lg = 24.dp
+    val xl = 32.dp
+    val xxl = 48.dp
+
+    // Keep the original names available to existing screens and components.
+    val compact = xs
+    val standard = md
+    val spacious = lg
+    val section = xl
 }
 
 object KiloCorners {

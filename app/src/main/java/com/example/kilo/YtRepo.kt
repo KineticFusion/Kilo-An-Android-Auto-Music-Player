@@ -391,6 +391,30 @@ object YtRepo {
         return fetchHomeCatalog().shelves
     }
 
+    /** Curated YouTube Music Explore shelves, reduced to browseable playlist/mix entries. */
+    fun fetchOfficialPlaylistShelves(maxPages: Int = 3): List<HomeShelf> {
+        val shelves = mutableListOf<HomeShelf>()
+        var json: JSONObject? = ytMusicPost("browse", JSONObject().put("browseId", "FEmusic_explore"))
+        if (json == null) return emptyList()
+        var page = 0
+        while (json != null && page < maxPages.coerceIn(1, 8)) {
+            parseShelves(json).forEach { shelf ->
+                val playlists = shelf.songs.filter { it.playlistId.isNotBlank() }
+                if (playlists.isNotEmpty()) {
+                    shelves += HomeShelf(shelf.title, playlists.distinctBy { it.playlistId }, true)
+                }
+            }
+            val continuations = mutableListOf<JSONObject>()
+            collect(json, "nextContinuationData", continuations)
+            val token = continuations.firstOrNull()?.optString("continuation").orEmpty()
+            if (token.isBlank()) break
+            val encoded = URLEncoder.encode(token, "UTF-8")
+            json = ytMusicPost("browse", JSONObject(), "&ctoken=$encoded&continuation=$encoded&type=next")
+            page++
+        }
+        return shelves.distinctBy { it.title to it.songs.map(SongItemClean::playlistId) }
+    }
+
     /** Loads every continuation page exposed by the signed-in or public Music Home feed. */
     fun fetchHomeCatalog(maxPages: Int = 5): HomeCatalogFetch {
         val shelves = mutableListOf<HomeShelf>()
@@ -709,6 +733,44 @@ object YtRepo {
         return s.split(":").fold(0L) { acc, p -> acc * 60 + p.toLong() } * 1000L
     }
 
+    /** Read only track/audio language metadata when the provider actually supplies it. */
+    private fun extractTrackLanguageCode(root: JSONObject): String {
+        val relevantKeys = setOf("languagecode", "tracklanguage", "songlanguage", "audiotracklanguage", "contentlanguage")
+        fun find(node: Any?): String? {
+            return when (node) {
+                is JSONObject -> {
+                    val keys = node.keys()
+                    var result: String? = null
+                    while (keys.hasNext() && result == null) {
+                        val key = keys.next()
+                        val value = node.opt(key)
+                        if (key.lowercase(Locale.ROOT).replace(Regex("[^a-z]"), "") in relevantKeys) {
+                            val candidate = when (value) {
+                                is String -> value
+                                is JSONObject -> value.optString("languageCode").ifBlank { value.optString("code") }
+                                else -> ""
+                            }.trim()
+                            result = candidate.takeIf(String::isNotBlank)
+                        }
+                        if (result == null) result = find(value)
+                    }
+                    result
+                }
+                is JSONArray -> {
+                    var result: String? = null
+                    var index = 0
+                    while (index < node.length() && result == null) {
+                        result = find(node.opt(index))
+                        index++
+                    }
+                    result
+                }
+                else -> null
+            }
+        }
+        return find(root).orEmpty()
+    }
+
     private fun parseResponsiveItem(r: JSONObject, idx: Int): SongItemClean? {
         val flex = r.optJSONArray("flexColumns") ?: return null
         fun col(i: Int) = flex.optJSONObject(i)
@@ -741,6 +803,7 @@ object YtRepo {
             themeColor = paletteColors[idx % paletteColors.size],
             durationMs = if (durStr.isNotEmpty()) parseDuration(durStr) else 210000L,
             isExplicit = r.toString().contains("explicit", ignoreCase = true),
+            languageCode = extractTrackLanguageCode(r),
         )
     }
 

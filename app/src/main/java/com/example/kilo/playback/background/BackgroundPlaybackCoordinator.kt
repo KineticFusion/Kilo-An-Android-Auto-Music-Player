@@ -4,7 +4,7 @@ import android.content.Context
 import android.os.Handler
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import com.example.kilo.playback.resume.SessionPersistence
+import com.example.kilo.playback.resume.PlaybackCheckpointEngine
 
 /** Command and persistence wrapper around the existing ExoPlayer owned by PlayerHolder. */
 class BackgroundPlaybackCoordinator(
@@ -12,7 +12,7 @@ class BackgroundPlaybackCoordinator(
     private val player: Player,
     private val handler: Handler
 ) : Player.Listener {
-    private val persistence = SessionPersistence(context)
+    private val checkpoints = PlaybackCheckpointEngine(context)
     private val saveSnapshot = Runnable { persist("coalesced_player_change") }
     private var attached = false
 
@@ -124,6 +124,7 @@ class BackgroundPlaybackCoordinator(
 
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) = scheduleSave("track_transition")
     override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) = scheduleSave("queue_change")
+    override fun onPlaybackStateChanged(playbackState: Int) = scheduleSave("playback_state_$playbackState")
     override fun onIsPlayingChanged(isPlaying: Boolean) = scheduleSave(if (isPlaying) "play_started" else "play_stopped")
     override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) = scheduleSave("play_intent")
     override fun onPositionDiscontinuity(
@@ -150,7 +151,7 @@ class BackgroundPlaybackCoordinator(
     }
 
     private fun persist(reason: String) {
-        runCatching { persistence.save(player, reason) }
+        runCatching { checkpoints.checkpoint(player, reason) }
             .onFailure { BackgroundPlaybackMetrics.event("snapshot_failed", "reason=$reason error=${it.javaClass.simpleName}") }
     }
 

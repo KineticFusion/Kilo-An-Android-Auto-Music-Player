@@ -88,8 +88,15 @@ object LosslessSource {
         skipOnce.add(mediaId)
     }
 
+    /** Drops only the cached URL so a proactive refresh can query this source again. */
+    fun invalidateForRefresh(mediaId: String) {
+        resolved.remove(mediaId)
+        misses.remove(mediaId)
+        skipOnce.remove(mediaId)
+    }
+
     /** Only returns a source match after metadata and the declared, unencrypted codec pass checks. */
-    fun resolve(context: Context, mediaId: String): StreamInfo? {
+    fun resolve(context: Context, mediaId: String, quality: String = "LOSSLESS"): StreamInfo? {
         peek(mediaId)?.let { return it }
         if (skipOnce.remove(mediaId)) return null
         if (!isEnabled(context)) return null
@@ -101,7 +108,10 @@ object LosslessSource {
         val token = prefs.getString("lossless_source_token", null)?.let(::decrypt).orEmpty()
         return try {
             val query = listOf(song.title, song.artist).filter(String::isNotBlank).joinToString(" ")
-            val search = requestJson("$root/search?q=${enc(query)}&quality=LOSSLESS", token)
+            val qualityValue = quality.uppercase().takeIf {
+                it in setOf("DATA_SAVER", "STANDARD", "HIGH", "VERY_HIGH", "LOSSLESS", "HI_RES_LOSSLESS")
+            } ?: "LOSSLESS"
+            val search = requestJson("$root/search?q=${enc(query)}&quality=$qualityValue", token)
             val tracks = search.optJSONArray("tracks") ?: run {
                 misses[mediaId] = System.currentTimeMillis() + 300_000L
                 return null
@@ -123,7 +133,7 @@ object LosslessSource {
                 misses[mediaId] = System.currentTimeMillis() + 300_000L
                 return null
             }
-            val stream = requestJson("$root/stream/${encPath(id)}?quality=LOSSLESS", token)
+            val stream = requestJson("$root/stream/${encPath(id)}?quality=$qualityValue", token)
             val codec = stream.optString("codec", stream.optString("format")).lowercase()
             if (stream.optBoolean("encrypted", false) || codec !in setOf("flac", "alac")) {
                 misses[mediaId] = System.currentTimeMillis() + 300_000L

@@ -1,13 +1,66 @@
 <?xml version="1.0" encoding="utf-8"?>
-<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
-    <capability android:name="actions.intent.START_FROM_MEDIA_PLAYBACK">
+<shortcuts
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+    <capability
+        android:name="custom.actions.intent.START_AUDIO_SEARCH"
+        app:queryPatterns="@array/kiloAudioSearchQueries">
         <intent
-            android:action="android.intent.action.VIEW"
+            android:action="com.example.kilo.action.ASSISTANT_AUDIO_SEARCH"
             android:targetPackage="com.example.kilo"
             android:targetClass="com.example.kilo.MainActivity">
             <parameter
-                android:name="mediaPlayback.query"
-                android:key="query" />
+                android:name="songQuery"
+                android:key="songQuery"
+                android:mimeType="https://schema.org/Text" />
         </intent>
     </capability>
+    <capability
+        android:name="custom.actions.intent.PLAY_PLAYLIST"
+        app:queryPatterns="@array/kiloPlaylistQueries">
+        <intent
+            android:action="com.example.kilo.action.ASSISTANT_PLAY_PLAYLIST"
+            android:targetPackage="com.example.kilo"
+            android:targetClass="com.example.kilo.MainActivity">
+            <parameter
+                android:name="playlistName"
+                android:key="playlistName"
+                android:mimeType="https://schema.org/Text" />
+        </intent>
+    </capability>
+
+    <capability android:name="actions.intent.GET_THING">
+        <intent
+            android:action="com.example.kilo.action.ASSISTANT_SEARCH"
+            android:targetPackage="com.example.kilo"
+            android:targetClass="com.example.kilo.MainActivity">
+            <parameter
+                android:name="thing.name"
+                android:key="query"
+                android:required="true" />
+        </intent>
+        <intent
+            android:action="com.example.kilo.action.ASSISTANT_SEARCH"
+            android:targetPackage="com.example.kilo"
+            android:targetClass="com.example.kilo.MainActivity" />
+    </capability>
+
+    <capability android:name="actions.intent.OPEN_APP_FEATURE">
+        <intent
+            android:action="com.example.kilo.action.ASSISTANT_OPEN_FEATURE"
+            android:targetPackage="com.example.kilo"
+            android:targetClass="com.example.kilo.MainActivity">
+            <parameter
+                android:name="feature.name"
+                android:key="feature"
+                android:required="true" />
+        </intent>
+        <intent
+            android:action="com.example.kilo.action.ASSISTANT_OPEN_FEATURE"
+            android:targetPackage="com.example.kilo"
+            android:targetClass="com.example.kilo.MainActivity" />
+    </capability>
+
+    <!-- Standard playback requests also arrive through Android's MEDIA_PLAY_FROM_SEARCH
+         media action and the active Media3 session. -->
 </shortcuts>

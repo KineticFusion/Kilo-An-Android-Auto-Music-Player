@@ -39,7 +39,8 @@ data class TrackFeatureProfile(
     val skipRate: Float,
     val metadataConfidence: Float,
     val isCollection: Boolean,
-    val updatedAtMs: Long = System.currentTimeMillis()
+    val updatedAtMs: Long = System.currentTimeMillis(),
+    val aliases: Set<String> = emptySet()
 )
 
 data class MoodFeatureProfile(
@@ -118,7 +119,8 @@ object MetadataAnalyzer {
         "dance" to listOf("dance", "house", "techno", "disco"),
         "r&b" to listOf("r&b", "rnb", "soul", "neo soul"),
         "soundtrack" to listOf("soundtrack", "score", "film theme"),
-        "country" to listOf("country", "bluegrass")
+        "country" to listOf("country", "bluegrass"),
+        "devotional" to listOf("devotional", "bhajan", "mantra", "qawwali", "nasheed", "worship", "shabad", "chant")
     )
 
     fun analyze(input: TrackFeatureInput): MetadataSignals {
@@ -276,7 +278,8 @@ object FeatureFusionEngine {
             skipRate = behavior.skip,
             metadataConfidence = metadata.confidence,
             isCollection = metadata.isCollection,
-            updatedAtMs = nowMs
+            updatedAtMs = nowMs,
+            aliases = input.aliases + input.id
         )
     }
 }
@@ -292,7 +295,8 @@ object SongFeatureExtractionPipeline {
 
 /** Bounded local feature cache. It is independent of playback and the music catalog. */
 object TrackFeatureDatabase {
-    private const val PREFS = "kilo_track_feature_profiles_v3"
+    // v4 discards old query-inferred genre tags that were cached as if they were real catalog metadata.
+    private const val PREFS = "kilo_track_feature_profiles_v4"
     private const val INDEX = "track_ids"
     private const val CAPACITY = 500
     private val memory = object : LruCache<String, TrackFeatureProfile>(CAPACITY) {}
@@ -331,6 +335,7 @@ object TrackFeatureDatabase {
         .put("artist", p.artistKey).put("genres", p.genres.toJson()).put("languages", p.languages.toJson())
         .put("attributes", p.attributes.toJson()).put("completion", p.completionRate).put("replay", p.replayRate)
         .put("skip", p.skipRate).put("confidence", p.metadataConfidence).put("collection", p.isCollection)
+        .put("aliases", org.json.JSONArray(p.aliases.toList()))
         .put("updated", p.updatedAtMs).toString()
 
     private fun decode(id: String, raw: String): TrackFeatureProfile? = runCatching {
@@ -338,7 +343,8 @@ object TrackFeatureDatabase {
         TrackFeatureProfile(id, j.optString("artist"), j.optJSONObject("genres").floatMap(),
             j.optJSONObject("languages").floatMap(), j.optJSONObject("attributes").floatMap(),
             j.optDouble("completion").toFloat(), j.optDouble("replay").toFloat(), j.optDouble("skip").toFloat(),
-            j.optDouble("confidence").toFloat(), j.optBoolean("collection"), j.optLong("updated"))
+            j.optDouble("confidence").toFloat(), j.optBoolean("collection"), j.optLong("updated"),
+            j.optJSONArray("aliases")?.let { array -> (0 until array.length()).map { array.optString(it) }.filter(String::isNotBlank).toSet() }.orEmpty())
     }.getOrNull()
 
     private fun Map<String, Float>.toJson() = JSONObject().also { json -> forEach { (key, value) -> json.put(key, value) } }
@@ -399,14 +405,23 @@ object MoodRecommendationEngine {
         mood("Rain Drive", mapOf("energy" to 42f, "tempo" to 42f, "atmosphere" to 86f, "darkness" to 64f, "driving" to 75f),
             "alternative" to .75f, "indie" to .70f, "ambient" to .65f, "electronic" to .55f, related = setOf("Night Drive", "Relax")),
         mood("Coffee Vibes", mapOf("energy" to 40f, "tempo" to 46f, "focus" to 66f, "atmosphere" to 72f),
-            "jazz" to .75f, "lofi" to .70f, "acoustic" to .55f, "indie" to .50f, related = setOf("Focus", "Relax"))
+            "jazz" to .75f, "lofi" to .70f, "acoustic" to .55f, "indie" to .50f, related = setOf("Focus", "Relax")),
+        mood("Devotional", mapOf("energy" to 35f, "tempo" to 30f, "instrumentalness" to 55f, "atmosphere" to 76f),
+            "devotional" to .95f, "classical" to .48f, "ambient" to .40f, related = setOf("Spiritual Morning", "Relax")),
+        mood("Spiritual Morning", mapOf("energy" to 40f, "tempo" to 35f, "instrumentalness" to 55f, "atmosphere" to 80f),
+            "devotional" to .90f, "ambient" to .62f, "classical" to .50f, "acoustic" to .42f, related = setOf("Devotional", "Focus")),
+        mood("Cinematic", mapOf("energy" to 50f, "tempo" to 48f, "atmosphere" to 84f, "instrumentalness" to 70f),
+            "soundtrack" to .95f, "classical" to .60f, "electronic" to .45f, related = setOf("Gaming", "Focus"))
     ).associateBy { it.name.lowercase(Locale.ROOT) }
 
     fun profile(name: String, fallbackGenres: Set<String> = emptySet()): MoodFeatureProfile {
         val canonical = canonical(name)
-        return profiles[canonical.lowercase(Locale.ROOT)] ?: MoodFeatureProfile(
-            canonical, mapOf("energy" to 50f, "tempo" to 50f),
-            fallbackGenres.associate { it.lowercase(Locale.ROOT) to .65f }
+        profiles[canonical.lowercase(Locale.ROOT)]?.let { return it }
+        val tasteLed = canonical.equals("Discover", true) || canonical.equals("Similar To Me", true)
+        return MoodFeatureProfile(
+            canonical,
+            if (tasteLed) mapOf("energy" to 50f, "tempo" to 50f) else emptyMap(),
+            if (tasteLed) fallbackGenres.associate { canonicalGenre(it) to .65f } else emptyMap()
         )
     }
 
@@ -448,6 +463,29 @@ object MoodRecommendationEngine {
             .ifEmpty { listOf(MoodCandidateSeed("popular songs")) }
     }
 
+    /** Focused retrieval plan for an explicitly selected genre category. */
+    fun genreCandidateSeeds(
+        genre: String,
+        preferredArtists: Collection<String> = emptyList(),
+        preferredLanguages: Collection<String> = emptyList(),
+        limit: Int = 4
+    ): List<MoodCandidateSeed> {
+        val cleanGenre = genre.trim().take(64)
+        if (cleanGenre.isBlank()) return emptyList()
+        val language = preferredLanguages.firstOrNull { it.isNotBlank() }.orEmpty()
+        val artists = preferredArtists.asSequence().map(String::trim).filter(String::isNotBlank)
+            .distinctBy { it.lowercase(Locale.ROOT) }.take(2).toList()
+        val seeds = buildList {
+            if (language.isNotBlank()) add(MoodCandidateSeed("$language $cleanGenre songs", setOf(cleanGenre), language = language))
+            add(MoodCandidateSeed("$cleanGenre songs", setOf(cleanGenre)))
+            add(MoodCandidateSeed("best $cleanGenre songs", setOf(cleanGenre)))
+            artists.forEach { artist ->
+                add(MoodCandidateSeed("$artist $cleanGenre songs", setOf(cleanGenre), setOf(artist), language))
+            }
+        }
+        return seeds.distinctBy { it.query.lowercase(Locale.ROOT) }.take(limit.coerceIn(1, 8))
+    }
+
     /** Compatibility helper for callers that only need the retrieval queries. */
     fun candidateQueries(
         mood: String,
@@ -461,9 +499,15 @@ object MoodRecommendationEngine {
         candidates: List<TrackFeatureProfile>, mood: String, user: CompanionProfile,
         events: List<ListeningEvent>, limit: Int = candidates.size,
         context: MoodSessionContext = MoodSessionContext(), nowMs: Long = System.currentTimeMillis(),
-        retrievalGenresByTrack: Map<String, Set<String>> = emptyMap()
+        retrievalGenresByTrack: Map<String, Set<String>> = emptyMap(),
+        targetGenre: String? = null,
+        playedTrackIds: Set<String> = emptySet()
     ): List<String> {
-        val target = MoodContextAnalyzer.adjust(profile(mood, user.favoriteGenres.toSet()), context)
+        val target = if (targetGenre.isNullOrBlank()) {
+            MoodContextAnalyzer.adjust(profile(mood, user.favoriteGenres.toSet()), context)
+        } else {
+            MoodFeatureProfile(targetGenre.trim(), emptyMap(), mapOf(canonicalGenre(targetGenre) to 1f))
+        }
         val eventHistory = events.groupBy { it.trackId }
         val artistTaste = mutableMapOf<String, Float>()
         events.asSequence().filter { it.artist.isNotBlank() }.forEach { event ->
@@ -478,12 +522,15 @@ object MoodRecommendationEngine {
             artistTaste[key] = (artistTaste[key] ?: 0f) + weight
         }
         val ranked = candidates.asSequence()
-            .filterNot { it.isCollection || it.trackId in user.excludedTrackIds }
+            .filterNot { it.isCollection || (it.aliases + it.trackId).any { id -> id in user.excludedTrackIds } }
             .mapNotNull { track ->
+                val aliases = track.aliases + track.trackId
                 val attrFit = featureFit(track.attributes, target.attributes)
-                val retrievalGenres = retrievalGenresByTrack[track.trackId].orEmpty()
+                val retrievalGenres = aliases.flatMap { retrievalGenresByTrack[it].orEmpty() }
+                    .mapTo(linkedSetOf(), ::canonicalGenre)
                     .associateWith { 0.58f }
-                val candidateGenres = track.genres + retrievalGenres.filterKeys { it !in track.genres }
+                val metadataGenres = track.genres.entries.associate { canonicalGenre(it.key) to it.value }
+                val candidateGenres = retrievalGenres + metadataGenres
                 val genreFit = weightedGenreFit(candidateGenres, target.genres)
                 val similarity = when {
                     candidateGenres.isEmpty() && attrFit == null -> 0f
@@ -494,38 +541,72 @@ object MoodRecommendationEngine {
                 val languageFit = if (user.favoriteLanguages.isEmpty()) 0f else track.languages.entries
                     .filter { (lang, _) -> user.favoriteLanguages.any { it.equals(lang, true) } }
                     .maxOfOrNull { it.value } ?: 0f
-                val liked = track.trackId in user.likedTrackIds
-                val downloaded = track.trackId in user.downloadedTrackIds
+                val liked = aliases.any { it in user.likedTrackIds }
+                val downloaded = aliases.any { it in user.downloadedTrackIds }
                 val followed = user.followedArtists.any { matchesArtist(track.artistKey, it.normalize()) }
                 val artistAffinity = artistTaste.entries.filter { matchesArtist(track.artistKey, it.key) }
                     .maxOfOrNull { it.value } ?: 0f
-                val history = eventHistory[track.trackId].orEmpty()
-                val hasPersonalSignal = liked || followed || artistAffinity > 0f || history.any {
-                    it.action in setOf("complete", "replay", "listen", "like")
+                val history = aliases.flatMap { eventHistory[it].orEmpty() }.distinctBy { Triple(it.trackId, it.atMs, it.action) }
+                val moodRelevant = if (!targetGenre.isNullOrBlank()) {
+                    genreFit >= .30f
+                } else {
+                    similarity >= .38f || genreFit >= .38f
                 }
-                val moodRelevant = similarity >= .25f || genreFit >= .26f ||
-                    (hasPersonalSignal && (similarity >= .10f || genreFit >= .12f))
                 if (!moodRelevant) return@mapNotNull null
                 val recentSkip = history.any { it.action == "skip" && nowMs - it.atMs < 45L * DAY_MS }
                 val discovery = track.attributes["discovery"] ?: 50f
-                var score = similarity * 48f + genreFit * 22f + languageFit * 7f
-                if (liked) score += 16f
-                if (downloaded) score += 4f
-                if (followed) score += 14f
-                score += artistAffinity.coerceIn(-18f, 20f)
-                score += track.completionRate * 7f + track.replayRate * 4f
+                val isPlayed = aliases.any { it in playedTrackIds } || history.any {
+                    it.action in setOf("listen", "complete", "replay")
+                }
+                val lastPlayAt = history.asSequence()
+                    .filter { it.action in setOf("listen", "complete", "replay") }
+                    .maxOfOrNull { it.atMs }
+                val daysSincePlay = lastPlayAt?.let { (nowMs - it).coerceAtLeast(0L) / DAY_MS }
+                var score = similarity * 54f + genreFit * 28f + languageFit * 5f
+                if (liked) score += 7f
+                if (downloaded) score += 2f
+                if (followed) score += 7f
+                score += artistAffinity.coerceIn(-8f, 8f)
+                // Taste should personalize tracks only after they satisfy the selected category.
+                score += track.completionRate * 2f + track.replayRate * 1.5f
                 score += if ((target.attributes["discovery"] ?: 0f) >= 70f) discovery * .08f else (100f - discovery) * .035f
                 score -= track.skipRate * 16f
                 if (recentSkip) score -= 24f
-                Ranked(track, score, similarity, genreFit)
+                if (!isPlayed) score += 18f else score -= 10f
+                if (daysSincePlay != null) score -= when {
+                    daysSincePlay < 14L -> 22f
+                    daysSincePlay < 45L -> 12f
+                    daysSincePlay < 120L -> 5f
+                    else -> 0f
+                }
+                Ranked(track, score, similarity, genreFit, isPlayed)
             }.sortedByDescending { it.score }.toList()
         return selectDiverse(ranked, limit.coerceIn(0, 500)).map { it.track.trackId }
     }
 
-    private data class Ranked(val track: TrackFeatureProfile, val score: Float, val similarity: Float, val genreFit: Float)
+    private data class Ranked(
+        val track: TrackFeatureProfile,
+        val score: Float,
+        val similarity: Float,
+        val genreFit: Float,
+        val isPlayed: Boolean
+    )
+
+    /** Prefer matching tracks the listener has not heard; use played matches only when needed. */
+    private fun selectDiverse(ranked: List<Ranked>, limit: Int): List<Ranked> {
+        if (limit == 0) return emptyList()
+        val unseen = selectDiversePool(ranked.filterNot { it.isPlayed }, limit)
+        if (unseen.size >= limit) return unseen
+        val selectedIds = unseen.mapTo(mutableSetOf()) { it.track.trackId }
+        val repeats = selectDiversePool(
+            ranked.filter { it.isPlayed && it.track.trackId !in selectedIds },
+            limit - unseen.size
+        )
+        return unseen + repeats
+    }
 
     /** Keeps approximate 70/20/10 relevance variety and caps repeated artists/genres when alternatives exist. */
-    private fun selectDiverse(ranked: List<Ranked>, limit: Int): List<Ranked> {
+    private fun selectDiversePool(ranked: List<Ranked>, limit: Int): List<Ranked> {
         if (limit == 0) return emptyList()
         val core = ranked.filter { it.similarity >= .60f || it.genreFit >= .72f }.toMutableList()
         val related = ranked.filter { it !in core && (it.similarity >= .35f || it.genreFit >= .30f) }.toMutableList()
@@ -582,17 +663,48 @@ object MoodRecommendationEngine {
     }
 
     private fun canonical(name: String) = when (name.trim().lowercase(Locale.ROOT)) {
-        "study", "deep work", "coding", "reading" -> "Study"
-        "chill", "calm", "rainy day" -> "Relax"
-        "hype mode", "gym", "running", "beast mode" -> "Workout"
+        "study", "deep work", "coding", "reading", "productivity" -> "Study"
+        "creative mode" -> "Focus"
+        "chill", "calm", "nature", "beach day", "healing", "meditation", "dreamscape", "late night chill" -> "Relax"
+        "instrumental" -> "Focus"
+        "rainy day", "rain drive" -> "Rain Drive"
+        "hype mode", "gym", "running", "beast mode", "high energy", "adrenaline rush", "cycling", "gym session" -> "Workout"
         "night drive", "midnight cruise", "sunrise drive", "summer drive", "mountain drive", "coastal drive", "city cruise" -> "Night Drive"
         "road trip" -> "Road Trip"
+        "commute" -> "Commute"
+        "coffee shop", "coffee shop escape" -> "Coffee Vibes"
+        "spiritual morning", "morning prayer", "mantras & chants" -> "Spiritual Morning"
+        "devotional", "bhajans" -> "Devotional"
+        "heartbreak" -> "Sad"
+        "reflective" -> "Sad"
+        "morning energy", "feel good", "hopeful", "celebration" -> "Happy"
+        "dance", "festival" -> "Party"
+        "weekend vibes" -> "Road Trip"
+        "movie scores", "anime music", "sci-fi vibes" -> "Cinematic"
+        "retro", "vinyl vibes" -> "Nostalgic"
+        "hidden gems", "rising artists", "trending", "radio surfing", "world music" -> "Discover"
         else -> name.trim().ifBlank { "Discover" }
     }
 
     private fun matchesArtist(a: String, b: String) = a.isNotBlank() && b.isNotBlank() &&
         (a == b || (minOf(a.length, b.length) >= 3 && (a.contains(b) || b.contains(a))))
     private fun String.normalize() = lowercase(Locale.ROOT).replace(Regex("[^\\p{L}\\p{N}]+"), " ").trim()
+
+    private fun canonicalGenre(value: String): String {
+        val key = value.normalize()
+        return when (key) {
+            "hip hop", "rap", "trap", "drill", "phonk", "boom bap" -> "hip-hop"
+            "edm", "electronica", "electro" -> "electronic"
+            "alt rock", "alternative rock", "alt pop" -> "alternative"
+            "lo fi", "jazzhop", "chillhop" -> "lofi"
+            "r b", "rnb", "neo soul" -> "r&b"
+            "house", "tech house", "deep house", "techno", "trance", "disco" -> "dance"
+            "piano", "orchestral", "movie scores", "film score" -> "classical"
+            "retrowave", "synth wave" -> "synthwave"
+            else -> key
+        }
+    }
+
     private const val DAY_MS = 24L * 60L * 60L * 1000L
 }
 

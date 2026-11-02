@@ -29,6 +29,7 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
+import com.example.kilo.lyrics.LyricsManager
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URLEncoder
@@ -37,7 +38,12 @@ import kotlin.math.abs
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 
-data class LyricLine(val timeMs: Long, val text: String)
+data class LyricLine(
+    val timeMs: Long,
+    val text: String,
+    val endTimeMs: Long = -1L,
+    val words: List<com.example.kilo.lyrics.models.WordTimestamp> = emptyList()
+)
 
 /** Tries multiple lyric providers in order. Network work always runs off the caller's main thread. */
 object LyricsRepository {
@@ -54,7 +60,11 @@ object LyricsRepository {
         Provider("lyrics_ovh", "Lyrics.ovh"),
         Provider("spotify_lyrics_api", "Spotify Lyrics API (self-hosted)")
     )
-    private val cache = java.util.concurrent.ConcurrentHashMap<String, List<LyricLine>>()
+    private val cache = java.util.Collections.synchronizedMap(
+        object : java.util.LinkedHashMap<String, List<LyricLine>>(100, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<LyricLine>>?): Boolean = size > 100
+        }
+    )
     @Volatile private var appContext: Context? = null
 
     fun providerOrder(context: Context): List<String> {
@@ -333,20 +343,55 @@ object LyricsRepository {
             val output = mutableListOf<LyricLine>()
             var inParagraph = false
             var startMs = -1L
+            var endMs = -1L
             var text = StringBuilder()
+            var activeSpanStart = -1L
+            var activeSpanEnd = -1L
+            var activeSpanText = StringBuilder()
+            val words = mutableListOf<com.example.kilo.lyrics.models.WordTimestamp>()
             var event = parser.eventType
             while (event != XmlPullParser.END_DOCUMENT) {
                 when (event) {
                     XmlPullParser.START_TAG -> if (parser.name.equals("p", true)) {
                         inParagraph = true
                         startMs = parseTtmlTime(parser.getAttributeValue(null, "begin").orEmpty())
+                        endMs = parseTtmlTime(parser.getAttributeValue(null, "end").orEmpty())
                         text = StringBuilder()
+                        words.clear()
+                    } else if (inParagraph && parser.name.equals("span", true)) {
+                        activeSpanStart = parseTtmlTime(parser.getAttributeValue(null, "begin").orEmpty())
+                        activeSpanEnd = parseTtmlTime(parser.getAttributeValue(null, "end").orEmpty())
+                        activeSpanText = StringBuilder()
                     }
-                    XmlPullParser.TEXT, XmlPullParser.CDSECT -> if (inParagraph) text.append(parser.text)
-                    XmlPullParser.END_TAG -> if (parser.name.equals("p", true)) {
-                        val line = text.toString().replace(Regex("\\s+"), " ").trim()
-                        if (line.isNotBlank()) output += LyricLine(startMs, line)
-                        inParagraph = false
+                    XmlPullParser.TEXT, XmlPullParser.CDSECT -> if (inParagraph) {
+                        text.append(parser.text)
+                        if (activeSpanStart >= 0L) activeSpanText.append(parser.text)
+                    }
+                    XmlPullParser.END_TAG -> when {
+                        inParagraph && parser.name.equals("span", true) -> {
+                            val tokens = activeSpanText.toString().replace(Regex("\\s+"), " ").trim()
+                                .split(' ').filter(String::isNotBlank)
+                            if (tokens.isNotEmpty() && activeSpanStart >= 0L && activeSpanEnd > activeSpanStart) {
+                                val weights = tokens.map { it.length.coerceAtLeast(1).toDouble() }
+                                val total = weights.sum().coerceAtLeast(1.0)
+                                var wordCursor = activeSpanStart
+                                tokens.forEachIndexed { index, token ->
+                                    val wordEnd = if (index == tokens.lastIndex) activeSpanEnd else
+                                        (wordCursor + ((activeSpanEnd - activeSpanStart) * weights[index] / total).toLong())
+                                            .coerceAtMost(activeSpanEnd)
+                                    words += com.example.kilo.lyrics.models.WordTimestamp(token, wordCursor, wordEnd)
+                                    wordCursor = wordEnd
+                                }
+                            }
+                            activeSpanStart = -1L
+                            activeSpanEnd = -1L
+                            activeSpanText = StringBuilder()
+                        }
+                        inParagraph && parser.name.equals("p", true) -> {
+                            val line = text.toString().replace(Regex("\\s+"), " ").trim()
+                            if (line.isNotBlank()) output += LyricLine(startMs, line, endMs, words.toList())
+                            inParagraph = false
+                        }
                     }
                 }
                 event = parser.next()
@@ -510,21 +555,7 @@ object LyricsRepository {
 
 @Composable
 fun SyncedLyricsOverlay(song: SongItemClean, positionMs: Long, onSeek: (Long) -> Unit, accent: Color) {
-    var lines by remember(song.id) { mutableStateOf<List<LyricLine>?>(null) }
-    LaunchedEffect(song.id) { lines = LyricsRepository.find(song) }
-    val timed = lines.orEmpty().any { it.timeMs >= 0L }
-    val current = if (timed) lines.orEmpty().indexOfLast { it.timeMs >= 0L && it.timeMs <= positionMs } else -1
-    val listState = rememberLazyListState()
-    LaunchedEffect(current) { if (current >= 0) listState.animateScrollToItem(current) }
-    when {
-        lines == null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(color = accent) }
-        lines!!.isEmpty() -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No synced lyrics found", color = Color.White.copy(alpha = .7f), textAlign = TextAlign.Center) }
-        else -> LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(vertical = 36.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            itemsIndexed(lines!!) { index, line ->
-                Text(line.text, Modifier.fillMaxWidth().then(if (line.timeMs >= 0L) Modifier.clickable { onSeek(line.timeMs) } else Modifier).padding(horizontal = 18.dp), color = if (index == current) accent else Color.White.copy(alpha = .58f), fontSize = if (index == current) 22.sp else 17.sp, fontWeight = if (index == current) FontWeight.Bold else FontWeight.Medium, textAlign = TextAlign.Center)
-            }
-        }
-    }
+    com.example.kilo.lyrics.ui.FullscreenLyrics(song, positionMs, accent, onSeek)
 }
 
 @Composable
@@ -534,8 +565,12 @@ fun CurrentSyncedLyricLine(
     accent: Color,
     onOpenLyrics: () -> Unit
 ) {
-    var lines by remember(song.id) { mutableStateOf(LyricsRepository.cached(song)) }
-    LaunchedEffect(song.id) { lines = LyricsRepository.find(song) }
+    var lines by remember(song.id) {
+        mutableStateOf(LyricsManager.cached(song)?.lines?.map { LyricLine(it.startMs, it.content) }.orEmpty())
+    }
+    LaunchedEffect(song.id) {
+        lines = LyricsManager.find(song)?.lines?.map { LyricLine(it.startMs, it.content) }.orEmpty()
+    }
     val currentLine = lines.asSequence()
         .filter { it.timeMs >= 0L && it.timeMs <= positionMs && it.text.isNotBlank() }
         .maxByOrNull { it.timeMs }

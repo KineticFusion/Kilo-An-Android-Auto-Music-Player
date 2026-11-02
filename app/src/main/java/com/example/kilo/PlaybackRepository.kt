@@ -2,6 +2,7 @@ package com.example.kilo
 
 import androidx.media3.common.MediaItem
 import com.example.kilo.streaming.StreamInfo
+import com.example.kilo.playback.v5.StreamLeaseManager
 import java.util.LinkedHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -67,9 +68,11 @@ object PlaybackRepository {
     }
 
     fun song(mediaId: String): SongItemClean? = synchronized(tracks) {
-        val entry = tracks[mediaId] ?: return@synchronized null
+        val entry = tracks[mediaId] ?: tracks.values.lastOrNull {
+            it.song.id == mediaId || it.song.videoId == mediaId
+        } ?: return@synchronized null
         if (System.currentTimeMillis() - entry.savedAtMs > TRACK_TTL_MS) {
-            tracks.remove(mediaId)
+            tracks.remove(trackKey(entry.song))
             null
         } else entry.song
     }
@@ -93,8 +96,10 @@ object PlaybackRepository {
 
     fun rememberResolvedStream(mediaId: String, info: StreamInfo) {
         if (mediaId.isBlank() || !isValid(info)) return
+        StreamLeaseManager.remember(mediaId, info)
         synchronized(streams) {
             streams[mediaId] = StreamEntry(info, System.currentTimeMillis())
+            StreamLeaseManager.trimTo(MAX_STREAMS)
         }
     }
 
@@ -103,12 +108,13 @@ object PlaybackRepository {
             streamMisses.incrementAndGet()
             return@synchronized null
         }
+        val lease = StreamLeaseManager.current(mediaId)
         val expiredByAge = System.currentTimeMillis() - entry.savedAtMs > STREAM_TTL_MS
-        if (expiredByAge || !isValid(entry.info)) {
+        if (expiredByAge || lease == null || !isValid(entry.info)) {
             streams.remove(mediaId)
             streamMisses.incrementAndGet()
             null
-        } else entry.info.also { streamHits.incrementAndGet() }
+        } else lease.also { streamHits.incrementAndGet() }
     }
 
     fun streamCacheMetrics(): Map<String, Long> = mapOf(
@@ -124,6 +130,7 @@ object PlaybackRepository {
     )
 
     fun invalidateResolvedStream(mediaId: String) {
+        StreamLeaseManager.invalidate(mediaId)
         synchronized(streams) { streams.remove(mediaId) }
     }
 
