@@ -5,6 +5,7 @@ import android.os.Handler
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import com.example.kilo.playback.resume.PlaybackCheckpointEngine
+import com.example.kilo.playback.stability.PlaybackCommandLedger
 
 /** Command and persistence wrapper around the existing ExoPlayer owned by PlayerHolder. */
 class BackgroundPlaybackCoordinator(
@@ -31,12 +32,15 @@ class BackgroundPlaybackCoordinator(
         BackgroundPlaybackMetrics.event("ownership_detached", "player=${System.identityHashCode(player)}")
     }
 
-    fun play() = command("play") { player.play() }
-    fun pause() = command("pause") { player.pause() }
+    fun play() = command("play", intent = PlaybackCommandLedger.Intent.PLAY) { player.play() }
+    fun pause() = command("pause", intent = PlaybackCommandLedger.Intent.PAUSE) { player.pause() }
     fun toggle() = if (player.playWhenReady) pause() else play()
     fun prepare() = command("prepare") { player.prepare() }
-    fun stop() = command("stop") { player.stop() }
-    fun setPlayWhenReady(value: Boolean) = command("play_when_ready", "value=$value") { player.playWhenReady = value }
+    fun stop() = command("stop", intent = PlaybackCommandLedger.Intent.STOP) { player.stop() }
+    fun setPlayWhenReady(value: Boolean) = command(
+        "play_when_ready", "value=$value",
+        intent = if (value) PlaybackCommandLedger.Intent.PLAY else PlaybackCommandLedger.Intent.PAUSE
+    ) { player.playWhenReady = value }
 
     fun seekTo(positionMs: Long) = command("seek", "positionMs=$positionMs") {
         player.seekTo(positionMs.coerceAtLeast(0L))
@@ -53,32 +57,32 @@ class BackgroundPlaybackCoordinator(
 
     fun seekBy(deltaMs: Long) = seekTo((player.currentPosition + deltaMs).coerceAtLeast(0L))
 
-    fun next(playAfter: Boolean = false) = command("next", "playAfter=$playAfter") {
+    fun next(playAfter: Boolean = false) = command("next", "playAfter=$playAfter", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
         if (player.mediaItemCount > 0) player.seekToNextMediaItem()
         if (playAfter) player.play()
     }
 
-    fun previous(playAfter: Boolean = false) = command("previous", "playAfter=$playAfter") {
+    fun previous(playAfter: Boolean = false) = command("previous", "playAfter=$playAfter", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
         if (player.mediaItemCount > 0) player.seekToPreviousMediaItem()
         if (playAfter) player.play()
     }
 
-    fun seekNextWindow(playAfter: Boolean = false) = command("next_window") {
+    fun seekNextWindow(playAfter: Boolean = false) = command("next_window", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
         player.seekToNextWindow()
         if (playAfter) player.play()
     }
 
-    fun seekPreviousWindow(playAfter: Boolean = false) = command("previous_window") {
+    fun seekPreviousWindow(playAfter: Boolean = false) = command("previous_window", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
         player.seekToPreviousWindow()
         if (playAfter) player.play()
     }
 
-    fun seekNext(playAfter: Boolean = false) = command("next") {
+    fun seekNext(playAfter: Boolean = false) = command("next", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
         player.seekToNext()
         if (playAfter) player.play()
     }
 
-    fun seekPrevious(playAfter: Boolean = false) = command("previous") {
+    fun seekPrevious(playAfter: Boolean = false) = command("previous", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
         player.seekToPrevious()
         if (playAfter) player.play()
     }
@@ -133,15 +137,23 @@ class BackgroundPlaybackCoordinator(
         reason: Int
     ) = scheduleSave("position_change")
 
-    private inline fun command(name: String, details: String = "", action: () -> Unit) {
+    private inline fun command(
+        name: String,
+        details: String = "",
+        intent: PlaybackCommandLedger.Intent? = null,
+        action: () -> Unit
+    ) {
         BackgroundPlaybackMetrics.event("command", "name=$name $details")
+        PlaybackCommandLedger.recordCommand(player, "media_session", name)
         action()
+        intent?.let { PlaybackCommandLedger.recordIntent(player, it, "media_session", name) }
         scheduleSave(name)
     }
 
     private inline fun mutateQueue(name: String, action: () -> Unit) {
         BackgroundPlaybackMetrics.event("queue_command", "name=$name")
         action()
+        PlaybackCommandLedger.recordQueueMutation(player, "media_session", name)
         scheduleSave(name)
     }
 

@@ -602,7 +602,11 @@ object PlaybackPerformanceLayer {
     fun onPlayerState(context: Context, player: Player, state: Int, isPlaying: Boolean) {
         PreparedPlaybackLayer.observeQueue(player)
         val currentId = player.currentMediaItem?.mediaId ?: return
-        StreamLeaseRefreshCoordinator.observePlayback(currentId, player.playWhenReady)
+        val upcomingIds = if (player.playWhenReady) {
+            (player.currentMediaItemIndex + 1 until minOf(player.mediaItemCount, player.currentMediaItemIndex + 3))
+                .mapNotNull { index -> player.getMediaItemAt(index).mediaId.takeIf(String::isNotBlank) }
+        } else emptyList()
+        StreamLeaseRefreshCoordinator.observePlayback(currentId, player.playWhenReady, upcomingIds)
         PlaybackMetrics.onPlaybackState(currentId, state, isPlaying)
         if (isPlaying) SourceLifecycleManager.transition(currentId, SourceLifecycleState.ACTIVE)
         ContinuityManager.observe(player)

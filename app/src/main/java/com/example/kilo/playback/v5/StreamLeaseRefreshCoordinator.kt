@@ -11,7 +11,6 @@ import java.util.concurrent.TimeUnit
 object StreamLeaseRefreshCoordinator {
     private const val TAG = "KiloStreamLease"
     private const val FAILED_REFRESH_RETRY_MS = 20_000L
-    private const val ACTIVE_STREAM_REFRESH_MS = 32_000L
     private const val FRESH_REPLACEMENT_TTL_MS = 45_000L
 
     private val executor = ScheduledThreadPoolExecutor(2) { task ->
@@ -21,58 +20,44 @@ object StreamLeaseRefreshCoordinator {
     private val inFlight = ConcurrentHashMap.newKeySet<String>()
     private val lastAttemptAt = ConcurrentHashMap<String, Long>()
     private val freshReplacementAt = ConcurrentHashMap<String, Long>()
-    private val activeLock = Any()
-    @Volatile private var activeMediaId: String? = null
-    private var activeRefresh: java.util.concurrent.ScheduledFuture<*>? = null
+    private val prioritizedIds = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var appContext: Context? = null
     private val leaseListener: (StreamLeaseManager.Lease) -> Unit = ::schedule
 
     fun install(context: Context) {
         appContext = context.applicationContext
         StreamLeaseManager.addListener(leaseListener)
-        StreamLeaseManager.all().forEach(::schedule)
     }
 
-    /** Refreshes only the currently playing source when the provider omits URL expiry metadata. */
-    fun observePlayback(mediaId: String, playWhenReady: Boolean) {
+    /** Keeps proactive refresh eligibility to the active item and at most two upcoming items. */
+    fun observePlayback(mediaId: String, playWhenReady: Boolean, upcomingMediaIds: List<String> = emptyList()) {
         val id = mediaId.trim()
-        synchronized(activeLock) {
-            if (!playWhenReady || id.isBlank() || id.startsWith("radio:")) {
-                activeRefresh?.cancel(false)
-                activeRefresh = null
-                activeMediaId = null
-                return
+        val targets = if (playWhenReady && id.isNotBlank() && !id.startsWith("radio:")) {
+            buildSet {
+                add(id)
+                upcomingMediaIds.asSequence().map(String::trim)
+                    .filter { it.isNotBlank() && !it.startsWith("radio:") }
+                    .take(2).forEach(::add)
             }
-            if (activeMediaId != id) {
-                activeRefresh?.cancel(false)
-                activeRefresh = null
-                activeMediaId = id
-            }
-            if (activeRefresh == null) scheduleActiveRefreshLocked(id)
+        } else emptySet()
+        prioritizedIds.clear()
+        prioritizedIds.addAll(targets)
+        scheduled.keys.toList().filterNot(prioritizedIds::contains).forEach { stale ->
+            scheduled.remove(stale)?.cancel(false)
         }
+        targets.forEach { target -> StreamLeaseManager.lease(target)?.let(::schedule) }
+        Log.d(TAG, "refreshPriority active=${if (playWhenReady) id else "none"} upcoming=${targets.size.coerceAtLeast(0) - if (playWhenReady && id.isNotBlank()) 1 else 0}")
     }
 
-    /** True only when a background refresh produced a replacement after the current source began. */
+    /** True only when refresh produced a distinct request tuple. */
     fun hasFreshReplacement(mediaId: String, nowMs: Long = System.currentTimeMillis()): Boolean =
         freshReplacementAt[mediaId]?.let { nowMs >= it && nowMs - it <= FRESH_REPLACEMENT_TTL_MS } == true
 
-    private fun scheduleActiveRefreshLocked(mediaId: String) {
-        activeRefresh = executor.schedule(activeRefreshTask@{
-            synchronized(activeLock) {
-                activeRefresh = null
-                if (activeMediaId != mediaId) return@activeRefreshTask
-                // Keep refreshing only this active item. Background refresh resolves a new
-                // source but leaves the current Media3 item and audio path untouched.
-                scheduleActiveRefreshLocked(mediaId)
-            }
-            Log.i(TAG, "activeSourceRefreshDue id=$mediaId elapsedMs=$ACTIVE_STREAM_REFRESH_MS")
-            refreshNow(mediaId)
-        }, ACTIVE_STREAM_REFRESH_MS, TimeUnit.MILLISECONDS)
-    }
+    fun isRefreshInFlight(mediaId: String): Boolean = inFlight.contains(mediaId.trim())
 
     /** Schedules work only after the lease's safety window begins. */
     fun schedule(lease: StreamLeaseManager.Lease) {
-        if (lease.mediaId.isBlank()) return
+        if (lease.mediaId.isBlank() || !prioritizedIds.contains(lease.mediaId)) return
         val delay = (lease.refreshAfterMs - System.currentTimeMillis()).coerceAtLeast(0L)
         scheduled.remove(lease.mediaId)?.cancel(false)
         scheduled[lease.mediaId] = executor.schedule({
@@ -87,18 +72,25 @@ object StreamLeaseRefreshCoordinator {
      * have to wait until the active buffer is exhausted.
      */
     fun refreshRejectedSource(mediaId: String) {
-        refreshNow(mediaId, allowMissingLease = true)
+        val id = mediaId.trim()
+        if (id.isBlank()) return
+        // A confirmed 403/410 invalidates any previous cooldown: the server has just
+        // rejected the active lease, so its replacement must begin immediately.
+        scheduled.remove(id)?.cancel(false)
+        refreshNow(id, allowMissingLease = true, forceRejected = true)
     }
 
     /** Queues a refresh; the old valid lease remains available until a replacement is stored. */
     fun refreshNow(mediaId: String) = refreshNow(mediaId, allowMissingLease = false)
 
-    private fun refreshNow(mediaId: String, allowMissingLease: Boolean) {
+    private fun refreshNow(mediaId: String, allowMissingLease: Boolean, forceRejected: Boolean = false) {
         val id = mediaId.trim()
-        if (id.isBlank() || (!allowMissingLease && StreamLeaseManager.lease(id) == null) || !inFlight.add(id)) return
+        if (id.isBlank() || !prioritizedIds.contains(id) ||
+            (!allowMissingLease && StreamLeaseManager.lease(id) == null) || !inFlight.add(id)
+        ) return
         val now = System.currentTimeMillis()
         val previousAttempt = lastAttemptAt[id] ?: 0L
-        if (now - previousAttempt < FAILED_REFRESH_RETRY_MS) {
+        if (!forceRejected && now - previousAttempt < FAILED_REFRESH_RETRY_MS) {
             inFlight.remove(id)
             val retryAt = StreamLeaseManager.lease(id)?.refreshAfterMs
                 ?.let { minOf(it, previousAttempt + FAILED_REFRESH_RETRY_MS) }
@@ -109,6 +101,9 @@ object StreamLeaseRefreshCoordinator {
                 refreshNow(id, allowMissingLease)
             }, (retryAt - now).coerceAtLeast(1_000L), TimeUnit.MILLISECONDS)
             return
+        }
+        if (forceRejected && now - previousAttempt < FAILED_REFRESH_RETRY_MS) {
+            Log.i(TAG, "rejectedSourceRefreshBypassedCooldown id=$id elapsedSinceAttemptMs=${now - previousAttempt}")
         }
         val context = appContext
         if (context == null) {
@@ -140,7 +135,7 @@ object StreamLeaseRefreshCoordinator {
     }
 
     private fun scheduleRetry(mediaId: String, allowMissingLease: Boolean = false) {
-        if (!allowMissingLease && StreamLeaseManager.lease(mediaId) == null) return
+        if (!prioritizedIds.contains(mediaId) || (!allowMissingLease && StreamLeaseManager.lease(mediaId) == null)) return
         scheduled.remove(mediaId)?.cancel(false)
         scheduled[mediaId] = executor.schedule({
             scheduled.remove(mediaId)

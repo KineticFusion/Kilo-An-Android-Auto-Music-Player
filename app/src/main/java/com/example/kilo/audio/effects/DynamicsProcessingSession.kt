@@ -46,7 +46,7 @@ class DynamicsProcessingSession(sessionId: Int) {
             val gain = gainsDb.getOrElse(index) { 0f }.coerceIn(-3f, 2.7f)
             effect.setPreEqBandAllChannelsTo(index, DynamicsProcessing.EqBand(true, frequency, gain))
         }
-        effect.setInputGainAllChannelsTo(inputGainDb.coerceIn(0f, 5.5f))
+        effect.setInputGainAllChannelsTo(inputGainDb.coerceIn(-4f, 5.5f))
         effect.enabled = true
     }
 

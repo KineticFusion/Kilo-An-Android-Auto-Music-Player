@@ -96,9 +96,9 @@ object PlaybackRepository {
 
     fun rememberResolvedStream(mediaId: String, info: StreamInfo) {
         if (mediaId.isBlank() || !isValid(info)) return
-        StreamLeaseManager.remember(mediaId, info)
+        val lease = StreamLeaseManager.replace(mediaId, info) ?: return
         synchronized(streams) {
-            streams[mediaId] = StreamEntry(info, System.currentTimeMillis())
+            streams[mediaId] = StreamEntry(lease.info, System.currentTimeMillis())
             StreamLeaseManager.trimTo(MAX_STREAMS)
         }
     }

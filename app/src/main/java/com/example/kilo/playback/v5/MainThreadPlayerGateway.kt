@@ -7,6 +7,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.MediaSource
+import com.example.kilo.playback.stability.PlaybackCommandLedger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -55,28 +56,75 @@ object MainThreadPlayerGateway {
         )
     }
 
-    fun play() = onPlayer { it.play() }
-    fun pause() = onPlayer { it.pause() }
-    fun prepare() = onPlayer { it.prepare() }
-    fun stop() = onPlayer { it.stop() }
-    fun seekTo(positionMs: Long) = onPlayer { it.seekTo(positionMs.coerceAtLeast(0L)) }
-    fun seekTo(index: Int, positionMs: Long) = onPlayer { it.seekTo(index, positionMs.coerceAtLeast(0L)) }
-    fun setMediaItems(items: List<MediaItem>, index: Int, positionMs: Long) =
-        onPlayer { it.setMediaItems(items, index, positionMs.coerceAtLeast(0L)) }
-    fun addMediaItems(items: List<MediaItem>) = onPlayer { it.addMediaItems(items) }
-    fun addMediaItems(index: Int, items: List<MediaItem>) = onPlayer { it.addMediaItems(index, items) }
-    fun addMediaItem(index: Int, item: MediaItem) = onPlayer { it.addMediaItem(index, item) }
-    fun setMediaSource(source: MediaSource) = onPlayer { it.setMediaSource(source) }
+    fun play() = onPlayer {
+        it.play()
+        PlaybackCommandLedger.recordIntent(it, PlaybackCommandLedger.Intent.PLAY, "phone", "play")
+    }
+    fun pause() = onPlayer {
+        it.pause()
+        PlaybackCommandLedger.recordIntent(it, PlaybackCommandLedger.Intent.PAUSE, "phone", "pause")
+    }
+    fun prepare() = onPlayer {
+        PlaybackCommandLedger.recordCommand(it, "phone", "prepare")
+        it.prepare()
+    }
+    fun stop() = onPlayer {
+        it.stop()
+        PlaybackCommandLedger.recordIntent(it, PlaybackCommandLedger.Intent.STOP, "phone", "stop")
+    }
+    fun seekTo(positionMs: Long) = onPlayer {
+        PlaybackCommandLedger.recordCommand(it, "phone", "seek")
+        it.seekTo(positionMs.coerceAtLeast(0L))
+    }
+    fun seekTo(index: Int, positionMs: Long) = onPlayer {
+        PlaybackCommandLedger.recordCommand(it, "phone", "seek_to_item")
+        it.seekTo(index, positionMs.coerceAtLeast(0L))
+    }
+    fun setMediaItems(items: List<MediaItem>, index: Int, positionMs: Long) = onPlayer {
+        it.setMediaItems(items, index, positionMs.coerceAtLeast(0L))
+        PlaybackCommandLedger.recordQueueMutation(it, "phone", "set_media_items")
+    }
+    fun addMediaItems(items: List<MediaItem>) = onPlayer {
+        it.addMediaItems(items)
+        PlaybackCommandLedger.recordQueueMutation(it, "phone", "add_media_items")
+    }
+    fun addMediaItems(index: Int, items: List<MediaItem>) = onPlayer {
+        it.addMediaItems(index, items)
+        PlaybackCommandLedger.recordQueueMutation(it, "phone", "add_media_items")
+    }
+    fun addMediaItem(index: Int, item: MediaItem) = onPlayer {
+        it.addMediaItem(index, item)
+        PlaybackCommandLedger.recordQueueMutation(it, "phone", "add_media_item")
+    }
+    fun setMediaSource(source: MediaSource) = onPlayer {
+        it.setMediaSource(source)
+        PlaybackCommandLedger.recordQueueMutation(it, "phone", "set_media_source")
+    }
     fun setVolume(volume: Float) = onPlayer { it.volume = volume.coerceIn(0f, 1f) }
     fun setRepeatMode(mode: Int) = onPlayer { it.repeatMode = mode }
     fun setPlaybackSpeed(speed: Float) = onPlayer { it.setPlaybackSpeed(speed.coerceIn(0.5f, 2f)) }
     fun setSkipSilenceEnabled(enabled: Boolean) = onPlayer { it.setSkipSilenceEnabled(enabled) }
 
     /** Use from binder/network callbacks; the action is serialized on the player looper. */
-    fun dispatch(action: (ExoPlayer) -> Unit) {
+    fun dispatch(action: (ExoPlayer) -> Unit) = dispatch("phone", "dispatch", false, action)
+
+    /** Serializes an adapter command and records only observable intent/queue changes. */
+    fun dispatch(origin: String, command: String, queueMutation: Boolean = false, action: (ExoPlayer) -> Unit) {
         val active = player ?: return
-        if (Looper.myLooper() == active.applicationLooper) action(active)
-        else playerHandler.post { if (player === active) action(active) }
+        val run = {
+            if (player === active) {
+                val previousPlayWhenReady = active.playWhenReady
+                PlaybackCommandLedger.recordCommand(active, origin, command)
+                action(active)
+                if (queueMutation) PlaybackCommandLedger.recordQueueMutation(active, origin, command)
+                if (previousPlayWhenReady != active.playWhenReady) {
+                    val intent = if (active.playWhenReady) PlaybackCommandLedger.Intent.PLAY else PlaybackCommandLedger.Intent.PAUSE
+                    PlaybackCommandLedger.recordIntent(active, intent, origin, command)
+                }
+            }
+        }
+        if (Looper.myLooper() == active.applicationLooper) run()
+        else playerHandler.post { run() }
     }
 
     fun post(action: () -> Unit) {

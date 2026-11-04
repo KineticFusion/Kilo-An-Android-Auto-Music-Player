@@ -8,6 +8,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -57,6 +59,7 @@ import androidx.compose.ui.platform.LocalContext
 import android.widget.Toast
 import coil.compose.AsyncImage
 import com.example.kilo.PlayerHolder
+import com.example.kilo.playback.v5.MainThreadPlayerGateway
 import com.example.kilo.SongItemClean
 import com.example.kilo.lyrics.LyricsManager
 import com.example.kilo.lyrics.LyricsDownloader
@@ -73,6 +76,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 import java.util.Locale
 
 @Composable
@@ -150,15 +154,21 @@ fun LyricsScreen(
             val displayLines = translatedLines ?: data.lines
             val duration = player.duration.takeIf { it > 0L && it != androidx.media3.common.C.TIME_UNSET } ?: song.durationMs
             val progress = if (duration > 0L) (position.toFloat() / duration).coerceIn(0f, 1f) else 0f
-            Box(modifier.fillMaxSize()) {
+            BoxWithConstraints(modifier.fillMaxSize()) {
+                val wideLayout = maxWidth >= 700.dp
                 AsyncImage(
                     model = song.coverUrl,
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize().blur(24.dp).graphicsLayer(alpha = 0.24f)
                 )
-                Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xCC090A10), Color(0xEE101117), Color(0xFF101117)))))
-                Column(Modifier.fillMaxSize().padding(horizontal = 14.dp, vertical = 8.dp)) {
+                Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(
+                    Color(0xE6090A10), accent.copy(alpha = 0.10f), Color(0xF5101117)
+                ))))
+                Column(
+                    Modifier.widthIn(max = 1040.dp).fillMaxSize().align(Alignment.Center)
+                        .padding(horizontal = if (wideLayout) 38.dp else 14.dp, vertical = 8.dp)
+                ) {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(if (karaokeEnabled) "KARAOKE LYRICS" else "LYRICS", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.4.sp)
@@ -192,14 +202,22 @@ fun LyricsScreen(
                     Spacer(Modifier.height(4.dp))
                     LazyColumn(
                         state = listState, modifier = Modifier.weight(1f).fillMaxWidth(),
-                        contentPadding = PaddingValues(vertical = 28.dp),
-                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                        contentPadding = PaddingValues(vertical = if (wideLayout) 68.dp else 28.dp),
+                        verticalArrangement = Arrangement.spacedBy(if (wideLayout) 18.dp else 12.dp)
                     ) {
                         itemsIndexed(displayLines, key = { index, line -> "${song.id}_${line.startMs}_$index" }) { index, line ->
                             val active = index == currentIndex
+                            val distanceFromCurrent = if (currentIndex >= 0) abs(index - currentIndex) else 3
+                            val lineOpacity = when {
+                                active -> 1f
+                                distanceFromCurrent == 1 -> 0.66f
+                                distanceFromCurrent == 2 -> 0.42f
+                                else -> 0.24f
+                            }
                             val scale by animateFloatAsState(if (active && animatedHighlight && !karaokeEnabled) 1.02f else 1f, tween(150), label = "lyric-line-scale")
                             val lineModifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
                                     .graphicsLayer(scaleX = scale, scaleY = scale)
+                                    .graphicsLayer(alpha = lineOpacity)
                                     .clickable(enabled = line.startMs >= 0L) { onSeek(line.startMs) }
                                     .padding(horizontal = 16.dp, vertical = 8.dp)
                             if (karaokeEnabled && active) {
@@ -209,21 +227,35 @@ fun LyricsScreen(
                             }
                         }
                     }
-                    Slider(
-                        value = seekPreview ?: progress,
-                        onValueChange = { seekPreview = it },
-                        onValueChangeFinished = {
-                            seekPreview?.let { if (duration > 0L) onSeek((it * duration).toLong()) }
-                            seekPreview = null
-                        },
-                        colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = accent, activeTrackColor = accent)
-                    )
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { player.seekToPreviousMediaItem() }) { Icon(Icons.Default.SkipPrevious, contentDescription = "Previous track", tint = Color.White) }
-                        IconButton(onClick = { if (player.isPlaying) player.pause() else player.play() }) {
-                            Icon(if (player.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = if (player.isPlaying) "Pause" else "Play", tint = accent)
+                    Column(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(24.dp))
+                            .background(Color.Black.copy(alpha = 0.38f))
+                            .padding(horizontal = 14.dp, vertical = 6.dp)
+                    ) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text(formatLyricsTime(seekPreview?.let { (it * duration).toLong() } ?: position), color = Color.White.copy(alpha = 0.70f), fontSize = 11.sp)
+                            Text(formatLyricsTime(duration), color = Color.White.copy(alpha = 0.70f), fontSize = 11.sp)
                         }
-                        IconButton(onClick = { player.seekToNextMediaItem() }) { Icon(Icons.Default.SkipNext, contentDescription = "Next track", tint = Color.White) }
+                        Slider(
+                            value = seekPreview ?: progress,
+                            onValueChange = { seekPreview = it },
+                            onValueChangeFinished = {
+                                seekPreview?.let { if (duration > 0L) onSeek((it * duration).toLong()) }
+                                seekPreview = null
+                            },
+                            colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = accent, activeTrackColor = accent)
+                        )
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                            IconButton(onClick = {
+                                MainThreadPlayerGateway.dispatch("phone", "lyrics_previous") { it.seekToPreviousMediaItem() }
+                            }) { Icon(Icons.Default.SkipPrevious, contentDescription = "Previous track", tint = Color.White) }
+                            IconButton(onClick = { if (player.isPlaying) MainThreadPlayerGateway.pause() else MainThreadPlayerGateway.play() }) {
+                                Icon(if (player.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, contentDescription = if (player.isPlaying) "Pause" else "Play", tint = accent)
+                            }
+                            IconButton(onClick = {
+                                MainThreadPlayerGateway.dispatch("phone", "lyrics_next") { it.seekToNextMediaItem() }
+                            }) { Icon(Icons.Default.SkipNext, contentDescription = "Next track", tint = Color.White) }
+                        }
                     }
                 }
             }
@@ -243,4 +275,9 @@ private fun loadArtwork(url: String): android.graphics.Bitmap? = runCatching {
         else -> null
     }
 }.getOrNull()
+
+private fun formatLyricsTime(positionMs: Long): String {
+    val totalSeconds = (positionMs.coerceAtLeast(0L) / 1_000L)
+    return "${totalSeconds / 60}:${(totalSeconds % 60).toString().padStart(2, '0')}"
+}
 

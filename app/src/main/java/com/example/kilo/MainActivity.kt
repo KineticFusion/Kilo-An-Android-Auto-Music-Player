@@ -899,7 +899,7 @@ private fun primaryPanelColor(skin: SkinTheme): Color = when (skin.layoutFamily)
 
 enum class ScreenNav {
     HOME, EXPLORE, LIBRARY, SEARCH, YOU, OFFLINE, RADIO, SETTINGS, APPEARANCE, APP_APPEARANCE,
-    PLAYBACK_SETTINGS, ABOUT_UPDATES, ANDROID_AUTO_SETTINGS, PLAYER_STYLES, EQUALIZER, V2_ROADMAP,
+    HOME_LAYOUT, PLAYBACK_SETTINGS, ABOUT_UPDATES, ANDROID_AUTO_SETTINGS, PLAYER_STYLES, EQUALIZER, V2_ROADMAP,
     BROWSE_CATEGORY, ARTISTS, ARTIST_DETAIL, PLAYLIST_DETAIL, OFFICIAL_PLAYLISTS
 }
 
@@ -977,6 +977,42 @@ val UI_CUSTOMIZATION_OPTIONS = listOf(
     UiCustomizationOption("largeText", "Larger typography", "Increase title and label sizes", "ACCESSIBILITY", false)
 )
 
+data class HomeSectionOption(val id: String, val title: String, val description: String)
+
+val HOME_SECTION_OPTIONS = listOf(
+    HomeSectionOption("continue", "Continue Listening", "Resume recent albums, artists, and mixes"),
+    HomeSectionOption("spotlight", "New Releases", "Feature new music from artists you follow"),
+    HomeSectionOption("quick", "Quick Picks", "Fast, personal song recommendations"),
+    HomeSectionOption("categories", "Music Feed", "Show the category shelves from your feed"),
+    HomeSectionOption("made", "Made For You", "Personal mixes and recommendation shelves"),
+    HomeSectionOption("recent", "Recently Played", "Return to music you heard recently"),
+    HomeSectionOption("discover", "Discover For You", "Find artists and songs beyond your rotation"),
+    HomeSectionOption("trending", "Trending Around You", "Popular picks for your selected region"),
+    HomeSectionOption("library", "Library Shortcuts", "Open playlists, liked songs, and downloads")
+)
+val DEFAULT_HOME_SECTION_ORDER = HOME_SECTION_OPTIONS.map { it.id }
+
+data class HomeLayoutPreset(
+    val id: String,
+    val title: String,
+    val description: String,
+    val sectionOrder: List<String>,
+    val compactRows: Boolean = false
+)
+
+val HOME_LAYOUT_PRESETS = listOf(
+    HomeLayoutPreset("balanced", "Balanced", "A clear mix of familiar music and discovery", DEFAULT_HOME_SECTION_ORDER),
+    HomeLayoutPreset("editorial", "Editorial", "Large release feature, then curated shelves", listOf("spotlight", "continue", "categories", "made", "quick", "recent", "discover", "trending", "library")),
+    HomeLayoutPreset("quick", "Quick Play", "Put songs you can start right away first", listOf("quick", "continue", "recent", "categories", "made", "discover", "trending", "library", "spotlight")),
+    HomeLayoutPreset("discovery", "Discovery", "Lead with fresh finds and regional trends", listOf("discover", "trending", "spotlight", "categories", "quick", "made", "continue", "recent", "library")),
+    HomeLayoutPreset("library", "Library First", "Put recent listening and saved music up front", listOf("continue", "recent", "library", "quick", "categories", "made", "discover", "trending", "spotlight")),
+    HomeLayoutPreset("compact", "Compact", "A denser feed with more music on screen", listOf("quick", "categories", "continue", "recent", "made", "discover", "trending", "library", "spotlight"), compactRows = true),
+    HomeLayoutPreset("custom", "Custom Layout", "Choose which sections appear and arrange their order", DEFAULT_HOME_SECTION_ORDER)
+)
+
+private fun normalizeHomeLayoutId(value: String?): String =
+    value?.takeIf { id -> HOME_LAYOUT_PRESETS.any { it.id == id } } ?: "balanced"
+
 val LocalUiCustomizations = compositionLocalOf<Map<String, Boolean>> { emptyMap() }
 val LocalPrimarySkin = compositionLocalOf { SkinTheme.SUNSET_GLASS }
 
@@ -1029,6 +1065,9 @@ data class AppStateModel(
     val playerOverlayTab: OverlayTab = OverlayTab.NONE,
     val downloadDirectoryUri: String? = null,
     val uiCustomizations: Map<String, Boolean> = UI_CUSTOMIZATION_OPTIONS.associate { it.key to it.enabledByDefault },
+    val homeLayoutId: String = "balanced",
+    val customHomeSectionOrder: List<String> = DEFAULT_HOME_SECTION_ORDER,
+    val hiddenHomeSections: Set<String> = emptySet(),
     val selectedPlayerStyleId: String = PLAYER_STYLE_PRESETS.first().id,
     val savedPlaylists: List<SavedPlaylist> = emptyList(),
     val pendingDriveRecap: DriveRecapPending? = null,
@@ -1104,6 +1143,7 @@ data class AppStateModel(
     val currentPosMs: Long = 0L,
     val currentDurationMs: Long = 215000L,
     val playbackSpeed: Float = 1f,
+    val outputVolume: Float = 1f,
     val skipSilenceEnabled: Boolean = false,
     val repeatCurrentTrack: Boolean = false,
     val djModeEnabled: Boolean = false,
@@ -1840,15 +1880,26 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val savedCustomizations = UI_CUSTOMIZATION_OPTIONS.associate { option ->
             option.key to preferences.getBoolean("ui_${option.key}", option.enabledByDefault)
         }
+        val cachedHomeShelves = HomeCache.initialize(application)
         _state.value = _state.value.copy(
             isSetupComplete = preferences.getBoolean(
                 "setup_complete",
                 preferences.getInt("setup_step", -1) >= 7
             ),
-            setupStep = preferences.getInt("setup_step", 0).coerceIn(0, 2),
+            setupStep = preferences.getInt("setup_step", 0).coerceIn(0, 3),
             downloadDirectoryUri = preferences.getString("download_directory_uri", null),
             downloadedSongs = loadDownloadedSongs(),
             uiCustomizations = savedCustomizations,
+            homeLayoutId = normalizeHomeLayoutId(preferences.getString("home_layout_id", "balanced")),
+            customHomeSectionOrder = run {
+                val saved = preferences.getString("custom_home_section_order", null).orEmpty()
+                    .split(',').filter { it in HOME_SECTION_OPTIONS.map(HomeSectionOption::id) }.distinct()
+                saved + DEFAULT_HOME_SECTION_ORDER.filterNot { it in saved }
+            },
+            hiddenHomeSections = (preferences.getStringSet("hidden_home_sections", emptySet()) ?: emptySet())
+                .intersect(HOME_SECTION_OPTIONS.mapTo(mutableSetOf(), HomeSectionOption::id)),
+            homeShelves = cachedHomeShelves,
+            quickPicks = cachedHomeShelves.firstOrNull()?.songs?.takeIf { it.isNotEmpty() } ?: INITIAL_TRACKS,
             selectedPlayerStyleId = preferences.getString("player_style_id", PLAYER_STYLE_PRESETS.first().id) ?: PLAYER_STYLE_PRESETS.first().id,
             customPlayerAccent = loadCustomPlayerAccent(preferences),
             selectedMood = preferences.getString("discovery_mood", "Discover") ?: "Discover",
@@ -1881,6 +1932,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             autoPlayOnCarConnect = preferences.getBoolean("auto_play_car_connect", false),
             pauseForCalls = preferences.getBoolean("pause_for_calls", true),
             playbackSpeed = preferences.getFloat("playback_speed", 1f).coerceIn(0.5f, 2f),
+            outputVolume = preferences.getFloat("player_output_volume", 1f).coerceIn(0f, 1f),
             skipSilenceEnabled = preferences.getBoolean("skip_silence_enabled", false),
             repeatCurrentTrack = preferences.getBoolean("repeat_current_track", false),
             djModeEnabled = preferences.getBoolean("dj_mode_enabled", false),
@@ -1898,6 +1950,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
         runCatching { MainThreadPlayerGateway.setPlaybackSpeed(_state.value.playbackSpeed) }
             .onFailure { Log.w("VybeVM", "Could not restore playback speed", it) }
+        runCatching { MainThreadPlayerGateway.setVolume(_state.value.outputVolume) }
+            .onFailure { Log.w("VybeVM", "Could not restore player volume", it) }
         runCatching { MainThreadPlayerGateway.setSkipSilenceEnabled(_state.value.skipSilenceEnabled) }
             .onFailure { Log.w("VybeVM", "Could not restore silence skipping", it) }
         PlayerHolder.setDjAnalysisEnabled(_state.value.djModeEnabled)
@@ -2108,7 +2162,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private fun loadHome() {
         viewModelScope.launch {
             val generation = ++homeLoadGeneration
-            _state.value = _state.value.copy(isSearching = true)
+            _state.value = _state.value.copy(isSearching = _state.value.homeShelves.isEmpty())
             val launchNumber = preferences.getInt("home_launch_number", 0) + 1
             preferences.edit().putInt("home_launch_number", launchNumber).apply()
             val profile = _state.value.listenerProfile
@@ -2164,12 +2218,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val hasPersonalizedInterest = baseInterests.isNotEmpty() || selectedDiscovery != null ||
                 profile.favoriteMoods.isNotEmpty() || profile.favoriteGenres.isNotEmpty()
             val loadResult = coroutineScope {
-                val homeTask = async(Dispatchers.IO) { YtRepo.fetchHomeCatalog() }
+                val homeTask = async(Dispatchers.IO) { YtRepo.fetchHomeCatalog(maxPages = 2) }
                 val historyTask = async(Dispatchers.IO) {
                     val history = Triple(PlayedSongHistory.ids(), PlayedSongHistory.discoveredIds(), PlayedSongHistory.discoveredButUnplayed())
                     history to PlayedSongHistory.listeningEvents()
                 }
                 val completeTask = async(Dispatchers.IO) { PlayedSongHistory.isHomeCatalogComplete() }
+                val fetched = homeTask.await()
+                if (generation == homeLoadGeneration && fetched.shelves.isNotEmpty()) {
+                    val firstCatalogShelves = fetched.shelves.asSequence()
+                        .map { shelf -> shelf.copy(songs = shelf.songs.take(10)) }
+                        .filter { it.songs.isNotEmpty() }
+                        .take(12)
+                        .toList()
+                    if (firstCatalogShelves.isNotEmpty()) {
+                        withContext(Dispatchers.IO) { HomeCache.set(firstCatalogShelves) }
+                        val firstPicks = firstCatalogShelves.firstOrNull()?.songs.orEmpty()
+                        _state.value = _state.value.copy(
+                            homeShelves = firstCatalogShelves,
+                            quickPicks = firstPicks,
+                            isSearching = false
+                        )
+                        // At most ten distinct tracks are warmed ahead of a tap.
+                        prepareVisibleTracks(firstCatalogShelves.flatMap { it.songs }.take(10), "home_initial")
+                    }
+                }
                 val similarTask = async(Dispatchers.IO) {
                     if (!hasPersonalizedInterest) emptyList() else {
                         val queryResults = coroutineScope {
@@ -2197,7 +2270,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     } ?: queryResults
                 }
                 Triple(
-                    homeTask.await(),
+                    fetched,
                     historyTask.await() to completeTask.await(),
                     similarTask.await() to freshTask.await()
                 )
@@ -2408,17 +2481,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     PlayedSongHistory.markShown(shelves.flatMap { it.songs }.distinctBy { it.videoId.ifBlank { it.id } }.take(100), "home")
                 }.onFailure { Log.w("KiloHomeFeed", "Could not persist Home impressions", it) }
             }
-            HomeCache.set(displayShelves)
+            withContext(Dispatchers.IO) { HomeCache.set(displayShelves) }
             val all = shelves.flatMap { it.songs }.filter { it.videoId.isNotEmpty() }.distinctBy { it.id }
             val picks = shelves.firstOrNull()?.songs.orEmpty()
+            val canAdoptHomeQueue = player.currentMediaItem == null && !player.isPlaying
             _state.value = _state.value.copy(
                 homeShelves = displayShelves,
                 quickPicks = picks,
-                playlist = all,
-                currentIndex = 0,
+                playlist = if (canAdoptHomeQueue) all else _state.value.playlist,
+                currentIndex = if (canAdoptHomeQueue) 0 else _state.value.currentIndex,
                 isSearching = false
             )
-            prepareVisibleTracks(displayShelves.flatMap { it.songs }, "home")
+            prepareVisibleTracks(displayShelves.flatMap { it.songs }.take(10), "home")
             refreshCompanionFeatures(
                 candidateSongs = all + homeSongs + dormantDiscovered + _state.value.downloadedSongs,
                 events = recentEvents
@@ -2697,7 +2771,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val queuedIndex = snapshot.playlist.indexOfFirst { discoveryKey(it) == id }
             val removeFromActiveQueue = action == "remove" && queuedIndex > activeIndex && queuedIndex < player.mediaItemCount
             if (removeFromActiveQueue) {
-                MainThreadPlayerGateway.dispatch { activePlayer ->
+                MainThreadPlayerGateway.dispatch("phone", "discovery_queue_remove", queueMutation = true) { activePlayer ->
                     if (queuedIndex > activePlayer.currentMediaItemIndex && queuedIndex < activePlayer.mediaItemCount) {
                         activePlayer.removeMediaItem(queuedIndex)
                     }
@@ -2798,9 +2872,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val candidates = songs.asSequence()
             .filter { it.videoId.isNotBlank() && !it.videoId.startsWith("radio:") }
             .distinctBy { it.videoId.ifBlank { it.id } }
-            .take(if (section.startsWith("search")) 40 else 20)
+            .take(10)
             .toList()
-        val visible = candidates.take(if (section.startsWith("search")) 10 else 20)
+        val visible = candidates.take(10)
         if (visible.isEmpty()) return
         val searchQuery = _state.value.searchQuery
         val moodName = _state.value.browseCategoryTitle
@@ -2809,7 +2883,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 PlaybackRepository.rememberAll(visible)
                 when {
                     section.startsWith("search") -> SearchWarmupEngine.prepare(
-                        getApplication(), searchQuery, candidates
+                        getApplication(), searchQuery, candidates.take(10)
                     )
                     section.startsWith("mood") -> MoodWarmupEngine.prepare(
                         getApplication(), moodName, visible
@@ -3112,7 +3186,7 @@ _state.value = _state.value.copy(
                 operation = "queue_seek"
             )
             PlaybackStartupMetrics.mediaItemsBuilt(metricTrackId, 0L, list.size)
-            MainThreadPlayerGateway.setVolume(1f)
+            MainThreadPlayerGateway.setVolume(_state.value.outputVolume)
             if (autoPlay) MainThreadPlayerGateway.play()
             _state.value = _state.value.copy(
                 isLoadingStream = player.playbackState == Player.STATE_BUFFERING,
@@ -3157,7 +3231,7 @@ _state.value = _state.value.copy(
                     metricTrackId,
                     SystemClock.elapsedRealtime() - setItemsStartedAt
                 )
-                MainThreadPlayerGateway.setVolume(1f)
+                MainThreadPlayerGateway.setVolume(_state.value.outputVolume)
                 // Set the play intent before preparation so the first READY state
                 // starts audio immediately, including on a cold resolver path.
                 if (autoPlay) MainThreadPlayerGateway.play()
@@ -3271,7 +3345,7 @@ _state.value = _state.value.copy(
         )
         // A manual seek overrides any in-progress Auto Mix fade or pending skip.
         PlayerHolder.cancelCrossfade("manual_seek")
-        MainThreadPlayerGateway.setVolume(1f)
+        MainThreadPlayerGateway.setVolume(_state.value.outputVolume)
         MainThreadPlayerGateway.seekTo(target)
         if (shouldResume) MainThreadPlayerGateway.play()
         _state.value = _state.value.copy(progress = target.toFloat() / dur.toFloat(), currentPosMs = target)
@@ -4099,12 +4173,26 @@ _state.value = _state.value.copy(
                     val prefixIds = prefix.mapTo(mutableSetOf()) { it.videoId.ifBlank { it.id } }
                     val upcoming = songs.filterNot { it.videoId.ifBlank { it.id } in prefixIds }
                     runCatching {
-                        player.removeMediaItems(currentQueueIndex + 1, player.mediaItemCount)
                         val newItems = upcoming.map { song ->
                             LosslessSource.register(song)
                             song.toMediaItem()
                         }
-                        if (newItems.isNotEmpty()) MainThreadPlayerGateway.addMediaItems(currentQueueIndex + 1, newItems)
+                        MainThreadPlayerGateway.dispatch("phone", "mood_queue_replace_upcoming") { activePlayer ->
+                            var changed = false
+                            if (currentQueueIndex + 1 < activePlayer.mediaItemCount) {
+                                activePlayer.removeMediaItems(currentQueueIndex + 1, activePlayer.mediaItemCount)
+                                changed = true
+                            }
+                            if (newItems.isNotEmpty()) {
+                                activePlayer.addMediaItems(currentQueueIndex + 1, newItems)
+                                changed = true
+                            }
+                            if (changed) {
+                                com.example.kilo.playback.stability.PlaybackCommandLedger.recordQueueMutation(
+                                    activePlayer, "phone", "mood_queue_replace_upcoming"
+                                )
+                            }
+                        }
                     }.onFailure { Log.w("VybeVM", "Could not replace upcoming mood queue; keeping current playback", it) }
                     prefix + upcoming
                 } else songs
@@ -4328,7 +4416,7 @@ _state.value = _state.value.copy(
         PlayerHolder.setCrossfadeAnalysisEnabled(enabled)
         if (!enabled) {
             PlayerHolder.cancelCrossfade("automix_disabled")
-            MainThreadPlayerGateway.setVolume(1f)
+            MainThreadPlayerGateway.setVolume(_state.value.outputVolume)
         }
     }
 
@@ -4440,12 +4528,12 @@ _state.value = _state.value.copy(
     }
 
     fun completeSetupStep(nextStep: Int) {
-        if (nextStep >= 3) {
+        if (nextStep >= 4) {
             finishQuickStart()
             return
         }
         if (nextStep < 0) return
-        val step = nextStep.coerceIn(0, 2)
+        val step = nextStep.coerceIn(0, 3)
         preferences.edit().putInt("setup_step", step).apply()
         _state.value = _state.value.copy(setupStep = step)
     }
@@ -4702,6 +4790,32 @@ _state.value = _state.value.copy(
         if (UI_CUSTOMIZATION_OPTIONS.none { it.key == key }) return
         preferences.edit().putBoolean("ui_$key", enabled).apply()
         _state.value = _state.value.copy(uiCustomizations = _state.value.uiCustomizations + (key to enabled))
+    }
+
+    fun setHomeLayout(id: String) {
+        val preset = HOME_LAYOUT_PRESETS.firstOrNull { it.id == id } ?: return
+        val nextOrder = if (id == "custom") _state.value.customHomeSectionOrder else preset.sectionOrder
+        preferences.edit().putString("home_layout_id", id).apply()
+        _state.value = _state.value.copy(homeLayoutId = id, customHomeSectionOrder = nextOrder)
+    }
+
+    fun moveCustomHomeSection(sectionId: String, offset: Int) {
+        val order = _state.value.customHomeSectionOrder.toMutableList()
+        val index = order.indexOf(sectionId)
+        val target = index + offset
+        if (index < 0 || target !in order.indices) return
+        val moved = order.removeAt(index)
+        order.add(target, moved)
+        val safe = order + DEFAULT_HOME_SECTION_ORDER.filterNot { it in order }
+        preferences.edit().putString("custom_home_section_order", safe.joinToString(",")).apply()
+        _state.value = _state.value.copy(customHomeSectionOrder = safe)
+    }
+
+    fun setCustomHomeSectionVisible(sectionId: String, visible: Boolean) {
+        if (HOME_SECTION_OPTIONS.none { it.id == sectionId }) return
+        val hidden = if (visible) _state.value.hiddenHomeSections - sectionId else _state.value.hiddenHomeSections + sectionId
+        preferences.edit().putStringSet("hidden_home_sections", hidden).apply()
+        _state.value = _state.value.copy(hiddenHomeSections = hidden)
     }
 
     fun setDownloadDirectory(uri: Uri?) {
@@ -5422,6 +5536,19 @@ _state.value = _state.value.copy(
         }
     }
 
+    fun setOutputVolume(volume: Float) {
+        val safeVolume = volume.coerceIn(0f, 1f)
+        runCatching {
+            MainThreadPlayerGateway.setVolume(safeVolume)
+            if (safeVolume > 0f) voiceVolumeBeforeMute = safeVolume
+            _state.value = _state.value.copy(outputVolume = safeVolume)
+        }.onFailure { error -> Log.w("VybeVM", "Could not change player volume", error) }
+    }
+
+    fun persistOutputVolume() {
+        preferences.edit().putFloat("player_output_volume", _state.value.outputVolume).apply()
+    }
+
     fun setSkipSilenceEnabled(enabled: Boolean) {
         runCatching {
             MainThreadPlayerGateway.setSkipSilenceEnabled(enabled)
@@ -5453,12 +5580,14 @@ _state.value = _state.value.copy(
     }
 
     fun setVoiceShuffle(enabled: Boolean) {
-        MainThreadPlayerGateway.dispatch { activePlayer -> activePlayer.shuffleModeEnabled = enabled }
+        MainThreadPlayerGateway.dispatch("phone", "voice_shuffle", queueMutation = true) { activePlayer ->
+            activePlayer.shuffleModeEnabled = enabled
+        }
         Toast.makeText(getApplication(), if (enabled) "Shuffle is on." else "Shuffle is off.", Toast.LENGTH_SHORT).show()
     }
 
     fun setVoiceMuted(muted: Boolean) {
-        MainThreadPlayerGateway.dispatch { activePlayer ->
+        MainThreadPlayerGateway.dispatch("phone", "voice_set_muted") { activePlayer ->
             if (muted) {
                 if (activePlayer.volume > 0f) voiceVolumeBeforeMute = activePlayer.volume
                 activePlayer.volume = 0f
@@ -5473,9 +5602,14 @@ _state.value = _state.value.copy(
         val snapshot = _state.value
         val activeIndex = player.currentMediaItemIndex.takeIf { it >= 0 } ?: snapshot.currentIndex
         if (player.mediaItemCount <= activeIndex + 1) return false
-        MainThreadPlayerGateway.dispatch { activePlayer ->
+        MainThreadPlayerGateway.dispatch("phone", "voice_clear_upcoming") { activePlayer ->
             val from = activePlayer.currentMediaItemIndex + 1
-            if (from in 1 until activePlayer.mediaItemCount) activePlayer.removeMediaItems(from, activePlayer.mediaItemCount)
+            if (from in 1 until activePlayer.mediaItemCount) {
+                activePlayer.removeMediaItems(from, activePlayer.mediaItemCount)
+                com.example.kilo.playback.stability.PlaybackCommandLedger.recordQueueMutation(
+                    activePlayer, "phone", "voice_clear_upcoming"
+                )
+            }
         }
         _state.value = snapshot.copy(
             playlist = snapshot.playlist.take((activeIndex + 1).coerceAtMost(snapshot.playlist.size)),
@@ -5514,7 +5648,9 @@ _state.value = _state.value.copy(
         } ?: return false
         val destination = if (toTop) currentIndex + 1 else snapshot.playlist.lastIndex
         if (from == destination || from !in 0 until player.mediaItemCount || destination !in 0 until player.mediaItemCount) return false
-        MainThreadPlayerGateway.dispatch { activePlayer -> activePlayer.moveMediaItem(from, destination) }
+        MainThreadPlayerGateway.dispatch("phone", "voice_move_queue_item", queueMutation = true) { activePlayer ->
+            activePlayer.moveMediaItem(from, destination)
+        }
         val reordered = snapshot.playlist.toMutableList().apply { add(destination, removeAt(from)) }
         _state.value = snapshot.copy(playlist = reordered)
         return true
@@ -5527,7 +5663,9 @@ _state.value = _state.value.copy(
             position > currentIndex && (snapshot.playlist[position].title.contains(query, true) || snapshot.playlist[position].artist.contains(query, true))
         } ?: return false
         if (index !in 0 until player.mediaItemCount) return false
-        MainThreadPlayerGateway.dispatch { activePlayer -> activePlayer.removeMediaItem(index) }
+        MainThreadPlayerGateway.dispatch("phone", "voice_remove_queue_item", queueMutation = true) { activePlayer ->
+            activePlayer.removeMediaItem(index)
+        }
         _state.value = snapshot.copy(playlist = snapshot.playlist.toMutableList().apply { removeAt(index) })
         return true
     }
@@ -5580,14 +5718,30 @@ _state.value = _state.value.copy(
                 }
             if (player.mediaItemCount > 0 && !mediaIdsMatch) return@launch
             if (mediaIdsMatch) {
-                val moving = snapshot.playlist.toMutableList()
-                for (target in start until updated.size) {
-                    val wantedId = updated[target].videoId.ifBlank { updated[target].id }
-                    val from = moving.indexOfFirst { it.videoId.ifBlank { it.id } == wantedId }
-                    if (from >= 0 && from != target) {
-                        player.moveMediaItem(from, target)
-                        val moved = moving.removeAt(from)
-                        moving.add(target, moved)
+                MainThreadPlayerGateway.dispatch("phone", "dj_queue_reorder") { activePlayer ->
+                    val queueStillMatches = activePlayer.mediaItemCount == snapshot.playlist.size &&
+                        (0 until activePlayer.mediaItemCount).all { index ->
+                            activePlayer.getMediaItemAt(index).mediaId ==
+                                snapshot.playlist[index].videoId.ifBlank { snapshot.playlist[index].id }
+                        }
+                    if (queueStillMatches) {
+                        val moving = snapshot.playlist.toMutableList()
+                        var changed = false
+                        for (target in start until updated.size) {
+                            val wantedId = updated[target].videoId.ifBlank { updated[target].id }
+                            val from = moving.indexOfFirst { it.videoId.ifBlank { it.id } == wantedId }
+                            if (from >= 0 && from != target) {
+                                activePlayer.moveMediaItem(from, target)
+                                changed = true
+                                val moved = moving.removeAt(from)
+                                moving.add(target, moved)
+                            }
+                        }
+                        if (changed) {
+                            com.example.kilo.playback.stability.PlaybackCommandLedger.recordQueueMutation(
+                                activePlayer, "phone", "dj_queue_reorder"
+                            )
+                        }
                     }
                 }
             }
@@ -6911,6 +7065,7 @@ fun VybeMainScaffold(vm: MainViewModel) {
                                 ScreenNav.SETTINGS -> BitChordSettingsScreen(vm)
                                 ScreenNav.APPEARANCE -> AppearanceScreen(vm)
                                 ScreenNav.APP_APPEARANCE -> AppAppearanceScreen(vm)
+                                ScreenNav.HOME_LAYOUT -> HomeLayoutScreen(vm)
                                 ScreenNav.PLAYBACK_SETTINGS -> PlaybackSettingsScreen(vm)
                                 ScreenNav.ABOUT_UPDATES -> AboutUpdatesScreen(vm)
                                 ScreenNav.ANDROID_AUTO_SETTINGS -> AndroidAutoSettingsScreen(vm)
@@ -8718,6 +8873,10 @@ private fun PlayerSignalBars(accent: Color, seed: Int, height: Dp = 34.dp) {
 @Composable
 fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
     val custom = LocalUiCustomizations.current
+    val adaptiveProfile = LocalAdaptiveLayoutProfile.current
+    val configuration = LocalConfiguration.current
+    val compactPhone = adaptiveProfile?.deviceClass?.name == "COMPACT_PHONE" || configuration.screenWidthDp <= 360
+    val expandedWindow = adaptiveProfile?.isExpanded == true
     val song = state.activeSong
     val skin = state.activeSkin
     var showPlaybackTools by remember { mutableStateOf(false) }
@@ -8732,7 +8891,12 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
     val remainingMs = (state.currentDurationMs - state.currentPosMs).coerceAtLeast(0L)
     val familyArtworkSize = when (skin.layoutFamily) { 0 -> 274; 1 -> 232; 2 -> 278; 3 -> 314; else -> 254 }
     val baseArtworkSize = familyArtworkSize + (skin.ordinal % 3 - 1) * 18
-    val artworkSizeDp = (baseArtworkSize + (playerStyle.detailStyle - 2) * 4).coerceIn(216, 326)
+    val artworkWidthLimit = (configuration.screenWidthDp - if (expandedWindow) 96 else 40).coerceAtLeast(180)
+    val artworkHeightLimit = (configuration.screenHeightDp - if (compactPhone) 430 else 390).coerceAtLeast(176)
+    val artworkSizeDp = (baseArtworkSize + (playerStyle.detailStyle - 2) * 4)
+        .coerceIn(216, 326)
+        .coerceAtMost(artworkWidthLimit)
+        .coerceAtMost(artworkHeightLimit)
 
     val bgColors = listOf(
         playerAccent.copy(alpha = (playerStyle.glow + 0.35f) * playerStyle.surfaceOpacity),
@@ -8771,7 +8935,14 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                     .fillMaxSize()
                     .statusBarsPadding()
                     .navigationBarsPadding()
-                    .padding(horizontal = 24.dp, vertical = 14.dp),
+                    .padding(
+                        horizontal = when {
+                            expandedWindow -> 48.dp
+                            compactPhone -> 14.dp
+                            else -> 20.dp
+                        },
+                        vertical = if (compactPhone) 6.dp else 12.dp
+                    ),
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
                 Row(
@@ -8816,7 +8987,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                 }
 
                 Box(
-                    modifier = Modifier.weight(1f).fillMaxWidth().padding(vertical = 10.dp),
+                    modifier = Modifier.weight(1f).fillMaxWidth().padding(vertical = if (compactPhone) 4.dp else 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     when (state.playerOverlayTab) {
@@ -8953,9 +9124,9 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(song.title, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(song.title, color = Color.White, fontSize = if (compactPhone) 20.sp else 24.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             if (custom["showArtistNames"] != false) {
-                                Text(song.artist, color = Color.White.copy(alpha = 0.72f), fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(song.artist, color = Color.White.copy(alpha = 0.72f), fontSize = if (compactPhone) 13.sp else 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                         }
 
@@ -8963,13 +9134,13 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                             val isFav = state.favoriteIds.contains(song.id)
                             IconButton(
                                 onClick = { vm.toggleFavorite(song.id) },
-                                modifier = Modifier.size(40.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.12f))
+                                modifier = Modifier.size(48.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.12f))
                             ) {
                                 Icon(
                                     imageVector = if (isFav) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
                                     contentDescription = "Favorite",
                                     tint = if (isFav) Color(0xFFFF4081) else Color.White,
-                                    modifier = Modifier.size(20.dp)
+                                    modifier = Modifier.size(24.dp)
                                 )
                             }
                             SongOverflowMenuButton(song = song, vm = vm)
@@ -9005,7 +9176,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         ),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(if (custom["showWaveform"] == true) 34.dp else 22.dp)
+                        .height(if (custom["showWaveform"] == true || compactPhone) 38.dp else 28.dp)
                             .clip(primaryCardShape(skin))
                     )
 
@@ -9014,21 +9185,21 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(formatMillis(state.currentPosMs), color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
+                        Text(formatMillis(state.currentPosMs), color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp, maxLines = 1)
                         val speedText = if (state.playbackSpeed % 1f == 0f) state.playbackSpeed.toInt().toString() else state.playbackSpeed.toString().trimEnd('0').trimEnd('.')
-                        Text("${state.activeSong.codecInfo.substringBefore(" • ")} • ${speedText}×", color = playerAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-                        Text("-${formatMillis(remainingMs)}", color = Color.White.copy(alpha = 0.6f), fontSize = 12.sp)
+                        Text("${state.activeSong.codecInfo.substringBefore(" • ")} • ${speedText}×", color = playerAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.weight(1f), textAlign = TextAlign.Center, overflow = TextOverflow.Ellipsis)
+                        Text("-${formatMillis(remainingMs)}", color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp, maxLines = 1)
                     }
 
-                    Spacer(modifier = Modifier.height(18.dp))
+                    Spacer(modifier = Modifier.height(if (compactPhone) 8.dp else 14.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        IconButton(onClick = { vm.prevTrack() }) {
-                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous", tint = Color.White, modifier = Modifier.size(42.dp))
+                        IconButton(onClick = { vm.prevTrack() }, modifier = Modifier.size(52.dp)) {
+                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous track", tint = Color.White, modifier = Modifier.size(if (compactPhone) 34.dp else 40.dp))
                         }
 
                         IconButton(
@@ -9059,12 +9230,12 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                             )
                         }
 
-                        IconButton(onClick = { vm.nextTrack() }) {
-                            Icon(Icons.Filled.SkipNext, contentDescription = "Next", tint = Color.White, modifier = Modifier.size(42.dp))
+                        IconButton(onClick = { vm.nextTrack() }, modifier = Modifier.size(52.dp)) {
+                            Icon(Icons.Filled.SkipNext, contentDescription = "Next track", tint = Color.White, modifier = Modifier.size(if (compactPhone) 34.dp else 40.dp))
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(if (compactPhone) 4.dp else 10.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -9104,6 +9275,38 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                 )
                             }
                         }
+                    }
+
+                    Spacer(modifier = Modifier.height(if (compactPhone) 0.dp else 4.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (state.outputVolume <= 0.01f) Icons.Default.VolumeOff else Icons.Default.VolumeDown,
+                            contentDescription = "Volume",
+                            tint = Color.White.copy(alpha = 0.78f),
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Slider(
+                            value = state.outputVolume,
+                            onValueChange = vm::setOutputVolume,
+                            onValueChangeFinished = vm::persistOutputVolume,
+                            valueRange = 0f..1f,
+                            colors = SliderDefaults.colors(
+                                thumbColor = playerAccent,
+                                activeTrackColor = playerAccent,
+                                inactiveTrackColor = Color.White.copy(alpha = 0.26f)
+                            ),
+                            modifier = Modifier.weight(1f).height(38.dp)
+                        )
+                        Icon(
+                            imageVector = Icons.Default.VolumeUp,
+                            contentDescription = "Maximum volume",
+                            tint = Color.White.copy(alpha = 0.78f),
+                            modifier = Modifier.size(22.dp)
+                        )
                     }
                 }
             }
@@ -9443,6 +9646,8 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                             artwork = playlist.coverUrl.ifBlank { playlist.songs.firstOrNull()?.coverUrl.orEmpty() },
                             skin = skin,
                             accent = accent,
+                            onSmartShuffle = { vm.startSmartShuffle(playlist.songs, playlist.name) },
+                            onAutoplay = { vm.addPlaylistToAutoplay(playlist.id) },
                             onClick = { vm.openSavedPlaylistDetail(playlist) }
                         )
                     }
@@ -9456,14 +9661,6 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                             onClick = { vm.openYoutubeMusicPlaylistDetail(playlist) }
                         )
                     }
-                }
-            }
-        }
-        if (state.dailyMixes.isNotEmpty()) item(key = "home_infinite_daily_mixes") {
-            HomeSectionHeading("Daily Mixes", "Refreshed from your listening and the time of day", accent)
-            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(11.dp)) {
-                items(state.dailyMixes, key = { "daily_mix_${it.id}" }) { mix ->
-                    DiscoveryMixCard(mix, skin) { vm.playDailyMix(mix.id) }
                 }
             }
         }
@@ -9540,6 +9737,11 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                 }
             }
         }
+        val activeLayout = HOME_LAYOUT_PRESETS.firstOrNull { it.id == state.homeLayoutId } ?: HOME_LAYOUT_PRESETS.first()
+        val homeSectionOrder = if (state.homeLayoutId == "custom") state.customHomeSectionOrder else activeLayout.sectionOrder
+        val visibleHomeSections = homeSectionOrder.filterNot { it in state.hiddenHomeSections }
+        val compactRows = activeLayout.compactRows || state.uiCustomizations["compactRows"] == true
+
         if (activeHomeCategory != "All") {
             categoryShelves.firstOrNull { it.title == activeHomeCategory }?.let { selectedShelf ->
                 item(key = "home_selected_category_${selectedShelf.title}") {
@@ -9554,54 +9756,75 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                 HomeSongCarousel("Recently Played", played, skin, vm, "Return to something familiar")
             }
         } else {
-            if (recentSongs.isNotEmpty()) item(key = "home_continue_listening") {
-                HomeSongCarousel("Continue Listening", recentSongs, skin, vm, "Pick up where you left off")
-            }
-            if (featuredRelease != null) item(key = "home_new_release_spotlight_${featuredRelease.id}") {
-                HomeReleaseSpotlight(featuredRelease, newReleaseSongs, skin, vm)
-            }
-            if (quickSongs.isNotEmpty()) item(key = "home_quick_picks") {
-                HomeCompactSongSection("Quick Picks", "Picked for your listening", quickSongs, "home_quick_picks", skin, vm)
-            }
-            categoryShelves.forEachIndexed { index, shelf ->
-                item(key = "home_feed_category_${index}_${shelf.title}") {
-                    HomeSongCarousel(shelf.title, shelf.songs, skin, vm, "Selected from your personal music feed")
-                }
-            }
-            if (madeForYouSongs.isNotEmpty()) item(key = "home_made_for_you") {
-                HomeSongCarousel("Made For You", madeForYouSongs, skin, vm, "Built from your listening and favorites")
-            }
-            val played = SessionStore.recentSongs().take(12)
-            if (played.isNotEmpty()) item(key = "home_recently_played") {
-                HomeSongCarousel("Recently Played", played, skin, vm, "Return to something familiar")
-            }
-        }
-        if (discoverySongs.isNotEmpty() || followedArtists.isNotEmpty()) item(key = "home_discover_for_you") {
-            HomeSongCarousel("Discover For You", discoverySongs, skin, vm, "Fresh finds shaped by your taste")
-            if (followedArtists.isNotEmpty()) {
-                HomeSectionHeading("Your Favourite Artists", "Followed artists come first", accent)
-                Column {
-                    followedArtists.take(5).forEach { name ->
-                        val artist = ArtistItem("home:${name.lowercase(Locale.ROOT)}", name, "Followed artist", "")
-                        ArtistSearchRow(artist, true, { vm.toggleFollowedArtist(name) }, { vm.openArtistByName(name) })
+            visibleHomeSections.forEach { sectionId ->
+                when (sectionId) {
+                    "continue" -> if (recentSongs.isNotEmpty()) item(key = "home_continue_listening") {
+                        HomeSongCarousel("Continue Listening", recentSongs, skin, vm, "Pick up where you left off")
                     }
-                }
-            }
-        }
-        if (trendingSongs.isNotEmpty()) item(key = "home_trending_for_you") {
-            HomeCompactSongSection("Trending Around You", "Popular picks from your music region", trendingSongs, "home_trending", skin, vm)
-        }
-        item(key = "home_library_shortcuts") {
-            HomeSectionHeading("Your Library", "Your saved music, one tap away", accent)
-            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
-                HomeShortcutCard("Playlists", Icons.Default.QueueMusic, accent, skin, Modifier.weight(1f)) {
-                    vm.setLibraryTab(3); vm.setScreen(ScreenNav.LIBRARY)
-                }
-                HomeShortcutCard("Liked Songs", Icons.Default.Favorite, accent, skin, Modifier.weight(1f)) {
-                    vm.setLibraryTab(1); vm.setScreen(ScreenNav.LIBRARY)
-                }
-                HomeShortcutCard("Downloads", Icons.Default.Download, accent, skin, Modifier.weight(1f)) {
-                    vm.setScreen(ScreenNav.OFFLINE)
+                    "spotlight" -> if (featuredRelease != null) item(key = "home_new_release_spotlight_${featuredRelease.id}") {
+                        HomeReleaseSpotlight(featuredRelease, newReleaseSongs, skin, vm)
+                    }
+                    "quick" -> if (quickSongs.isNotEmpty()) item(key = "home_quick_picks") {
+                        if (compactRows) HomeCompactSongSection("Quick Picks", "Picked for your listening", quickSongs, "home_quick_picks", skin, vm)
+                        else HomeSongCarousel("Quick Picks", quickSongs, skin, vm, "Picked for your listening")
+                    }
+                    "categories" -> if (categoryShelves.isNotEmpty()) item(key = "home_feed_categories") {
+                        categoryShelves.forEachIndexed { index, shelf ->
+                            if (compactRows) HomeCompactSongSection(shelf.title, "Selected from your personal music feed", shelf.songs, "home_feed_category_$index", skin, vm)
+                            else HomeSongCarousel(shelf.title, shelf.songs, skin, vm, "Selected from your personal music feed")
+                        }
+                    }
+                    "made" -> if (madeForYouSongs.isNotEmpty() || state.dailyMixes.isNotEmpty()) item(key = "home_made_for_you") {
+                        if (state.dailyMixes.isNotEmpty()) {
+                            HomeSectionHeading("Daily Mixes", "Refreshed from your listening and the time of day", accent)
+                            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(11.dp)) {
+                                items(state.dailyMixes, key = { "daily_mix_${it.id}" }) { mix ->
+                                    DiscoveryMixCard(mix, skin) { vm.playDailyMix(mix.id) }
+                                }
+                            }
+                        }
+                        if (madeForYouSongs.isNotEmpty()) {
+                            if (compactRows) HomeCompactSongSection("Made For You", "Built from your listening and favorites", madeForYouSongs, "home_made_for_you", skin, vm)
+                            else HomeSongCarousel("Made For You", madeForYouSongs, skin, vm, "Built from your listening and favorites")
+                        }
+                    }
+                    "recent" -> SessionStore.recentSongs().take(12).takeIf { it.isNotEmpty() }?.let { played ->
+                        item(key = "home_recently_played") {
+                            HomeSongCarousel("Recently Played", played, skin, vm, "Return to something familiar")
+                        }
+                    }
+                    "discover" -> if (discoverySongs.isNotEmpty() || followedArtists.isNotEmpty()) item(key = "home_discover_for_you") {
+                        if (discoverySongs.isNotEmpty()) {
+                            if (compactRows) HomeCompactSongSection("Discover For You", "Fresh finds shaped by your taste", discoverySongs, "home_discover_for_you", skin, vm)
+                            else HomeSongCarousel("Discover For You", discoverySongs, skin, vm, "Fresh finds shaped by your taste")
+                        }
+                        if (followedArtists.isNotEmpty()) {
+                            HomeSectionHeading("Your Favourite Artists", "Followed artists come first", accent)
+                            Column {
+                                followedArtists.take(5).forEach { name ->
+                                    val artist = ArtistItem("home:${name.lowercase(Locale.ROOT)}", name, "Followed artist", "")
+                                    ArtistSearchRow(artist, true, { vm.toggleFollowedArtist(name) }, { vm.openArtistByName(name) })
+                                }
+                            }
+                        }
+                    }
+                    "trending" -> if (trendingSongs.isNotEmpty()) item(key = "home_trending_for_you") {
+                        HomeCompactSongSection("Trending Around You", "Popular picks from your music region", trendingSongs, "home_trending", skin, vm)
+                    }
+                    "library" -> item(key = "home_library_shortcuts") {
+                        HomeSectionHeading("Your Library", "Your saved music, one tap away", accent)
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                            HomeShortcutCard("Playlists", Icons.Default.QueueMusic, accent, skin, Modifier.weight(1f)) {
+                                vm.setLibraryTab(3); vm.setScreen(ScreenNav.LIBRARY)
+                            }
+                            HomeShortcutCard("Liked Songs", Icons.Default.Favorite, accent, skin, Modifier.weight(1f)) {
+                                vm.setLibraryTab(1); vm.setScreen(ScreenNav.LIBRARY)
+                            }
+                            HomeShortcutCard("Downloads", Icons.Default.Download, accent, skin, Modifier.weight(1f)) {
+                                vm.setScreen(ScreenNav.OFFLINE)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -9882,8 +10105,11 @@ private fun PlaylistQuickCard(
     skin: SkinTheme,
     accent: Color,
     modifier: Modifier = Modifier,
+    onSmartShuffle: (() -> Unit)? = null,
+    onAutoplay: (() -> Unit)? = null,
     onClick: () -> Unit
 ) {
+    var actionsExpanded by remember(title) { mutableStateOf(false) }
     KiloCard(
         modifier = modifier.width(230.dp).height(86.dp).clickable(onClick = onClick),
         shape = primaryCardShape(skin),
@@ -9903,7 +10129,36 @@ private fun PlaylistQuickCard(
                 Text(subtitle, color = Color.White.copy(alpha = 0.58f), fontSize = 9.sp,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
-            Icon(Icons.Default.ArrowForward, contentDescription = "Open $title", tint = Color.White.copy(alpha = 0.58f), modifier = Modifier.size(16.dp))
+            if (onSmartShuffle != null || onAutoplay != null) {
+                Box {
+                    IconButton(onClick = { actionsExpanded = true }, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "$title options", tint = Color.White.copy(alpha = 0.78f))
+                    }
+                    DropdownMenu(expanded = actionsExpanded, onDismissRequest = { actionsExpanded = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Open playlist") },
+                            leadingIcon = { Icon(Icons.Default.QueueMusic, contentDescription = null) },
+                            onClick = { actionsExpanded = false; onClick() }
+                        )
+                        onSmartShuffle?.let { action ->
+                            DropdownMenuItem(
+                                text = { Text("Smart Shuffle") },
+                                leadingIcon = { Icon(Icons.Default.Shuffle, contentDescription = null) },
+                                onClick = { actionsExpanded = false; action() }
+                            )
+                        }
+                        onAutoplay?.let { action ->
+                            DropdownMenuItem(
+                                text = { Text("Add to Autoplay") },
+                                leadingIcon = { Icon(Icons.Default.PlaylistAdd, contentDescription = null) },
+                                onClick = { actionsExpanded = false; action() }
+                            )
+                        }
+                    }
+                }
+            } else {
+                Icon(Icons.Default.ArrowForward, contentDescription = "Open $title", tint = Color.White.copy(alpha = 0.58f), modifier = Modifier.size(16.dp))
+            }
         }
     }
 }
@@ -10500,6 +10755,57 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                 Text("Music for what you’re into right now", color = Color.White.copy(alpha = 0.63f), fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp))
             }
         }
+        item(key = "browse_quick_access") {
+            HomeSectionHeading("Quick access", "Downloads and your collection, one tap away", accent)
+            LazyRow(
+                contentPadding = PaddingValues(horizontal = browseGutter),
+                horizontalArrangement = Arrangement.spacedBy(KiloSpacing.xs)
+            ) {
+                item(key = "browse_access_liked") {
+                    HomeShortcutCard("Liked", Icons.Default.Favorite, accent, skin, Modifier.width(88.dp)) {
+                        vm.setLibraryTab(1); vm.setScreen(ScreenNav.LIBRARY)
+                    }
+                }
+                item(key = "browse_access_downloads") {
+                    HomeShortcutCard("Downloads", Icons.Default.Download, accent, skin, Modifier.width(88.dp)) { vm.setScreen(ScreenNav.OFFLINE) }
+                }
+                item(key = "browse_access_playlists") {
+                    HomeShortcutCard("Playlists", Icons.Default.QueueMusic, accent, skin, Modifier.width(88.dp)) {
+                        vm.setLibraryTab(3); vm.setScreen(ScreenNav.LIBRARY)
+                    }
+                }
+                item(key = "browse_access_radio") {
+                    HomeShortcutCard("Radio", Icons.Default.Radio, accent, skin, Modifier.width(88.dp)) { vm.setScreen(ScreenNav.RADIO) }
+                }
+                item(key = "browse_access_search") {
+                    HomeShortcutCard("Search", Icons.Default.Search, accent, skin, Modifier.width(88.dp)) { vm.setScreen(ScreenNav.SEARCH) }
+                }
+            }
+        }
+        item(key = "browse_mood_worlds_top") {
+            HomeSectionHeading("Moods", "Pick a feeling and start listening", accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = browseGutter), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                itemsIndexed(moodNames, key = { _, mood -> "browse_mood_$mood" }, contentType = { _, _ -> "mood_card" }) { index, mood ->
+                    BrowseVisualCard(
+                        title = mood, subtitle = "Mood mix", artwork = coverArts.getOrNull(index),
+                        tint = listOf(Color(0xFF4B2B85), Color(0xFF087C89), Color(0xFF9B4C34), Color(0xFF344D8A))[index % 4],
+                        modifier = Modifier.width(browseCardWidth).height(156.dp)
+                    ) { vm.openBrowseCategory(mood, BrowseCategoryKind.MOOD) }
+                }
+            }
+        }
+        item(key = "browse_genre_worlds_top") {
+            HomeSectionHeading("Genres", "Explore the sounds you love", accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = browseGutter), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                itemsIndexed(genreNames, key = { _, genre -> "browse_genre_$genre" }, contentType = { _, _ -> "genre_card" }) { index, genre ->
+                    BrowseVisualCard(
+                        title = genre, subtitle = "Genre", artwork = coverArts.getOrNull((index + 3) % coverArts.size.coerceAtLeast(1)),
+                        tint = listOf(Color(0xFF7B263D), Color(0xFF155C73), Color(0xFF5C3B83), Color(0xFF73602B))[index % 4],
+                        modifier = Modifier.width(browseCardWidth).height(144.dp)
+                    ) { vm.openBrowseCategory(genre, BrowseCategoryKind.GENRE) }
+                }
+            }
+        }
         item(key = "browse_discovery_options_top") {
             HomeSectionHeading("Quick actions", "Discovery without digging through menus", accent)
             DiscoveryOptionsStrip(
@@ -10530,6 +10836,8 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                             artwork = playlist.coverUrl.ifBlank { playlist.songs.firstOrNull()?.coverUrl.orEmpty() },
                             skin = skin,
                             accent = accent,
+                            onSmartShuffle = { vm.startSmartShuffle(playlist.songs, playlist.name) },
+                            onAutoplay = { vm.addPlaylistToAutoplay(playlist.id) },
                             onClick = { vm.openSavedPlaylistDetail(playlist) }
                         )
                     }
@@ -10561,33 +10869,6 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                     onClick = { vm.playSongFromShelf(song, browseReplaySongs, selectionSource = "phone_browse_recent") },
                     vm = vm
                 )
-            }
-        }
-        item(key = "browse_quick_access") {
-            HomeSectionHeading("Quick access", "Your music, one tap away", accent)
-            LazyRow(
-                contentPadding = PaddingValues(horizontal = browseGutter),
-                horizontalArrangement = Arrangement.spacedBy(KiloSpacing.xs)
-            ) {
-                item(key = "browse_access_liked") {
-                    HomeShortcutCard("Liked", Icons.Default.Favorite, accent, skin, Modifier.width(88.dp)) {
-                        vm.setLibraryTab(1); vm.setScreen(ScreenNav.LIBRARY)
-                    }
-                }
-                item(key = "browse_access_downloads") {
-                    HomeShortcutCard("Downloads", Icons.Default.Download, accent, skin, Modifier.width(88.dp)) { vm.setScreen(ScreenNav.OFFLINE) }
-                }
-                item(key = "browse_access_playlists") {
-                    HomeShortcutCard("Playlists", Icons.Default.QueueMusic, accent, skin, Modifier.width(88.dp)) {
-                        vm.setLibraryTab(3); vm.setScreen(ScreenNav.LIBRARY)
-                    }
-                }
-                item(key = "browse_access_radio") {
-                    HomeShortcutCard("Radio", Icons.Default.Radio, accent, skin, Modifier.width(88.dp)) { vm.setScreen(ScreenNav.RADIO) }
-                }
-                item(key = "browse_access_search") {
-                    HomeShortcutCard("Search", Icons.Default.Search, accent, skin, Modifier.width(88.dp)) { vm.setScreen(ScreenNav.SEARCH) }
-                }
             }
         }
         if (state.dailyMixes.isNotEmpty()) item(key = "browse_dynamic_mixes") {
@@ -10660,30 +10941,6 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                         tint = listOf(Color(0xFF24566B), Color(0xFF71436B), Color(0xFF67512D), Color(0xFF394D79))[index % 4],
                         modifier = Modifier.width(browseCardWidth.coerceAtLeast(180.dp)).height(144.dp)
                     ) { browseSearch(collection.query) }
-                }
-            }
-        }
-        item {
-            HomeSectionHeading("Mood worlds", "Pick the feeling; KILO will find the sound", accent)
-            LazyRow(contentPadding = PaddingValues(horizontal = browseGutter), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                itemsIndexed(moodNames, key = { _, mood -> "browse_mood_$mood" }, contentType = { _, _ -> "mood_card" }) { index, mood ->
-                    BrowseVisualCard(
-                        title = mood, subtitle = "Mood mix", artwork = coverArts.getOrNull(index),
-                        tint = listOf(Color(0xFF4B2B85), Color(0xFF087C89), Color(0xFF9B4C34), Color(0xFF344D8A))[index % 4],
-                        modifier = Modifier.width(browseCardWidth).height(156.dp)
-                    ) { vm.openBrowseCategory(mood, BrowseCategoryKind.MOOD) }
-                }
-            }
-        }
-        item {
-            HomeSectionHeading("Genre worlds", "Explore the sounds you love", accent)
-            LazyRow(contentPadding = PaddingValues(horizontal = browseGutter), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                itemsIndexed(genreNames, key = { _, genre -> "browse_genre_$genre" }, contentType = { _, _ -> "genre_card" }) { index, genre ->
-                    BrowseVisualCard(
-                        title = genre, subtitle = "Genre", artwork = coverArts.getOrNull((index + 3) % coverArts.size.coerceAtLeast(1)),
-                        tint = listOf(Color(0xFF7B263D), Color(0xFF155C73), Color(0xFF5C3B83), Color(0xFF73602B))[index % 4],
-                        modifier = Modifier.width(browseCardWidth).height(144.dp)
-                    ) { vm.openBrowseCategory(genre, BrowseCategoryKind.GENRE) }
                 }
             }
         }
@@ -11688,6 +11945,113 @@ fun V2RoadmapScreen(vm: MainViewModel) {
 }
 
 @Composable
+private fun HomeLayoutScreen(vm: MainViewModel) {
+    val state by vm.state.collectAsState()
+    val accent = state.activeSkin.highlight
+    val selected = state.homeLayoutId
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { vm.handleSystemBack() }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back to Appearance", tint = Color.White)
+            }
+            Column(Modifier.weight(1f)) {
+                Text("YOUR HOME, YOUR WAY", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.5.sp)
+                Text("Home layouts", color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.ExtraBold)
+            }
+        }
+        Text(
+            "Choose what appears first. Each layout changes the order and density of your Home feed.",
+            color = Color.White.copy(alpha = 0.68f), fontSize = 14.sp, lineHeight = 20.sp,
+            modifier = Modifier.padding(start = 4.dp, end = 4.dp, bottom = 6.dp)
+        )
+        SettingsSectionHeader("START WITH A LAYOUT")
+        HOME_LAYOUT_PRESETS.filterNot { it.id == "custom" }.chunked(2).forEach { rowPresets ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                rowPresets.forEach { preset ->
+                    val isSelected = selected == preset.id
+                    Column(
+                        Modifier.weight(1f).heightIn(min = 112.dp)
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(if (isSelected) Brush.linearGradient(listOf(accent.copy(alpha = 0.3f), primaryPanelColor(state.activeSkin))) else Brush.linearGradient(listOf(primaryPanelColor(state.activeSkin), primaryPanelColor(state.activeSkin))))
+                            .border(1.dp, if (isSelected) accent else Color.White.copy(alpha = 0.09f), RoundedCornerShape(20.dp))
+                            .clickable { vm.setHomeLayout(preset.id) }
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            if (isSelected) Icon(Icons.Default.CheckCircle, contentDescription = "Selected", tint = accent, modifier = Modifier.size(18.dp))
+                            Text(preset.title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                        Text(preset.description, color = Color.White.copy(alpha = 0.68f), fontSize = 12.sp, lineHeight = 17.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(if (preset.compactRows) "DENSE FEED" else "PERSONAL FEED", color = accent, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
+                    }
+                }
+                if (rowPresets.size == 1) Spacer(Modifier.weight(1f))
+            }
+        }
+
+        SettingsSectionHeader("CUSTOMIZE YOUR FEED")
+        SettingsGroupCard {
+            Row(
+                Modifier.fillMaxWidth().clickable { vm.setHomeLayout("custom") }.padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(Icons.Default.Tune, contentDescription = null, tint = accent, modifier = Modifier.size(22.dp))
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Custom layout", color = Color.White, fontWeight = FontWeight.Bold)
+                    Text("Choose sections and move them up or down", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
+                }
+                RadioButton(selected = selected == "custom", onClick = { vm.setHomeLayout("custom") })
+            }
+            if (selected == "custom") {
+                HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+                state.customHomeSectionOrder.forEachIndexed { index, sectionId ->
+                    val section = HOME_SECTION_OPTIONS.firstOrNull { it.id == sectionId } ?: return@forEachIndexed
+                    Row(
+                        Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Checkbox(
+                            checked = sectionId !in state.hiddenHomeSections,
+                            onCheckedChange = { visible -> vm.setCustomHomeSectionVisible(sectionId, visible) },
+                            colors = CheckboxDefaults.colors(checkedColor = accent)
+                        )
+                        Column(Modifier.weight(1f).padding(start = 4.dp, end = 4.dp)) {
+                            Text(section.title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(section.description, color = Color.White.copy(alpha = 0.58f), fontSize = 11.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                        IconButton(onClick = { vm.moveCustomHomeSection(sectionId, -1) }, enabled = index > 0, modifier = Modifier.size(44.dp)) {
+                            Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Move ${section.title} up", tint = if (index > 0) Color.White else Color.Gray)
+                        }
+                        IconButton(onClick = { vm.moveCustomHomeSection(sectionId, 1) }, enabled = index < state.customHomeSectionOrder.lastIndex, modifier = Modifier.size(44.dp)) {
+                            Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Move ${section.title} down", tint = if (index < state.customHomeSectionOrder.lastIndex) Color.White else Color.Gray)
+                        }
+                    }
+                    if (index < state.customHomeSectionOrder.lastIndex) HorizontalDivider(color = Color.White.copy(alpha = 0.05f), modifier = Modifier.padding(horizontal = 12.dp))
+                }
+                HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.ViewCompact, contentDescription = null, tint = accent)
+                    Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                        Text("Compact song rows", color = Color.White, fontWeight = FontWeight.Medium)
+                        Text("Show more tracks with less scrolling", color = Color.White.copy(alpha = 0.58f), fontSize = 11.sp)
+                    }
+                    Switch(
+                        checked = state.uiCustomizations["compactRows"] == true,
+                        onCheckedChange = { vm.toggleCustomization("compactRows", it) }
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
 fun AppearanceScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val accent = state.activeSkin.highlight
@@ -11709,6 +12073,14 @@ fun AppearanceScreen(vm: MainViewModel) {
         )
         SettingsSectionHeader("LOOK & FEEL")
         SettingsGroupCard {
+            SettingsRowItem(
+                icon = Icons.Default.Home,
+                title = "Home Layout",
+                subtitle = HOME_LAYOUT_PRESETS.size.toString() + " layouts · build a custom Home feed",
+                trailingValue = HOME_LAYOUT_PRESETS.firstOrNull { it.id == state.homeLayoutId }?.title ?: "Balanced",
+                onClick = { vm.setScreen(ScreenNav.HOME_LAYOUT) }
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
             SettingsRowItem(
                 icon = Icons.Default.Palette,
                 title = "Themes",
@@ -13062,6 +13434,20 @@ private fun PlaylistDetailScreen(vm: MainViewModel) {
                     }
                 }
             }
+            if (playlist.source != "youtube_music") {
+                item(key = "playlist_detail_autoplay_${playlist.id}") {
+                    FilledTonalButton(
+                        onClick = { vm.addPlaylistToAutoplay(playlist.id) },
+                        enabled = actionsEnabled,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Icon(Icons.Default.PlaylistAdd, contentDescription = null)
+                        Spacer(Modifier.width(7.dp))
+                        Text("Add to Autoplay", maxLines = 1)
+                    }
+                }
+            }
             if (state.isLoadingPlaylistDetail) {
                 item(key = "playlist_detail_loading_${playlist.id}") {
                     Box(Modifier.fillMaxWidth().padding(vertical = 26.dp), contentAlignment = Alignment.Center) {
@@ -13635,7 +14021,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                     Text("KILO QUICK START", color = Color.White, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp)
                 }
                 Text(
-                    "Step " + (state.setupStep + 1) + " of 3",
+                    "Step " + (state.setupStep + 1) + " of 4",
                     color = state.activeSkin.highlight,
                     fontWeight = FontWeight.Bold
                 )
@@ -13713,9 +14099,37 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                         }
                     }
 
+                    2 -> WizardStepContent(
+                        "Make KILO yours",
+                        "Pick a few genres and moods for a more personal Home feed. This is optional, and you can change it later in You → Personalisation."
+                    ) {
+                        val profile = state.listenerProfile
+                        Column(
+                            Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(14.dp)
+                        ) {
+                            Text("Genres", color = Color.White, fontWeight = FontWeight.Bold)
+                            ProfileChoiceGrid(
+                                PERSONALIZATION_GENRES,
+                                profile.favoriteGenres,
+                                state.activeSkin.highlight,
+                                vm::toggleProfileGenre,
+                                minimumRequired = 0
+                            )
+                            Text("Moods", color = Color.White, fontWeight = FontWeight.Bold)
+                            ProfileChoiceGrid(
+                                PERSONALIZATION_MOODS,
+                                profile.favoriteMoods,
+                                state.activeSkin.highlight,
+                                vm::toggleProfileMood,
+                                minimumRequired = 0
+                            )
+                        }
+                    }
+
                     else -> WizardStepContent(
                         "You're ready to listen",
-                        "Your setup is complete. Start with public music now, and add personal preferences whenever you want."
+                        "Your setup is ready. Sign-in and personalization remain optional, and you can update them any time in You."
                     ) {
                         Column(
                             modifier = Modifier.fillMaxWidth(),
@@ -13735,7 +14149,7 @@ fun BitChordSetupWizard(vm: MainViewModel) {
             ) {
                 if (state.setupStep == 0) {
                     Button(
-                        onClick = { vm.completeSetupStep(3) },
+                        onClick = { vm.completeSetupStep(4) },
                         modifier = Modifier.weight(1.2f),
                         colors = ButtonDefaults.buttonColors(containerColor = state.activeSkin.highlight)
                     ) {
@@ -13764,8 +14178,9 @@ fun BitChordSetupWizard(vm: MainViewModel) {
                     ) {
                         Text(
                             when {
-                                state.setupStep >= 2 -> "Start listening"
-                                state.setupStep == 1 && !state.isLoggedIn -> "Skip for now"
+                                state.setupStep >= 3 -> "Start listening"
+                                state.setupStep == 1 && !state.isLoggedIn -> "Continue without sign-in"
+                                state.setupStep == 2 -> "Continue"
                                 else -> "Continue"
                             },
                             color = Color.Black,

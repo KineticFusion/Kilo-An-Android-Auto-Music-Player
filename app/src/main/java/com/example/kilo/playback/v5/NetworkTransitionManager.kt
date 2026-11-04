@@ -9,7 +9,7 @@ import com.example.kilo.sourceprefetch.SourcePrefetchManager
 import com.example.kilo.networkmonitor.NetworkHealthSnapshot
 import com.example.kilo.networkmonitor.NetworkHealthMonitor
 
-/** Refreshes only upcoming stream work after a network transition; it never replaces the active item. */
+/** Refreshes only the active and next two eligible leases after a network transition. */
 object NetworkTransitionManager {
     private const val TAG = "KiloNetworkTransition"
     private var lastSnapshot: NetworkHealthSnapshot? = null
@@ -37,11 +37,10 @@ object NetworkTransitionManager {
                 if (StreamLeaseManager.refreshDue(id)) {
                     StreamLeaseRefreshCoordinator.refreshNow(id)
                 }
-                val upcoming = SourcePrefetchManager.upcomingIds(active, 4)
+                val upcoming = SourcePrefetchManager.upcomingIds(active, 2)
                     .filter { it != id && !it.startsWith("radio:") }
                 if (upcoming.isNotEmpty()) {
-                    // Expired cached leases will be resolved again by the existing source path.
-                    upcoming.forEach { trackId -> if (StreamLeaseManager.refreshDue(trackId)) PlaybackRepository.invalidateResolvedStream(trackId) }
+                    // Keep the existing lease usable until an alternate has been validated.
                     appContext?.let { QueuePreloader.enqueue(it, upcoming) }
                 }
             }

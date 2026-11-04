@@ -18,7 +18,7 @@ object AndroidAutoRepository {
 
     fun rememberSongs(songs: List<SongItemClean>) = PlaybackRepository.rememberAll(songs)
 
-    fun dispatch(action: (ExoPlayer) -> Unit) = MainThreadPlayerGateway.dispatch(action)
+    fun dispatch(action: (ExoPlayer) -> Unit) = MainThreadPlayerGateway.dispatch("android_auto", "browse_adapter", action = action)
 
     fun queueSnapshot(): ListenableFuture<QueueSnapshot> {
         val result = SettableFuture.create<QueueSnapshot>()
@@ -43,18 +43,25 @@ object AndroidAutoRepository {
         beforePrepare: (ExoPlayer) -> Unit,
         onSaved: (ExoPlayer) -> Unit
     ) {
-        MainThreadPlayerGateway.dispatch { player ->
-            if (player.isPlaying) return@dispatch
+        MainThreadPlayerGateway.dispatch("android_auto", "resume_on_connect") { player ->
+            if (player.isPlaying || player.playWhenReady) return@dispatch
             if (player.mediaItemCount == 0) {
                 val (items, position) = fallbackItems()
                 if (items.isNotEmpty()) {
                     val (index, startPositionMs) = position
                     beforeSet(player)
                     player.setMediaItems(items, index.coerceIn(0, items.lastIndex), startPositionMs.coerceAtLeast(0L))
+                    com.example.kilo.playback.stability.PlaybackCommandLedger.recordQueueMutation(
+                        player, "android_auto", "resume_on_connect_restore"
+                    )
                 }
             }
             if (player.mediaItemCount > 0) {
                 player.play()
+                com.example.kilo.playback.stability.PlaybackCommandLedger.recordIntent(
+                    player, com.example.kilo.playback.stability.PlaybackCommandLedger.Intent.PLAY,
+                    "android_auto", "resume_on_connect"
+                )
                 if (player.playbackState == androidx.media3.common.Player.STATE_IDLE ||
                     player.playbackState == androidx.media3.common.Player.STATE_ENDED
                 ) {
@@ -75,10 +82,14 @@ object AndroidAutoRepository {
         onStarted: (ExoPlayer) -> Unit = {}
     ) {
         if (items.isEmpty()) return
-        MainThreadPlayerGateway.dispatch { player ->
+        MainThreadPlayerGateway.dispatch("android_auto", "start_queue", queueMutation = true) { player ->
             beforeSet(player)
             player.setMediaItems(items, index.coerceIn(0, items.lastIndex), positionMs.coerceAtLeast(0L))
             player.play()
+            com.example.kilo.playback.stability.PlaybackCommandLedger.recordIntent(
+                player, com.example.kilo.playback.stability.PlaybackCommandLedger.Intent.PLAY,
+                "android_auto", "start_queue"
+            )
             beforePrepare(player)
             player.prepare()
             onStarted(player)

@@ -67,8 +67,9 @@ class AudioSessionManager(
             activeTrackId = trackId
             activeAnalysis = null
             refresh()
-            if (profiles.selectedId() == SoundProfileRepository.ORIGINAL) return
-            // Existing cached analysis is optional. Its database lookup runs off the player/UI thread.
+            // Optional cached analysis is loaded for Original too, so quiet tracks can receive
+            // bounded level compensation while loud tracks are attenuated before the limiter.
+            // The lookup stays off the player/UI thread and never delays playback.
             backgroundExecutor.execute {
                 PlayerHolder.loadAnalysis(trackId, backgroundExecutor).whenComplete { result, error ->
                     if (error != null) Log.d(TAG, "cached track analysis unavailable trackId=$trackId", error)
@@ -162,7 +163,9 @@ class AudioSessionManager(
                 )
                 activeEffects += "10-band EQ"
                 if (effectivePlan.limiterEnabled) activeEffects += "limiter"
-                if (effectivePlan.inputGainDb > 0f) activeEffects += "${"%.1f".format(effectivePlan.inputGainDb)}dB gain"
+                if (kotlin.math.abs(effectivePlan.inputGainDb) >= 0.1f) {
+                    activeEffects += "${"%.1f".format(effectivePlan.inputGainDb)}dB level"
+                }
             }.onFailure { health.onEffectFailure("DynamicsProcessing.apply", it) }
         } else if (effectivePlan.eqGainsDb.take(3).any { it > 0f }) {
             if (fallbackBass.attach(sessionId, 240)) activeEffects += "bass (fallback)"
@@ -189,7 +192,7 @@ class AudioSessionManager(
             analysisApplied = effectivePlan.analysisUsed,
             analyzer = AudioAnalyzer(dynamics != null, spatialEnhancer.platformSpatializerAvailable, exciter.supported),
             message = when {
-                dynamics != null && limiterActive && effectivePlan.inputGainDb > 0f -> "${effectivePlan.description}; limiter is active"
+                dynamics != null && limiterActive && kotlin.math.abs(effectivePlan.inputGainDb) >= 0.1f -> "${effectivePlan.description}; peak protection is active"
                 dynamics != null -> "${effectivePlan.activeProfile.description}; session effects are active"
                 else -> "This device does not expose the full profile; playback remains unchanged"
             }

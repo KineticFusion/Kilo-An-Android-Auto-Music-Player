@@ -14,12 +14,14 @@ class AudioPipeline(private val profiles: SoundProfileRepository) {
         val profile = profiles.forOutput(route)
         if (profile.id == SoundProfileRepository.ORIGINAL) {
             val inputGain = com.example.kilo.audio.dsp.DynamicLoudnessProcessor()
-                .inputGain(profile, null, limiterAvailable)
+                .inputGain(profile, analysis, limiterAvailable)
             return AudioProfilePlan(
                 selectedId, profile, route, List(10) { 0f }, inputGain, 0,
                 limiterEnabled = limiterAvailable, transparentMode = false,
-                analysisUsed = false,
-                description = if (limiterAvailable) "Original tone with ${"%.1f".format(inputGain)} dB level boost and peak limiting" else "Original tone; this Android version cannot safely apply the level boost"
+                analysisUsed = analysis != null,
+                description = if (limiterAvailable) {
+                    "Original EQ with protected level matching${if (analysis != null) " from cached track analysis" else ""}"
+                } else "Original tone; this Android version cannot safely apply level matching"
             )
         }
         return carProcessor.plan(selectedId, profile, route, analysis, limiterAvailable)

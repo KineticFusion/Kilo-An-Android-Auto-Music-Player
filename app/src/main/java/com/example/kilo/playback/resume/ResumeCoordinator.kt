@@ -3,6 +3,7 @@ package com.example.kilo.playback.resume
 import android.content.Context
 import androidx.media3.common.Player
 import com.example.kilo.SessionStore
+import com.example.kilo.playback.stability.PlaybackCommandLedger
 
 /** Restores the saved queue paused, leaving playback start under the user's control. */
 object ResumeCoordinator {
@@ -13,6 +14,7 @@ object ResumeCoordinator {
         player.repeatMode = snapshot?.repeatMode ?: player.repeatMode
         player.shuffleModeEnabled = snapshot?.shuffleEnabled ?: player.shuffleModeEnabled
         player.setMediaItems(restored.items, restored.index, restored.posMs.coerceAtLeast(0L))
+        PlaybackCommandLedger.recordQueueMutation(player, "resume", "restore_saved_queue")
         BackgroundResumeLog.restored(restored.items.size, restored.index, restored.posMs, snapshot?.playWhenReady == true)
         // Deliberately do not auto-play on a normal app launch; media controllers can
         // resume through the existing MediaLibrarySession callback when requested.

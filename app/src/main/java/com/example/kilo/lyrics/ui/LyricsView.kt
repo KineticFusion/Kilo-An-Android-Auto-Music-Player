@@ -20,12 +20,13 @@ fun LyricsView(line: LyricsLine, active: Boolean, onSeek: (Long) -> Unit, modifi
     Text(
         line.content,
         modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp))
-            .background(if (active) LocalLyricsAccent.current.copy(alpha = 0.10f) else androidx.compose.ui.graphics.Color.Transparent)
-            .clickable(enabled = line.startMs >= 0L) { onSeek(line.startMs) }.padding(horizontal = 16.dp, vertical = 8.dp),
-        color = if (active) LocalLyricsAccent.current else androidx.compose.ui.graphics.Color.White.copy(alpha = 0.56f),
-        fontSize = if (active) 21.sp else 17.sp,
-        fontWeight = if (active) FontWeight.Bold else FontWeight.Medium,
+            .background(if (active) LocalLyricsAccent.current.copy(alpha = 0.14f) else androidx.compose.ui.graphics.Color.Transparent)
+            .clickable(enabled = line.startMs >= 0L) { onSeek(line.startMs) }
+            .padding(horizontal = 18.dp, vertical = if (active) 12.dp else 8.dp),
+        color = if (active) LocalLyricsAccent.current else androidx.compose.ui.graphics.Color.White.copy(alpha = 0.62f),
+        fontSize = if (active) 25.sp else 18.sp,
+        fontWeight = if (active) FontWeight.ExtraBold else FontWeight.Medium,
         textAlign = TextAlign.Center,
-        lineHeight = 29.sp
+        lineHeight = if (active) 34.sp else 27.sp
     )
 }

@@ -93,8 +93,12 @@ import com.example.kilo.audioanalysis.AudioAnalysisService
 import com.example.kilo.audioanalysis.TrackAnalysisEntity
 import com.example.kilo.playback.stability.MediaSourceAudit
 import com.example.kilo.playback.stability.PlaybackStabilityManager
+import com.example.kilo.playback.stability.PlaybackCommandLedger
 import com.example.kilo.playback.stability.RecoveryCoordinator
+import com.example.kilo.playbackrecovery.PlaybackDiagnostics
 import com.example.kilo.playback.v5.StreamLeaseRefreshCoordinator
+import com.example.kilo.networkmonitor.NetworkGrade
+import com.example.kilo.networkmonitor.NetworkHealthMonitor
 import com.example.kilo.search.preparation.SearchWarmupEngine
 import com.example.kilo.mood.preparation.MoodWarmupEngine
 import org.json.JSONArray
@@ -111,6 +115,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.system.exitProcess
 
 private const val TAG = "VybeAuto"
+private const val REJECTED_SOURCE_REFRESH_WAIT_MS = 4_000L
+private const val REJECTED_SOURCE_REFRESH_POLL_MS = 100L
 private fun safeUriForLog(uri: Uri?): String = uri?.buildUpon()?.clearQuery()?.build()?.toString().orEmpty()
 private const val ROOT = "root"
 private const val AUTO_STYLE_SUPPORTED = AndroidAutoUiModule.STYLE_SUPPORTED
@@ -151,11 +157,10 @@ private class PlaybackLoadErrorPolicy : DefaultLoadErrorHandlingPolicy(5) {
                 // the source. A DataSource-level retry reuses the open extractor and its
                 // byte position; the refreshed resolver may return another container.
                 val mediaId = PlayerHolder.refreshRejectedStreamSource(loadErrorInfo.loadEventInfo.dataSpec)
-                val canRebuildSource = mediaId != null && loadErrorInfo.errorCount == 1
                 Log.w(
                     "KiloPlayback",
                     "http=$status rejectedSource id=${mediaId.orEmpty()} " +
-                        "attempt=${loadErrorInfo.errorCount} rebuildSource=$canRebuildSource"
+                        "attempt=${loadErrorInfo.errorCount} dataSourceAlternativesExhausted=${mediaId?.let(PlayerHolder::sourceAlternativesExhausted) == true}"
                 )
                 // Propagate immediately to PlayerHolder.onPlayerError. Its existing
                 // recovery replaces only the current item and preserves queue, position,
@@ -527,6 +532,9 @@ object SessionStore {
 }
 
 object HomeCache {
+    private const val PREFS_NAME = "vybe_app_settings"
+    private const val HOME_CACHE_KEY = "home_feed_cache_v1"
+    private const val HOME_CACHE_TIME_KEY = "home_feed_cache_time_v1"
     @Volatile
     var shelves: List<HomeShelf> = emptyList()
     /** Keep personalized unplayed shelves separate from remote catalog refreshes. */
@@ -535,7 +543,58 @@ object HomeCache {
     @Volatile
     private var time = 0L
     @Volatile
-    private var lastAttempt = 0L
+    private var initialized = false
+    @Volatile
+    private var appContext: Context? = null
+
+    /** Reads a small, local snapshot only. Never perform network work from a browse callback. */
+    @Synchronized
+    fun initialize(context: Context): List<HomeShelf> {
+        appContext = context.applicationContext
+        if (initialized) return shelves
+        initialized = true
+        if (shelves.isNotEmpty()) return shelves
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val raw = prefs.getString(HOME_CACHE_KEY, null) ?: return shelves
+        shelves = runCatching {
+            val root = JSONArray(raw)
+            buildList {
+                for (i in 0 until root.length()) {
+                    val shelfJson = root.optJSONObject(i) ?: continue
+                    val songsJson = shelfJson.optJSONArray("songs") ?: continue
+                    val songs = buildList {
+                        for (songIndex in 0 until songsJson.length()) {
+                            val song = songsJson.optJSONObject(songIndex) ?: continue
+                            val id = song.optString("id").takeIf(String::isNotBlank) ?: continue
+                            add(SongItemClean(
+                                id = id,
+                                videoId = song.optString("videoId"),
+                                playlistId = song.optString("playlistId"),
+                                albumBrowseId = song.optString("albumBrowseId"),
+                                title = song.optString("title"),
+                                artist = song.optString("artist"),
+                                album = song.optString("album"),
+                                coverUrl = song.optString("coverUrl"),
+                                durationMs = song.optLong("durationMs", 215_000L),
+                                isDownloaded = song.optBoolean("isDownloaded"),
+                                isExplicit = song.optBoolean("isExplicit"),
+                                spotifyTrackId = song.optString("spotifyTrackId"),
+                                languageCode = song.optString("languageCode")
+                            ))
+                        }
+                    }
+                    if (songs.isNotEmpty()) add(HomeShelf(
+                        title = shelfJson.optString("title").ifBlank { "Picked for you" },
+                        songs = songs,
+                        isList = shelfJson.optBoolean("isList")
+                    ))
+                }
+            }.take(MAX_CACHED_SHELVES)
+        }.getOrDefault(emptyList())
+        discoveryShelves = shelves.filter { it.title.isNotBlank() }
+        time = prefs.getLong(HOME_CACHE_TIME_KEY, 0L)
+        return shelves
+    }
 
     fun set(list: List<HomeShelf>) {
         shelves = list
@@ -547,26 +606,55 @@ object HomeCache {
         }
         if (personalizedShelves.isNotEmpty() || list.isEmpty()) discoveryShelves = personalizedShelves
         time = System.currentTimeMillis()
+        runCatching {
+            val encoded = JSONArray().apply {
+                list.take(MAX_CACHED_SHELVES).forEach { shelf ->
+                    val cachedSongs = shelf.songs.take(MAX_CACHED_SONGS_PER_SHELF)
+                    if (cachedSongs.isNotEmpty()) put(JSONObject().apply {
+                        put("title", shelf.title)
+                        put("isList", shelf.isList)
+                        put("songs", JSONArray().apply {
+                            cachedSongs.forEach { song -> put(JSONObject().apply {
+                                put("id", song.id)
+                                put("videoId", song.videoId)
+                                put("playlistId", song.playlistId)
+                                put("albumBrowseId", song.albumBrowseId)
+                                put("title", song.title)
+                                put("artist", song.artist)
+                                put("album", song.album)
+                                put("coverUrl", song.coverUrl)
+                                put("durationMs", song.durationMs)
+                                put("isDownloaded", song.isDownloaded)
+                                put("isExplicit", song.isExplicit)
+                                put("spotifyTrackId", song.spotifyTrackId)
+                                put("languageCode", song.languageCode)
+                            }) }
+                        })
+                    })
+                }
+            }
+            // apply() keeps this write off the UI thread; the serialized snapshot is intentionally bounded.
+            appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                ?.edit()?.putString(HOME_CACHE_KEY, encoded.toString())
+                ?.putLong(HOME_CACHE_TIME_KEY, time)?.apply()
+        }.onFailure { Log.w("KiloHomeCache", "Could not persist Home feed snapshot", it) }
     }
 
-    fun get(): List<HomeShelf> {
-        val now = System.currentTimeMillis()
-        val stale = shelves.isEmpty() || now - time > 900_000L
-        if (stale && now - lastAttempt > 30_000L) {
-            lastAttempt = now
-            runCatching { YtRepo.fetchHomeCatalog().shelves }
-                .getOrDefault(emptyList())
-                .takeIf { it.isNotEmpty() }
-                ?.let(::set)
-        }
-        return shelves
-    }
+    fun get(): List<HomeShelf> = shelves
+
+    private const val MAX_CACHED_SHELVES = 12
+    private const val MAX_CACHED_SONGS_PER_SHELF = 10
 }
 
 object PlayerHolder {
     private const val MAX_PLAYBACK_RETRIES = 2
     private const val STARTUP_WARM_BYTES = 96L * 1024L
-    private data class ErrorRecovery(val positionMs: Long, val shouldResume: Boolean, val attempt: Int)
+    private data class ErrorRecovery(
+        val positionMs: Long,
+        val shouldResume: Boolean,
+        val attempt: Int,
+        val queueGeneration: Long
+    )
     private var player: ExoPlayer? = null
     private var standbyPlayer: ExoPlayer? = null
     private var crossfadeOrchestrator: CrossfadeOrchestrator? = null
@@ -575,9 +663,11 @@ object PlayerHolder {
     private var analysisService: AudioAnalysisService? = null
     @Volatile private var analysisAppContext: Context? = null
     @Volatile private var analysisResultListener: ((TrackAnalysisEntity) -> Unit)? = null
-    private val retryAttempts = ConcurrentHashMap<String, Int>()
+        private val retryAttempts = ConcurrentHashMap<String, Int>()
     private val analysisLookupRequested = ConcurrentHashMap.newKeySet<String>()
     private val unavailableTrackIds = ConcurrentHashMap.newKeySet<String>()
+    private val exhaustedSourceIds = ConcurrentHashMap.newKeySet<String>()
+    private val sourceFormatChangePending = ConcurrentHashMap.newKeySet<String>()
     private val lastKnownPositionMs = ConcurrentHashMap<String, Long>()
     private val pendingErrorRecoveries = ConcurrentHashMap<String, ErrorRecovery>()
     private val qualifiedHistoryIds = ConcurrentHashMap.newKeySet<String>()
@@ -675,6 +765,7 @@ object PlayerHolder {
     fun get(context: Context): ExoPlayer {
         player?.let { return it }
         val app = context.applicationContext
+        StreamRequestDiagnostics.enabled = BuildConfig.DEBUG
         val playbackPreferences = app.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
         handleCallAudioFocus = playbackPreferences.getBoolean("pause_for_calls", true)
         Favorites.init(app)
@@ -683,10 +774,7 @@ object PlayerHolder {
 
         val meter = DefaultBandwidthMeter.Builder(app).build()
         bandwidthMeter = meter
-        val http = DefaultHttpDataSource.Factory()
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(6000)
-            .setReadTimeoutMs(30000)
+        val http = StreamRequestPolicy.httpFactory()
             .setTransferListener(object : TransferListener {
                 override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
                 override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
@@ -706,10 +794,19 @@ object PlayerHolder {
                 override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) = Unit
                 override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
             })
+        StreamRecoveryDataSourceFactory.install(
+            streamForRequest = ::streamForDataSpec,
+            resolveAlternative = { spec, failed -> resolveAlternativeForDataSource(app, spec, failed) },
+            reportFailure = { stream, status -> FastStream.reportPlaybackFailure(stream, status) },
+            onAlternativesExhausted = { spec -> markSourceAlternativesExhausted(spec) }
+        )
+        val playbackHttp = StreamRecoveryDataSourceFactory.wrap(http, "player")
 
         val cachedFactory = CacheDataSource.Factory()
             .setCache(AudioCache.get(app))
-            .setUpstreamDataSourceFactory(DefaultDataSource.Factory(app, http))
+            .setUpstreamDataSourceFactory(
+                DefaultDataSource.Factory(app, playbackHttp)
+            )
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
         val resolver = ResolvingDataSource.Resolver { spec ->
@@ -773,6 +870,11 @@ object PlayerHolder {
                 p.currentMediaItem?.mediaId?.takeIf { p.isPlaying }?.let { id ->
                     val position = p.currentPosition.coerceAtLeast(0L)
                     lastKnownPositionMs[id] = position
+                    RecoveryCoordinator.markRecovered(
+                        id,
+                        position,
+                        (p.bufferedPosition - p.currentPosition).coerceAtLeast(0L)
+                    )
                     if (position >= 30_000L && qualifiedHistoryIds.add(id)) {
                         val playedItem = p.currentMediaItem
                         bgPool.execute {
@@ -835,9 +937,17 @@ object PlayerHolder {
                 if (playbackState == Player.STATE_READY) {
                     val id = p.currentMediaItem?.mediaId
                     id?.let { idleRecoveryAttempts.remove(it) }
+                    id?.let {
+                        exhaustedSourceIds.remove(it)
+                        sourceFormatChangePending.remove(it)
+                    }
                     val recovery = id?.let { pendingErrorRecoveries.remove(it) }
                     if (id != null && RecoveryCoordinator.state(id) == RecoveryCoordinator.State.RECOVERING) {
-                        RecoveryCoordinator.markRecovered(id)
+                        RecoveryCoordinator.markRecovered(
+                            id,
+                            p.currentPosition.coerceAtLeast(0L),
+                            (p.bufferedPosition - p.currentPosition).coerceAtLeast(0L)
+                        )
                     }
                     if (id != null && recovery != null) {
                         val duration = p.duration.takeIf { it > 0L && it != C.TIME_UNSET }
@@ -853,7 +963,10 @@ object PlayerHolder {
                         // here can trigger a second buffer cycle after READY, which sounds
                         // like a brief pause even though the stream has recovered.
                         lastKnownPositionMs[id] = targetPosition
-                        if (recovery.shouldResume && lastPlayIntent && !p.playWhenReady) p.play()
+                        val recoveryStillCurrent = PlaybackCommandLedger.mayRecover(
+                            id, recovery.queueGeneration, p.playWhenReady || lastPlayIntent
+                        )
+                        if (recovery.shouldResume && recoveryStillCurrent && lastPlayIntent && !p.playWhenReady) p.play()
                     }
                 }
                 if (playbackState == Player.STATE_IDLE) {
@@ -937,6 +1050,9 @@ object PlayerHolder {
                                                 GenomeXRecommendationEngine.belongsToActiveSession(app, sessionTrackId)
                                             ) {
                                                 p.addMediaItems(refillItems)
+                                                PlaybackCommandLedger.recordQueueMutation(
+                                                    p, "discovery", "genome_session_refill"
+                                                )
                                                 Log.i("GenomeX", "session refill added=" + refillItems.size + " queued=" + p.mediaItemCount)
                                             }
                                         } finally {
@@ -994,49 +1110,111 @@ object PlayerHolder {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                val failedItem = p.currentMediaItem
-                val id = failedItem?.mediaId
+                val failedItem = p.currentMediaItem ?: return
+                val id = failedItem.mediaId
                 Log.e("KiloAuto", "PLAYER_ERROR code=${error.errorCode} name=${error.errorCodeName} " +
                     "id=${id.orEmpty()} uri=${safeUriForLog(failedItem?.localConfiguration?.uri)} " +
                     "state=${p.playbackState} playWhenReady=${p.playWhenReady}", error)
                 PlaybackStartupMetrics.playerError(id, error.errorCode, error.errorCodeName)
-                if (id == null || failedItem == null) return
                 pendingErrorRecoveries.remove(id)
                 Log.e("KiloPlayback", "Playback error ${error.errorCodeName} code=${error.errorCode} for $id", error)
                 logPlaybackSnapshot("playerError")
+                val errorQueueGeneration = PlaybackCommandLedger.queueGeneration()
+                val shouldResume = p.playWhenReady || lastPlayIntent
+                val httpStatus = httpStatusCode(error)
+                val errorCategory = playbackErrorCategory(error, httpStatus)
+                if (!PlaybackCommandLedger.mayRecover(id, errorQueueGeneration, shouldResume)) {
+                    RecoveryCoordinator.cancelExistingRecovery(id, "recovery_suppressed_by_user_intent_or_queue_change", errorQueueGeneration)
+                    Log.i(
+                        "KiloPlayback",
+                        "playerErrorRecoverySuppressed id=$id category=$errorCategory generation=$errorQueueGeneration " +
+                            "playWhenReady=${p.playWhenReady} lastPlayIntent=$lastPlayIntent"
+                    )
+                    return
+                }
                 // A previous passive refresh may already have marked this track as
                 // recovering. The player-error owner must still replace the rejected
                 // source; the bounded retry counter below prevents recovery loops.
                 RecoveryCoordinator.beginPlayerErrorRecovery(
                     id,
                     "owner=player_error code=${error.errorCode} name=${error.errorCodeName} " +
-                        "carMode=${com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(app)}"
+                        "carMode=${com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(app)}",
+                    errorQueueGeneration,
+                    errorCategory,
+                    p.currentPosition.coerceAtLeast(0L)
+                ).also { started ->
+                    if (!started) {
+                        Log.i("KiloPlayback", "duplicatePlayerErrorRecoverySuppressed id=$id category=$errorCategory")
+                        return
+                    }
+                }
+                PlaybackDiagnostics.record(
+                    "player_error_classified", id,
+                    "category=$errorCategory httpStatus=${httpStatus ?: -1} " +
+                        "playWhenReady=${p.playWhenReady} generation=$errorQueueGeneration"
                 )
+                // Read in-flight first: refresh success records the replacement before it
+                // clears inFlight, so one of these checks will preserve a just-refreshed URL.
                 val keepRefreshedSource = !id.startsWith("radio:") &&
                     StreamLeaseRefreshCoordinator.hasFreshReplacement(id)
-                if (!id.startsWith("radio:") && !keepRefreshedSource) {
-                    PlaybackRepository.invalidateResolvedStream(id)
-                    LosslessSource.invalidate(id)
-                    FastStream.invalidate(id)
-                    QueuePreloader.forget(id)
-                } else if (keepRefreshedSource) {
-                    Log.i("KiloPlayback", "playerErrorUsingFreshReplacement id=$id; resolver cache retained")
+                val rejectedLease = httpStatus == 403 || httpStatus == 410
+                if (keepRefreshedSource) {
+                    Log.i("KiloPlayback", "playerErrorUsingFreshReplacement id=$id; current lease is already distinct")
+                }
+                if (sourceFormatChangePending.contains(id)) {
+                    Log.i("KiloPlayback", "playerErrorRebuildRequired id=$id reason=alternate_container_or_format")
                 }
                 val attempt = retryAttempts.merge(id, 1) { previous, increment -> previous + increment } ?: 1
-                val retryDelay = (100L * (attempt - 1)).takeIf { attempt <= MAX_PLAYBACK_RETRIES }
+                val retryLimit = when (errorCategory) {
+                    "rejected_http_403", "expired_http_410", "network", "transient_http_401", "transient_http_429" -> MAX_PLAYBACK_RETRIES + 1
+                    "decoder", "io" -> 1
+                    else -> 1
+                }
+                val retryDelay = when (attempt) {
+                    1 -> 150L
+                    2 -> 400L
+                    3 -> 1_200L
+                    4 -> 3_000L
+                    else -> null
+                }.takeIf { attempt <= retryLimit }
                 val failureText = generateSequence<Throwable>(error) { it.cause }
                     .mapNotNull { it.message }
                     .joinToString(" ")
                 // A resolver miss can recover on the NewPipe/legacy pass after invalidation.
                 // Only YouTube's explicit unavailable response should skip immediately.
                 val streamUnavailable = failureText.contains("video is unavailable", ignoreCase = true)
-                val shouldResume = p.playWhenReady || lastPlayIntent
+                val transientHttp = httpStatus == 401 || httpStatus == 429
+                val hardClientHttp = httpStatus != null && httpStatus in 400..499 &&
+                    !rejectedLease && !transientHttp
+                val rejectedFallbacksExhausted = rejectedLease &&
+                    exhaustedSourceIds.contains(id) && networkHealthyForSkip()
                 val retryPositionMs = maxOf(
                     lastKnownPositionMs[id] ?: 0L,
                     p.currentPosition.coerceAtLeast(0L)
                 )
                 val currentIndex = p.currentMediaItemIndex
-                if (streamUnavailable || retryDelay == null) {
+                val terminalOutputError = errorCategory == "audio_sink" || errorCategory == "permission"
+                if (terminalOutputError) {
+                    RecoveryCoordinator.markFailed(id, "terminal_$errorCategory")
+                    Log.e(
+                        "KiloPlayback",
+                        "automaticRecoverySkipped id=$id category=$errorCategory; player and queue left untouched"
+                    )
+                    return
+                }
+                if (streamUnavailable || hardClientHttp || rejectedFallbacksExhausted || retryDelay == null) {
+                    val confirmedPermanent = streamUnavailable || hardClientHttp || rejectedFallbacksExhausted
+                    if (!confirmedPermanent) {
+                        retryAttempts.remove(id)
+                        RecoveryCoordinator.markFailed(id, "soft_failure_waiting_for_source_or_network:$errorCategory")
+                        Log.w(
+                            "KiloPlayback",
+                            "softFailureNoQueueAdvance id=$id category=$errorCategory http=${httpStatus ?: -1} " +
+                                "alternativesExhausted=${exhaustedSourceIds.contains(id)} " +
+                                "network=${NetworkHealthMonitor.snapshot().grade}"
+                        )
+                        return
+                    }
                     unavailableTrackIds.add(id)
                     retryAttempts.remove(id)
                     val nextIndex = (1 until p.mediaItemCount)
@@ -1046,21 +1224,50 @@ object PlayerHolder {
                             nextId != id && nextId !in unavailableTrackIds
                         }
                     if (nextIndex != null) {
-                        Log.w("KiloPlayback", "Skipping unavailable stream id=$id; continuing at queue index=$nextIndex")
-                        RecoveryCoordinator.markFailed(id, "unavailable_stream_skipped")
+                        Log.w(
+                            "KiloPlayback",
+                            "Skipping confirmed unavailable source id=$id category=$errorCategory; " +
+                                "continuing at queue index=$nextIndex"
+                        )
+                        RecoveryCoordinator.markFailed(id, "${errorCategory}_skipped_after_fallback_exhaustion")
                         MediaSourceAudit.beforeMutation("prepare:skip_unavailable", p, id)
                         p.seekTo(nextIndex, 0L)
                         p.prepare()
                         if (shouldResume) p.play()
                     } else {
-                        Log.e("KiloPlayback", "No other playable queue item after stream failure id=$id")
+                        Log.e("KiloPlayback", "No other playable queue item after confirmed unavailable source id=$id")
                         RecoveryCoordinator.markFailed(id, "unavailable_stream_and_no_queue_candidate")
                         p.pause()
                     }
                     return
                 }
-                Handler(Looper.getMainLooper()).postDelayed({
-                    if (p.currentMediaItem?.mediaId == id && p.currentMediaItemIndex == currentIndex) {
+                val retryDeadlineElapsed = SystemClock.elapsedRealtime() + REJECTED_SOURCE_REFRESH_WAIT_MS
+                val retryHandler = Handler(Looper.getMainLooper())
+                val retryRunnable = object : Runnable {
+                    private var refreshWaitLogged = false
+
+                    override fun run() {
+                    if (p.currentMediaItem?.mediaId != id || p.currentMediaItemIndex != currentIndex ||
+                        !PlaybackCommandLedger.mayRecover(id, errorQueueGeneration, p.playWhenReady || lastPlayIntent)
+                    ) {
+                        RecoveryCoordinator.cancelExistingRecovery(
+                            id,
+                            "track_queue_or_intent_changed_before_retry",
+                            errorQueueGeneration
+                        )
+                        return
+                    }
+                    if (StreamLeaseRefreshCoordinator.isRefreshInFlight(id) &&
+                        SystemClock.elapsedRealtime() < retryDeadlineElapsed
+                    ) {
+                        if (!refreshWaitLogged) {
+                            refreshWaitLogged = true
+                            Log.i("KiloPlayback", "errorRecoveryAwaitingSourceRefresh id=$id generation=$errorQueueGeneration")
+                        }
+                        retryHandler.postDelayed(this, REJECTED_SOURCE_REFRESH_POLL_MS)
+                        return
+                    }
+                    runCatching {
                         val resumePositionMs = maxOf(
                             retryPositionMs,
                             lastKnownPositionMs[id] ?: 0L
@@ -1070,11 +1277,21 @@ object PlayerHolder {
                         // fresh stream, while preserving the queue and the listener's
                         // last confirmed position.
                         val shouldResumeNow = shouldResume && (p.playWhenReady || lastPlayIntent)
-                        pendingErrorRecoveries[id] = ErrorRecovery(resumePositionMs, shouldResumeNow, attempt)
+                        pendingErrorRecoveries[id] = ErrorRecovery(
+                            resumePositionMs, shouldResumeNow, attempt, errorQueueGeneration
+                        )
                         val originalUri = failedItem.localConfiguration?.uri
                         val retryItem = failedItem.buildUpon().apply {
                             if (originalUri?.scheme == "vybe") setUri(originalUri)
                         }.build()
+                        if (!RecoveryCoordinator.markAttemptDispatched(
+                                id, errorQueueGeneration, "player_error"
+                            )
+                        ) {
+                            pendingErrorRecoveries.remove(id)
+                            Log.i("KiloPlayback", "errorRecoveryDispatchSuppressed id=$id generation=$errorQueueGeneration")
+                            return
+                        }
                         MediaSourceAudit.beforeMutation("replace_media_item:player_error_recovery", p, id)
                         p.replaceMediaItem(currentIndex, retryItem)
                         p.seekTo(currentIndex, resumePositionMs)
@@ -1088,10 +1305,13 @@ object PlayerHolder {
                             "errorRecoveryPrepared id=$id attempt=$attempt positionMs=$resumePositionMs " +
                                 "wasPlaying=$shouldResumeNow uriScheme=${originalUri?.scheme.orEmpty()}"
                         )
-                    } else {
-                        RecoveryCoordinator.cancelExistingRecovery(id, "track_or_queue_changed_before_retry")
+                    }.onFailure { recoveryError ->
+                        RecoveryCoordinator.markFailed(id, "player_error_retry_exception:${recoveryError.javaClass.simpleName}")
+                        Log.e("KiloPlayback", "errorRecoveryPrepareFailed id=$id attempt=$attempt", recoveryError)
                     }
-                }, retryDelay)
+                    }
+                }
+                retryHandler.postDelayed(retryRunnable, retryDelay)
             }
         })
         p.addAnalyticsListener(object : AnalyticsListener {
@@ -1139,6 +1359,7 @@ object PlayerHolder {
         previousState: Int
     ) {
         val appContext = analysisAppContext ?: return
+        val queueGeneration = PlaybackCommandLedger.queueGeneration()
         val hadStarted = id == lastAudibleTrackId || id == lastAutoplayReadyTrackId ||
             p.currentPosition > 0L || (lastKnownPositionMs[id] ?: 0L) > 0L
         // A cold-path failure can fall from BUFFERING back to IDLE before the first
@@ -1146,6 +1367,10 @@ object PlayerHolder {
         // leaving the first selection permanently stuck with playWhenReady=true.
         val failedDuringStartup = !hadStarted && previousState == Player.STATE_BUFFERING
         if ((!hadStarted && !failedDuringStartup) || !p.playWhenReady || p.playerError != null || p.mediaItemCount == 0) return
+        if (!PlaybackCommandLedger.mayRecover(id, queueGeneration, p.playWhenReady || lastPlayIntent)) {
+            Log.i("KiloPlayback", "unexpectedIdleRecovery suppressed id=$id reason=user_intent_or_queue_generation")
+            return
+        }
         if (idleRecoveryScheduled.contains(id)) return
         val protection = PlaybackStabilityManager.unexpectedIdleRecoveryDecision(id)
         if (protection.shouldBlock) {
@@ -1161,14 +1386,16 @@ object PlayerHolder {
         if (!RecoveryCoordinator.beginExistingRecovery(
                 id,
                 "owner=unexpected_idle previousState=$previousState carMode=" +
-                    com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(appContext)
+                    com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode.enabled(appContext),
+                queueGeneration,
+                p.currentPosition.coerceAtLeast(0L)
             )
         ) {
             Log.w("KiloPlayback", "unexpectedIdleRecovery suppressed id=$id reason=recovery_already_active")
             return
         }
         if (!idleRecoveryScheduled.add(id)) {
-            RecoveryCoordinator.cancelExistingRecovery(id, "duplicate_idle_recovery_request")
+            RecoveryCoordinator.cancelExistingRecovery(id, "duplicate_idle_recovery_request", queueGeneration)
             return
         }
         val attempt = idleRecoveryAttempts.merge(id, 1) { previous, increment -> previous + increment } ?: 1
@@ -1192,16 +1419,30 @@ object PlayerHolder {
         )
         handler.postDelayed({
             idleRecoveryScheduled.remove(id)
+            if (PlaybackCommandLedger.queueGeneration() != queueGeneration ||
+                !PlaybackCommandLedger.mayRecover(id, queueGeneration, p.playWhenReady || lastPlayIntent)
+            ) {
+                RecoveryCoordinator.cancelExistingRecovery(id, "idle_recovery_intent_or_generation_changed", queueGeneration)
+                return@postDelayed
+            }
             if (p.currentMediaItem?.mediaId != id) {
-                RecoveryCoordinator.cancelExistingRecovery(id, "track_changed_before_idle_recovery")
+                RecoveryCoordinator.cancelExistingRecovery(id, "track_changed_before_idle_recovery", queueGeneration)
                 return@postDelayed
             }
             if (!p.playWhenReady || p.playbackState != Player.STATE_IDLE || p.playerError != null) {
                 if (p.playbackState == Player.STATE_READY && p.isPlaying) {
-                    RecoveryCoordinator.markRecovered(id)
+                    RecoveryCoordinator.markRecovered(
+                        id,
+                        p.currentPosition.coerceAtLeast(0L),
+                        (p.bufferedPosition - p.currentPosition).coerceAtLeast(0L)
+                    )
                 } else {
-                    RecoveryCoordinator.cancelExistingRecovery(id, "idle_recovery_no_longer_applicable")
+                    RecoveryCoordinator.cancelExistingRecovery(id, "idle_recovery_no_longer_applicable", queueGeneration)
                 }
+                return@postDelayed
+            }
+            if (!RecoveryCoordinator.markAttemptDispatched(id, queueGeneration, "idle_guard")) {
+                RecoveryCoordinator.cancelExistingRecovery(id, "idle_recovery_claim_expired", queueGeneration)
                 return@postDelayed
             }
             runCatching {
@@ -1268,12 +1509,29 @@ object PlayerHolder {
     fun refreshStreamForContinuity(ctx: Context, videoId: String): Boolean = runCatching {
         val current = PlaybackRepository.resolvedStream(videoId) ?: FastStream.peek(videoId)
         val currentItag = current?.url?.let { Uri.parse(it).getQueryParameter("itag") }
-        resolveStreamInfo(
+        val resolved = resolveStreamInfo(
             ctx.applicationContext,
             videoId,
             forceRefresh = true,
             preferredItag = currentItag
-        ) != null
+        )
+        if (resolved != null && (current == null || !resolved.sameRequestTuple(current))) {
+            return@runCatching true
+        }
+        if (current != null) {
+            val alternate = FastStream.resolveAlternative(
+                videoId = videoId,
+                fallback = { id -> YtRepo.fetchStream(id) },
+                context = ctx.applicationContext,
+                failed = current,
+                preferredItag = current.itag.takeIf { it > 0 }?.toString() ?: currentItag
+            )
+            if (alternate != null && !alternate.sameRequestTuple(current)) {
+                PlaybackRepository.rememberResolvedStream(videoId, alternate)
+                return@runCatching true
+            }
+        }
+        false
     }.onFailure { error ->
         Log.w("KiloPlayback", "background stream lease refresh failed id=$videoId", error)
     }.getOrDefault(false)
@@ -1317,11 +1575,112 @@ object PlayerHolder {
         return null
     }
 
+    private fun playbackErrorCategory(error: PlaybackException, httpStatus: Int?): String = when {
+        httpStatus == 401 -> "transient_http_401"
+        httpStatus == 429 -> "transient_http_429"
+        httpStatus == 403 -> "rejected_http_403"
+        httpStatus == 410 -> "expired_http_410"
+        httpStatus != null && httpStatus in 400..499 -> "terminal_http_$httpStatus"
+        error.errorCodeName.contains("NO_PERMISSION", ignoreCase = true) ||
+            error.errorCodeName.contains("CLEARTEXT_NOT_PERMITTED", ignoreCase = true) -> "permission"
+        error.errorCodeName.contains("AUDIO_TRACK", ignoreCase = true) ||
+            error.errorCodeName.contains("AUDIO_SINK", ignoreCase = true) -> "audio_sink"
+        error.errorCodeName.contains("DECODER", ignoreCase = true) ||
+            error.errorCodeName.contains("DECODING", ignoreCase = true) ||
+            error.errorCodeName.contains("PARSING_CONTAINER", ignoreCase = true) -> "decoder"
+        error.errorCodeName.contains("NETWORK", ignoreCase = true) ||
+            error.errorCodeName.contains("TIMEOUT", ignoreCase = true) -> "network"
+        error.errorCodeName.startsWith("ERROR_CODE_IO", ignoreCase = true) -> "io"
+        else -> "other"
+    }
+
     private fun invalidateStreamSource(videoId: String) {
         PlaybackRepository.invalidateResolvedStream(videoId)
         LosslessSource.invalidate(videoId)
         FastStream.invalidate(videoId)
         QueuePreloader.forget(videoId)
+    }
+
+    fun sourceAlternativesExhausted(videoId: String): Boolean = exhaustedSourceIds.contains(videoId)
+
+    private fun markSourceAlternativesExhausted(dataSpec: DataSpec) {
+        val mediaId = mediaIdFromDataSpec(dataSpec) ?: return
+        if (sourceFormatChangePending.contains(mediaId)) return
+        exhaustedSourceIds.add(mediaId)
+        Log.w("KiloPlayback", "allSameFormatAlternativesExhausted id=$mediaId position=${dataSpec.position}")
+    }
+
+    private fun networkHealthyForSkip(): Boolean {
+        val network = NetworkHealthMonitor.snapshot()
+        return network.validated && network.grade !in setOf(NetworkGrade.POOR, NetworkGrade.CRITICAL)
+    }
+
+    private fun mediaIdFromDataSpec(dataSpec: DataSpec): String? {
+        dataSpec.uri.takeIf { it.scheme.equals("vybe", ignoreCase = true) }
+            ?.lastPathSegment?.takeIf(String::isNotBlank)?.let { return it }
+        val key = dataSpec.key.orEmpty()
+        if (key.startsWith("yt:")) return key.removePrefix("yt:").substringBefore(':').takeIf(String::isNotBlank)
+        return Regex("^(.+?)(?:-[0-9a-fA-F]{8})?-[^-]+-full-v\\d+$")
+            .matchEntire(key)?.groupValues?.getOrNull(1)?.takeIf(String::isNotBlank)
+    }
+
+    private fun streamForDataSpec(dataSpec: DataSpec): StreamInfo? {
+        val mediaId = mediaIdFromDataSpec(dataSpec) ?: return null
+        return PlaybackRepository.resolvedStream(mediaId) ?: FastStream.peek(mediaId)
+    }
+
+    /** Resolve an alternate while retaining the lease that produced the rejected HTTP request. */
+    private fun resolveAlternativeForDataSource(
+        ctx: Context,
+        dataSpec: DataSpec,
+        failed: StreamInfo
+    ): StreamInfo? {
+        val mediaId = mediaIdFromDataSpec(dataSpec) ?: return null
+        val rejected = failed.copy(videoId = mediaId, url = dataSpec.uri.toString())
+        val replacement = runCatching {
+            FastStream.resolveAlternative(
+                videoId = mediaId,
+                fallback = { id -> YtRepo.fetchStream(id) },
+                context = ctx.applicationContext,
+                failed = rejected,
+                preferredItag = rejected.itag.takeIf { it > 0 }?.toString()
+            )
+        }.onFailure { error ->
+            Log.w("KiloPlayback", "alternateSourceResolutionFailed id=$mediaId", error)
+        }.getOrNull()
+
+        if (replacement == null) {
+            exhaustedSourceIds.add(mediaId)
+            Log.w("KiloPlayback", "alternateSourceExhausted id=$mediaId position=${dataSpec.position}")
+            return null
+        }
+
+        PlaybackRepository.rememberResolvedStream(mediaId, replacement)
+        val current = PlaybackRepository.resolvedStream(mediaId) ?: replacement
+        exhaustedSourceIds.remove(mediaId)
+        val rejectedItag = rejected.itag.takeIf { it > 0 }
+            ?: Uri.parse(rejected.url).getQueryParameter("itag")?.toIntOrNull()
+        val replacementItag = current.itag.takeIf { it > 0 }
+            ?: Uri.parse(current.url).getQueryParameter("itag")?.toIntOrNull()
+        val sameContainer = rejected.mime.isNotBlank() && current.mime.isNotBlank() &&
+            rejected.mime.substringBefore(';').equals(current.mime.substringBefore(';'), ignoreCase = true)
+        val sameFormat = sameContainer || (rejectedItag != null && rejectedItag == replacementItag)
+        if (!sameFormat) {
+            sourceFormatChangePending.add(mediaId)
+            Log.i(
+                "KiloPlayback",
+                "alternateSourceNeedsMediaSourceRebuild id=$mediaId oldItag=${rejectedItag ?: -1} " +
+                    "newItag=${replacementItag ?: -1} oldMime=${rejected.mime} newMime=${current.mime}"
+            )
+            return null
+        }
+        sourceFormatChangePending.remove(mediaId)
+        Log.i(
+            "KiloPlayback",
+            "alternateSourceReady id=$mediaId client=${current.clientId} itag=${current.itag} " +
+                "generation=${current.generation} position=${dataSpec.position}"
+        )
+        return current
     }
 
     /**
@@ -1330,33 +1689,13 @@ object PlayerHolder {
      * HTTP URI instead.
      */
     fun refreshRejectedStreamSource(dataSpec: DataSpec): String? {
-        val videoId = dataSpec.uri
-            .takeIf { it.scheme.equals("vybe", ignoreCase = true) }
-            ?.lastPathSegment
-            ?.takeIf { it.isNotBlank() }
-            ?: dataSpec.key?.let { key ->
-                Regex("^(.+?)(?:-[0-9a-fA-F]{8})?-[^-]+-full-v\\d+$")
-                    .matchEntire(key)
-                    ?.groupValues
-                    ?.getOrNull(1)
-            }
-            ?.takeIf { it.isNotBlank() }
-            ?: return null
-        if (StreamLeaseRefreshCoordinator.hasFreshReplacement(videoId)) {
-            Log.i(
-                "KiloPlayback",
-                "rejectedOldStream id=$videoId keepingRecentlyRefreshedSource=true " +
-                    "uriScheme=${dataSpec.uri.scheme.orEmpty()} keyPresent=${!dataSpec.key.isNullOrBlank()}"
-            )
-            return videoId
-        }
-        invalidateStreamSource(videoId)
-        // Invalidating the rejected lease is correct for the next Media3 load, but the
-        // currently playing item may still have seconds of buffered audio. Resolve a
-        // replacement now in the background so onPlayerError can reuse it if that buffer
-        // later runs dry instead of starting a cold resolver request at the interruption.
-        StreamLeaseRefreshCoordinator.refreshRejectedSource(videoId)
-        Log.i("KiloPlayback", "rejectedSourceRefreshQueued id=$videoId; active buffered source remains untouched")
+        val videoId = mediaIdFromDataSpec(dataSpec) ?: return null
+        Log.i(
+            "KiloPlayback",
+            "rejectedSourceLoadFailed id=$videoId alternativesExhausted=${exhaustedSourceIds.contains(videoId)} " +
+                "formatChangePending=${sourceFormatChangePending.contains(videoId)} position=${dataSpec.position}; " +
+                "keeping last known lease for same-item rebuild"
+        )
         return videoId
     }
 
@@ -1366,6 +1705,7 @@ object PlayerHolder {
         forceRefresh: Boolean = false,
         preferredItag: String? = null
     ): StreamInfo? {
+        StreamRequestDiagnostics.enabled = BuildConfig.DEBUG
         if (forceRefresh) {
             // Bypass provider URL caches, but retain the repository's current valid lease
             // until the replacement has been fully resolved and validated.
@@ -1450,17 +1790,10 @@ object PlayerHolder {
                 "expiresAtMs=${info.expiresAtEpochMs} ttlMs=${(info.expiresAtEpochMs - System.currentTimeMillis()).takeIf { info.expiresAtEpochMs > 0L } ?: -1L} " +
                 "resolveMs=${SystemClock.elapsedRealtime() - resolveStartedAt} rangeStart=${spec.position}"
         )
-        val refererHeaders = if (streamHost.endsWith("youtube.com") || streamHost.endsWith("googlevideo.com")) {
-            mapOf(
-                "Referer" to "https://www.youtube.com/",
-                "Origin" to "https://www.youtube.com",
-                "Accept-Encoding" to "identity"
-            )
-        } else emptyMap()
         return spec.buildUpon()
             .setUri(Uri.parse(info.url))
             .setKey(AudioCache.keyFor(videoId, info.url))
-            .setHttpRequestHeaders(spec.httpRequestHeaders + info.requestHeaders + refererHeaders + mapOf("User-Agent" to info.userAgent))
+            .setHttpRequestHeaders(spec.httpRequestHeaders + StreamRequestPolicy.headers(info))
             .build()
     }
 }
@@ -1808,7 +2141,10 @@ class VybeMediaService : MediaLibraryService() {
                 backgroundPlaybackCoordinator?.snapshot("close_app")
                 SessionStore.save(it)
                 MediaSourceAudit.beforeMutation("stop:close_app", it)
-                it.stop()
+                backgroundPlaybackCoordinator?.stop() ?: run {
+                    PlaybackCommandLedger.recordIntent(it, PlaybackCommandLedger.Intent.STOP, "service", "close_app")
+                    it.stop()
+                }
             }
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -3331,17 +3667,22 @@ class VybeMediaService : MediaLibraryService() {
                 !autoPlayOnCarConnectHandled
             ) {
                 autoPlayOnCarConnectHandled = true
-                AndroidAutoRepository.resumeOnCarConnect(
-                    fallbackItems = {
+                // SessionStore is file-backed. Read it on the service IO executor, then
+                // hand the immutable fallback queue to the shared-player looper gateway.
+                io.execute {
+                    val fallback = runCatching {
                         val restored = SessionStore.load()
                         val items = restored?.items.orEmpty().ifEmpty { SessionStore.recentSongs().map { it.toMediaItem() } }
                         val index = restored?.index?.coerceIn(0, items.lastIndex.coerceAtLeast(0)) ?: 0
                         items to (index to (restored?.posMs ?: 0L))
-                    },
-                    beforeSet = { player -> MediaSourceAudit.beforeMutation("set_media_items:session_restore", player) },
-                    beforePrepare = { player -> MediaSourceAudit.beforeMutation("prepare:session_restore", player) },
-                    onSaved = SessionStore::save
-                )
+                    }.getOrDefault(emptyList<MediaItem>() to (0 to 0L))
+                    AndroidAutoRepository.resumeOnCarConnect(
+                        fallbackItems = { fallback },
+                        beforeSet = { player -> MediaSourceAudit.beforeMutation("set_media_items:session_restore", player) },
+                        beforePrepare = { player -> MediaSourceAudit.beforeMutation("prepare:session_restore", player) },
+                        onSaved = SessionStore::save
+                    )
+                }
             }
             val commands = MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS
                 .buildUpon()
@@ -3353,6 +3694,16 @@ class VybeMediaService : MediaLibraryService() {
             return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
                 .setAvailableSessionCommands(commands)
                 .build()
+        }
+
+        @Suppress("DEPRECATION")
+        override fun onPlayerCommandRequest(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            playerCommand: Int
+        ): Int {
+            PlaybackCommandLedger.recordControllerRequest(session.player, controller.packageName, playerCommand)
+            return super.onPlayerCommandRequest(session, controller, playerCommand)
         }
 
         override fun onPostConnect(session: MediaSession, controller: MediaSession.ControllerInfo) {

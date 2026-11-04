@@ -7,9 +7,13 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.source.LoadEventInfo
+import androidx.media3.exoplayer.source.MediaLoadData
 import com.example.kilo.androidauto.performance.AndroidAutoPerformanceMode
 import com.example.kilo.networkmonitor.NetworkHealthMonitor
+import com.example.kilo.playback.stability.PlaybackCommandLedger
 import com.example.kilo.playbackrecovery.PlaybackDiagnostics
 import com.example.kilo.playback.stability.RecoveryCoordinator
 import com.example.kilo.playback.stability.MediaSourceProtectionLayer
@@ -18,6 +22,7 @@ import com.example.kilo.playback.stability.PlaybackStabilityManager
 import com.example.kilo.playback.stability.RecoveryProtectionLayer
 import com.example.kilo.playback.stability.MediaSourceAudit
 import com.example.kilo.playbackoptimization.SourceLifecycleManager
+import java.io.IOException
 
 /**
  * Read-only observer around KILO's shared player. It is attached to the same player used by
@@ -91,6 +96,7 @@ internal class PlaybackStabilityTracer(context: Context) : Player.Listener, Anal
                 "stability_state", id,
                 "from=${stateName(old)} to=$stateName positionMs=${active.currentPosition} " +
                     "bufferedMs=$bufferedMs playWhenReady=${active.playWhenReady} isPlaying=${active.isPlaying} " +
+                    "suppression=${active.playbackSuppressionReason} queueGeneration=${PlaybackCommandLedger.queueGeneration()} " +
                     "sourceState=$sourceState sourceValid=$sourceValid recovery=${RecoveryCoordinator.state(id)} " +
                     "queueIndex=${active.currentMediaItemIndex} queueCount=${active.mediaItemCount} " +
                     "network=${NetworkHealthMonitor.snapshot().transport}/${NetworkHealthMonitor.snapshot().grade} " +
@@ -146,7 +152,11 @@ internal class PlaybackStabilityTracer(context: Context) : Player.Listener, Anal
         }
 
         if (playbackState == Player.STATE_READY && active.playWhenReady) {
-            RecoveryCoordinator.markRecovered(id)
+            RecoveryCoordinator.markRecovered(
+                id,
+                active.currentPosition.coerceAtLeast(0L),
+                (active.bufferedPosition - active.currentPosition).coerceAtLeast(0L)
+            )
         }
     }
 
@@ -168,6 +178,64 @@ internal class PlaybackStabilityTracer(context: Context) : Player.Listener, Anal
             "code=${error.errorCode} name=${error.errorCodeName} thread=${Thread.currentThread().name}"
         )
         PlaybackPerformanceDashboard.logSnapshot("player_error:${error.errorCodeName}")
+    }
+
+    override fun onAudioUnderrun(
+        eventTime: AnalyticsListener.EventTime,
+        bufferSize: Int,
+        bufferSizeMs: Long,
+        elapsedSinceLastFeedMs: Long
+    ) {
+        val active = player ?: return
+        val id = active.currentMediaItem?.mediaId.orEmpty()
+        PlaybackDiagnostics.record(
+            "audio_underrun", id,
+            "positionMs=${active.currentPosition} bufferedAheadMs=${(active.bufferedPosition - active.currentPosition).coerceAtLeast(0L)} " +
+                "bufferSize=$bufferSize bufferSizeMs=$bufferSizeMs elapsedSinceFeedMs=$elapsedSinceLastFeedMs " +
+                "playWhenReady=${active.playWhenReady} state=${stateName(active.playbackState)} " +
+                "generation=${PlaybackCommandLedger.queueGeneration()}"
+        )
+    }
+
+    override fun onLoadError(
+        eventTime: AnalyticsListener.EventTime,
+        loadEventInfo: LoadEventInfo,
+        mediaLoadData: MediaLoadData,
+        error: IOException,
+        wasCanceled: Boolean
+    ) {
+        val active = player ?: return
+        val id = active.currentMediaItem?.mediaId.orEmpty()
+        val status = generateSequence<Throwable>(error) { it.cause }
+            .mapNotNull { (it as? HttpDataSource.InvalidResponseCodeException)?.responseCode }
+            .firstOrNull()
+        PlaybackDiagnostics.record(
+            "load_error_observed", id,
+            "httpStatus=${status ?: -1} error=${error.javaClass.simpleName} cancelled=$wasCanceled " +
+                "dataType=${mediaLoadData.dataType} loadTask=${loadEventInfo.loadTaskId} " +
+                "positionMs=${active.currentPosition} state=${stateName(active.playbackState)} " +
+                "generation=${PlaybackCommandLedger.queueGeneration()} recoveryOwner=PlayerHolder"
+        )
+    }
+
+    override fun onAudioSinkError(eventTime: AnalyticsListener.EventTime, audioSinkError: Exception) {
+        val active = player ?: return
+        PlaybackDiagnostics.record(
+            "audio_sink_error_observed",
+            active.currentMediaItem?.mediaId.orEmpty(),
+            "error=${audioSinkError.javaClass.simpleName} positionMs=${active.currentPosition} " +
+                "state=${stateName(active.playbackState)} recoveryOwner=PlayerHolder"
+        )
+    }
+
+    override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) {
+        val active = player ?: return
+        PlaybackDiagnostics.record(
+            "playback_suppression_changed",
+            active.currentMediaItem?.mediaId.orEmpty(),
+            "reason=$playbackSuppressionReason playWhenReady=${active.playWhenReady} " +
+                "isPlaying=${active.isPlaying} state=${stateName(active.playbackState)}"
+        )
     }
 
     override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) {
