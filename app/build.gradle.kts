@@ -14,8 +14,8 @@ android {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 34
-        versionName = "3.4.0"
+        versionCode = 345
+        versionName = "3.4.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -111,6 +111,5 @@ androidComponents {
         implementation("androidx.media3:media3-session:1.4.1")
         implementation("androidx.media3:media3-ui:1.4.1")
         implementation("io.coil-kt:coil-compose:2.7.0")
-        implementation("androidx.browser:browser:1.8.0")
         implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.5")
     }

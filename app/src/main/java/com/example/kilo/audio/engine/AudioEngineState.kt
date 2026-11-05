@@ -9,6 +9,9 @@ data class AudioEngineState(
     val effectsActive: Boolean = false,
     val limiterActive: Boolean = false,
     val analysisApplied: Boolean = false,
+    val loudnessMode: String = "NORMAL",
+    val audioMode: String = "BALANCED",
+    val currentGainDb: Float = 0f,
     val analyzer: AudioAnalyzer = AudioAnalyzer(false, false),
     val message: String = "Original tone with a level boost"
 )

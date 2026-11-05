@@ -16,10 +16,13 @@ import com.example.kilo.audio.effects.EqualizerController
 import com.example.kilo.audio.effects.ExciterController
 import com.example.kilo.audio.effects.LoudnessController
 import com.example.kilo.audio.effects.DynamicsProcessingSession
+import com.example.kilo.audio.effects.LoudnessEnhancerSession
 import com.example.kilo.audio.effects.VirtualizerController
 import com.example.kilo.audio.profiles.SoundProfileRepository
 import com.example.kilo.audio.dsp.SpatialEnhancer
 import com.example.kilo.audio.dsp.StereoWidener
+import com.example.kilo.audio.dsp.LoudnessManager
+import com.example.kilo.audio.dsp.AudioModeManager
 import com.example.kilo.audioanalysis.TrackAnalysisEntity
 import java.util.concurrent.Executor
 
@@ -30,6 +33,8 @@ class AudioSessionManager(
     private val handler: Handler,
     private val backgroundExecutor: Executor,
     private val profiles: SoundProfileRepository,
+    private val loudnessManager: LoudnessManager,
+    private val audioModeManager: AudioModeManager,
     private val onState: (AudioEngineState) -> Unit
 ) {
     private val appContext = context.applicationContext
@@ -37,7 +42,7 @@ class AudioSessionManager(
         routeSnapshot = route
         refresh()
     }
-    private val pipeline = AudioPipeline(profiles)
+    private val pipeline = AudioPipeline(profiles, loudnessManager)
     private val health = AudioHealthMonitor()
     private val eq = EqualizerController()
     private val loudness = LoudnessController()
@@ -47,6 +52,9 @@ class AudioSessionManager(
     private val spatialEnhancer = SpatialEnhancer(appContext)
     private val stereoWidener = StereoWidener()
     private var dynamics: DynamicsProcessingSession? = null
+    private var loudnessEnhancer: LoudnessEnhancerSession? = null
+    private var dynamicsAttemptedSessionId = 0
+    private var loudnessEnhancerAttemptedSessionId = 0
     private var activeSessionId = 0
     private var routeSnapshot = AudioOutputRoute()
     private var activeAnalysis: TrackAnalysisEntity? = null
@@ -111,6 +119,8 @@ class AudioSessionManager(
                 output = routeSnapshot,
                 selectedProfileId = selected.id,
                 activeProfileTitle = selected.title,
+                loudnessMode = loudnessManager.mode().name,
+                audioMode = audioModeManager.mode().name,
                 message = if (selected.id == SoundProfileRepository.ORIGINAL) {
                     "Original tone with a level boost; peak limiting applies during playback"
                 } else {
@@ -122,10 +132,10 @@ class AudioSessionManager(
         if (activeSessionId != sessionId) {
             releaseEffects()
             activeSessionId = sessionId
+            dynamicsAttemptedSessionId = 0
         }
 
-        val limiterAvailable = Build.VERSION.SDK_INT >= 28
-        val plan = pipeline.createPlan(routeSnapshot, activeAnalysis, limiterAvailable)
+        val plan = pipeline.createPlan(routeSnapshot, activeAnalysis, Build.VERSION.SDK_INT >= 28)
         if (plan.transparentMode) {
             releaseEffects()
             activeSessionId = sessionId
@@ -139,6 +149,9 @@ class AudioSessionManager(
                 limiterActive = false,
                 analysisApplied = false,
                 analyzer = analyzer,
+                loudnessMode = loudnessManager.mode().name,
+                audioMode = audioModeManager.mode().name,
+                currentGainDb = 0f,
                 message = plan.description
             )
             AudioMetrics.profileApplied(routeSnapshot.kind.label, plan.activeProfile.title, sessionId, false, "none (original)")
@@ -146,14 +159,23 @@ class AudioSessionManager(
             return
         }
 
-        var dynamicsReady = dynamics != null
-        if (Build.VERSION.SDK_INT >= 28 && dynamics == null) {
+        if (Build.VERSION.SDK_INT >= 28 && dynamics == null && dynamicsAttemptedSessionId != sessionId) {
+            dynamicsAttemptedSessionId = sessionId
             runCatching { createDynamics(sessionId) }
-                .onSuccess { dynamics = it; dynamicsReady = true }
+                .onSuccess { dynamics = it }
                 .onFailure { health.onEffectFailure("DynamicsProcessing", it) }
         }
+        if (dynamics == null && loudnessEnhancer == null && loudnessEnhancerAttemptedSessionId != sessionId && Build.VERSION.SDK_INT >= 19) {
+            loudnessEnhancerAttemptedSessionId = sessionId
+            runCatching { LoudnessEnhancerSession(sessionId) }
+                .onSuccess { effect ->
+                    if (effect.hasControl) loudnessEnhancer = effect else effect.release()
+                }
+                .onFailure { health.onEffectFailure("LoudnessEnhancer", it) }
+        }
 
-        val effectivePlan = pipeline.createPlan(routeSnapshot, activeAnalysis, dynamicsReady)
+        val safeGainStageAvailable = dynamics != null || loudnessEnhancer != null
+        val effectivePlan = pipeline.createPlan(routeSnapshot, activeAnalysis, safeGainStageAvailable)
         val activeEffects = mutableListOf<String>()
         if (dynamics != null) {
             runCatching {
@@ -167,8 +189,16 @@ class AudioSessionManager(
                     activeEffects += "${"%.1f".format(effectivePlan.inputGainDb)}dB level"
                 }
             }.onFailure { health.onEffectFailure("DynamicsProcessing.apply", it) }
-        } else if (effectivePlan.eqGainsDb.take(3).any { it > 0f }) {
-            if (fallbackBass.attach(sessionId, 240)) activeEffects += "bass (fallback)"
+        } else {
+            if (loudnessEnhancer != null) {
+                runCatching {
+                    loudnessEnhancer?.apply(loudness.safeInputGain(effectivePlan.inputGainDb, effectivePlan.limiterEnabled))
+                    activeEffects += "bounded loudness matching"
+                }.onFailure { health.onEffectFailure("LoudnessEnhancer.apply", it) }
+            }
+            if (effectivePlan.eqGainsDb.take(3).any { it > 0f }) {
+                if (fallbackBass.attach(sessionId, 240)) activeEffects += "bass (fallback)"
+            }
         }
 
         val stereoStrength = stereoWidener.virtualizerStrength(
@@ -191,10 +221,14 @@ class AudioSessionManager(
             limiterActive = limiterActive,
             analysisApplied = effectivePlan.analysisUsed,
             analyzer = AudioAnalyzer(dynamics != null, spatialEnhancer.platformSpatializerAvailable, exciter.supported),
+            loudnessMode = loudnessManager.mode().name,
+            audioMode = audioModeManager.mode().name,
+            currentGainDb = effectivePlan.inputGainDb,
             message = when {
                 dynamics != null && limiterActive && kotlin.math.abs(effectivePlan.inputGainDb) >= 0.1f -> "${effectivePlan.description}; peak protection is active"
                 dynamics != null -> "${effectivePlan.activeProfile.description}; session effects are active"
-                else -> "This device does not expose the full profile; playback remains unchanged"
+                loudnessEnhancer != null -> "Bounded loudness matching is active; this phone does not expose the full EQ profile"
+                else -> "This device does not expose session audio effects; playback remains unchanged"
             }
         )
         AudioMetrics.profileApplied(routeSnapshot.kind.label, effectivePlan.activeProfile.title, sessionId, limiterActive, activeEffects.joinToString().ifBlank { "none" })
@@ -209,6 +243,10 @@ class AudioSessionManager(
     private fun releaseEffects() {
         runCatching { dynamics?.release() }
         dynamics = null
+        runCatching { loudnessEnhancer?.release() }
+        loudnessEnhancer = null
+        dynamicsAttemptedSessionId = 0
+        loudnessEnhancerAttemptedSessionId = 0
         fallbackBass.release()
         virtualizer.release()
     }

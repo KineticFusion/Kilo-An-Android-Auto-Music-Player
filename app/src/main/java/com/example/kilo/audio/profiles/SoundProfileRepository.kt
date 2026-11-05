@@ -36,11 +36,11 @@ class SoundProfileRepository(private val preferences: SharedPreferences) {
         val selected = profiles.firstOrNull { it.id == selectedId() } ?: profiles.first()
         if (selected.id != ORIGINAL) return selected
         val routeGain = when (route.kind) {
-            AudioOutputKind.CAR_BLUETOOTH, AudioOutputKind.ANDROID_AUTO -> 4.0f
-            AudioOutputKind.BLUETOOTH_SPEAKER -> 3.0f
-            AudioOutputKind.EARBUDS, AudioOutputKind.HEADPHONES, AudioOutputKind.WIRED, AudioOutputKind.USB_DAC -> 3.0f
-            AudioOutputKind.BUILT_IN -> 3.0f
-            AudioOutputKind.OTHER -> 3.0f
+            AudioOutputKind.CAR_BLUETOOTH, AudioOutputKind.ANDROID_AUTO -> 5.0f
+            AudioOutputKind.BLUETOOTH_SPEAKER -> 4.0f
+            AudioOutputKind.EARBUDS, AudioOutputKind.HEADPHONES, AudioOutputKind.WIRED, AudioOutputKind.USB_DAC -> 4.0f
+            AudioOutputKind.BUILT_IN -> 4.0f
+            AudioOutputKind.OTHER -> 4.0f
         }
         return selected.copy(inputGainDb = routeGain, virtualizerStrength = 0, gainsDb = flat)
     }

@@ -10,10 +10,10 @@ class CarAudioProcessor(
     private val bass: DynamicBassProcessor = DynamicBassProcessor(),
     private val loudness: DynamicLoudnessProcessor = DynamicLoudnessProcessor()
 ) {
-    fun plan(requestedId: String, profile: SoundProfile, output: AudioOutputRoute, analysis: TrackAnalysisEntity?, limiterAvailable: Boolean): AudioProfilePlan {
+    fun plan(requestedId: String, profile: SoundProfile, output: AudioOutputRoute, analysis: TrackAnalysisEntity?, limiterAvailable: Boolean, loudnessMode: LoudnessMode = LoudnessMode.NORMAL): AudioProfilePlan {
         val gains = dynamicEq.gains(profile, analysis).zip(bass.gains(profile, analysis)) { a, b -> ((a + b) / 2f).coerceIn(-3f, 2.7f) }
         val carRoute = output.kind == AudioOutputKind.CAR_BLUETOOTH || output.kind == AudioOutputKind.ANDROID_AUTO
-        val inputGain = loudness.inputGain(profile, analysis, limiterAvailable)
+        val inputGain = loudness.inputGain(profile, analysis, limiterAvailable, loudnessMode, output)
         return AudioProfilePlan(
             requestedId, profile, output, gains, inputGain,
             profile.virtualizerStrength.coerceIn(0, if (carRoute) 150 else 100),

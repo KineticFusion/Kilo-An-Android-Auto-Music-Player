@@ -36,6 +36,8 @@ object LosslessSource {
     fun song(mediaId: String): SongItemClean? = songs[mediaId]
     fun root(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         .getString("lossless_source_url", "").orEmpty()
+    fun provider(context: Context): String = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getString("lossless_source_provider", "Custom source").orEmpty()
     fun isEnabled(context: Context): Boolean = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         .getBoolean("lossless_source_enabled", false)
     fun hasToken(context: Context): Boolean = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -50,7 +52,7 @@ object LosslessSource {
         misses.clear()
     }
 
-    fun testAndSave(context: Context, sourceUrl: String, token: String): String {
+    fun testAndSave(context: Context, sourceUrl: String, token: String, provider: String = "Custom source"): String {
         val uri = URL(sourceUrl)
         require(uri.protocol == "https") { "Use a secure HTTPS source URL." }
         require(uri.host.isNotBlank()) { "Enter a valid source URL." }
@@ -72,8 +74,9 @@ object LosslessSource {
         else if (previousRoot != normalizedRoot) prefs.edit().remove("lossless_source_token").apply()
         prefs.edit()
             .putString("lossless_source_url", normalizedRoot)
+            .putString("lossless_source_provider", provider)
             .putBoolean("lossless_source_enabled", true)
-            .putString("lossless_source_status", "Connected: ${manifest.optString("name", manifest.optString("id"))}")
+            .putString("lossless_source_status", "Connected: ${manifest.optString("name", manifest.optString("id"))} · $provider")
             .apply()
         resolved.clear()
         misses.clear()

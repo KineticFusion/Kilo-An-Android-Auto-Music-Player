@@ -860,46 +860,68 @@ private fun playerControlShape(style: PlayerStylePreset): androidx.compose.ui.gr
     else -> RoundedCornerShape((style.cornerRadius - 4).coerceAtLeast(10).dp)
 }
 
-enum class SkinTheme(val title: String, val highlight: Color, val description: String, val layoutFamily: Int) {
-    SUNSET_GLASS("Liquid Glass", Color(0xFFB783FF), "Frosted floating panels and soft ambient color", 0),
-    SPOTIFY("Spotify Flow", Color(0xFF1ED760), "Quick grids, dense playlists and a compact player", 1),
-    YT_MUSIC("YouTube Music", Color(0xFFFF3355), "Mood shelves, bold artwork and a discovery feed", 2),
-    JIOSAAVN("Apple Music", Color(0xFFFF567A), "Editorial Listen Now with oversized album art", 3),
-    PRISM_GLASS("Prism Glass", Color(0xFF48D9FF), "Cool glass surfaces with layered artwork", 0),
-    FROSTED_NIGHT("Frosted Night", Color(0xFFFF7AC8), "Soft blur, floating controls and calm spacing", 0),
-    DEEZER_FLOW("Deezer Flow", Color(0xFF9B6BFF), "Colorful discovery tiles and a flowing mix", 1),
-    GAANA_BEATS("Gaana Beats", Color(0xFFFF6848), "Warm compact cards and playlist-first browsing", 1),
-    POCKET_MIX("Pocket Mix", Color(0xFFFFB938), "A bright quick-pick grid for fast browsing", 1),
-    JIOSAAVN_WAVE("JioSaavn", Color(0xFF28C9B7), "Portrait artwork and language-inspired shelves", 2),
-    YANDEX_WAVE("Yandex Wave", Color(0xFFFF6B4A), "A vertical flow of moods and recent tracks", 2),
-    NIGHT_DRIVE("Night Drive", Color(0xFF58B8FF), "Wide night-toned artwork and seamless shelves", 2),
-    QOBUZ_EDITORIAL("Qobuz Hi-Fi", Color(0xFF58C5D8), "Album-led editorial pages and clean typography", 3),
-    AMAZON_EDITORIAL("Amazon Music", Color(0xFF39C9D6), "Personalized sections with clear library access", 3),
-    SOUNDCLOUD_WAVE("SoundCloud", Color(0xFFFF7A30), "Waveform accents and a creator-style track feed", 4)
+enum class SkinTheme(
+    val title: String,
+    val highlight: Color,
+    val description: String,
+    val layoutFamily: Int,
+    val canvasTop: Color,
+    val canvasMiddle: Color,
+    val canvasBottom: Color,
+    val panel: Color,
+    val foreground: Color,
+    val mutedForeground: Color,
+    val isLight: Boolean = false,
+    val glassStyle: Boolean = false,
+    val glassLocked: Boolean = false,
+    val cardRadius: Int = 22
+) {
+    SUNSET_GLASS("Liquid Glass", Color(0xFFC69AFF), "Translucent layers, refracted highlights and floating controls", 0,
+        Color(0xFF261942), Color(0xFF171629), Color(0xFF090A10), Color(0xFF272238), Color(0xFFF8F5FF), Color(0xFFC7C2D1), glassStyle = true, glassLocked = true, cardRadius = 30),
+    SPOTIFY("Spotify Flow", Color(0xFF1ED760), "A dark, compact listening feed with quick rotation grids", 1,
+        Color(0xFF16231A), Color(0xFF0D1510), Color(0xFF080A09), Color(0xFF202923), Color(0xFFF7F8F7), Color(0xFFAEB8B0), cardRadius = 12),
+    YT_MUSIC("YouTube Music", Color(0xFFFF4B58), "Mood chips, quick picks and a smooth, artwork-led feed", 2,
+        Color(0xFF29151A), Color(0xFF170D11), Color(0xFF09090D), Color(0xFF23171B), Color(0xFFFFF8F8), Color(0xFFB9AEB0), cardRadius = 24),
+    JIOSAAVN("Apple Music", Color(0xFFB51F38), "Editorial album art, generous spacing and layered glass controls", 3,
+        Color(0xFFFFFBF8), Color(0xFFF8F2EF), Color(0xFFF2EAE6), Color(0xFFFFFFFF), Color(0xFF211A1A), Color(0xFF746A69), isLight = true, glassStyle = true, glassLocked = true, cardRadius = 24),
+    PRISM_GLASS("Prism Glass", Color(0xFF6F5CE8), "Soft cream surfaces with vivid, artwork-colored accents", 3,
+        Color(0xFFFFFCF5), Color(0xFFF7F1E8), Color(0xFFF1E9DD), Color(0xFFFFFFFF), Color(0xFF201C20), Color(0xFF777078), isLight = true, glassStyle = true, cardRadius = 28),
+    FROSTED_NIGHT("Frosted Night", Color(0xFFFF42D0), "Deep navy panels with cyan and magenta instrument lights", 0,
+        Color(0xFF101521), Color(0xFF0B101A), Color(0xFF080B12), Color(0xFF1A2230), Color(0xFFE9F3FF), Color(0xFF9BA8BC), glassStyle = true, cardRadius = 16),
+    DEEZER_FLOW("Deezer Flow", Color(0xFFA24BFF), "Discovery stories, colorful charts and flowing mixes", 1,
+        Color(0xFF191627), Color(0xFF11111D), Color(0xFF0B0B12), Color(0xFF242235), Color(0xFFF5F2FF), Color(0xFFB5AEC8), cardRadius = 16),
+    GAANA_BEATS("Gaana Beats", Color(0xFFFF4D5A), "A playlist-first feed with warm Indian music accents", 1,
+        Color(0xFF1C1420), Color(0xFF120F1A), Color(0xFF0B0B12), Color(0xFF251B2C), Color(0xFFFFF7F7), Color(0xFFBDAEB8), cardRadius = 16),
+    POCKET_MIX("Pocket Mix", Color(0xFFD6E9A5), "An iPod-inspired music menu and classic click-wheel player", 1,
+        Color(0xFF273027), Color(0xFF182019), Color(0xFF0C110D), Color(0xFF303B31), Color(0xFFF3F7E8), Color(0xFFB7C2AF), cardRadius = 8),
+    JIOSAAVN_WAVE("JioSaavn", Color(0xFF35C8B0), "Portrait artwork, language shelves and relaxed spacing", 2,
+        Color(0xFF252831), Color(0xFF1B1E26), Color(0xFF12141A), Color(0xFF2C303A), Color(0xFFF4F6FA), Color(0xFFAAB0BD), cardRadius = 14),
+    YANDEX_WAVE("Yandex Wave", Color(0xFFFF7861), "Vivid gradient mixes with a vertical, personal music stream", 2,
+        Color(0xFF281A31), Color(0xFF171627), Color(0xFF0C0D17), Color(0xFF29233A), Color(0xFFFFF8FF), Color(0xFFC5BBD1), cardRadius = 22),
+    NIGHT_DRIVE("Night Drive", Color(0xFF50CFFF), "Midnight blue surfaces, neon gradients and a wide player", 2,
+        Color(0xFF101B34), Color(0xFF0A1124), Color(0xFF070B18), Color(0xFF1B2940), Color(0xFFF0F6FF), Color(0xFFA4B3CB), cardRadius = 20),
+    QOBUZ_EDITORIAL("Qobuz Hi-Fi", Color(0xFF146E7A), "A bright, restrained album journal with clear Hi-Res details", 3,
+        Color(0xFFF9F8F5), Color(0xFFF1F0EC), Color(0xFFE7E6E0), Color(0xFFFFFFFF), Color(0xFF181A1B), Color(0xFF696E70), isLight = true, cardRadius = 12),
+    AMAZON_EDITORIAL("Amazon Music", Color(0xFF18CBD4), "Personal recaps, profile filters and an organized collection", 3,
+        Color(0xFF111314), Color(0xFF0A0C0D), Color(0xFF060708), Color(0xFF1C2021), Color(0xFFF7FAFA), Color(0xFFAFB7B8), cardRadius = 14),
+    SOUNDCLOUD_WAVE("SoundCloud", Color(0xFFE85A16), "A creator-style stream with waveforms and a clean light canvas", 4,
+        Color(0xFFFFFEFC), Color(0xFFF8F5F1), Color(0xFFF0ECE7), Color(0xFFFFFFFF), Color(0xFF191716), Color(0xFF77716D), isLight = true, cardRadius = 10),
+    KILO_ORIGINAL("KILO Original", Color(0xFF55E7FF), "Neon accents, fluid glass and KILO’s own quick discovery flow", 0,
+        Color(0xFF102A39), Color(0xFF11192B), Color(0xFF070B14), Color(0xFF182B3A), Color(0xFFF0FAFF), Color(0xFF9FB7C7), glassStyle = true, cardRadius = 26)
 }
 
 private fun primaryCardShape(skin: SkinTheme): androidx.compose.ui.graphics.Shape =
-    RoundedCornerShape(listOf(30, 10, 18, 28, 40, 22, 12, 34, 16, 26, 38, 20, 14, 32, 24)[skin.ordinal].dp)
+    RoundedCornerShape(skin.cardRadius.dp)
 
-private fun primaryBackdrop(skin: SkinTheme): Brush = when (skin.layoutFamily) {
-    0 -> Brush.radialGradient(listOf(skin.highlight.copy(alpha = 0.38f), Color(0xFF1B1930), Color(0xFF08090D)))
-    1 -> Brush.verticalGradient(listOf(Color(0xFF101613), Color(0xFF080A09), Color(0xFF050605)))
-    2 -> Brush.verticalGradient(listOf(Color(0xFF291016), Color(0xFF120B10), Color(0xFF08090D)))
-    3 -> Brush.verticalGradient(listOf(Color(0xFF2A111C), Color(0xFF171018), Color(0xFF09090D)))
-    else -> Brush.verticalGradient(listOf(Color(0xFF1B1015), Color(0xFF101117), Color(0xFF07090D)))
-}
+private fun primaryBackdrop(skin: SkinTheme): Brush = if (skin.glassStyle) {
+    Brush.radialGradient(listOf(skin.highlight.copy(alpha = if (skin.isLight) 0.12f else 0.30f), skin.canvasMiddle, skin.canvasBottom))
+} else Brush.verticalGradient(listOf(skin.canvasTop, skin.canvasMiddle, skin.canvasBottom))
 
-private fun primaryPanelColor(skin: SkinTheme): Color = when (skin.layoutFamily) {
-    0 -> Color.White.copy(alpha = 0.12f)
-    1 -> Color(0xFF202923)
-    2 -> Color(0xFF21151A)
-    3 -> Color(0xFF24151B)
-    else -> Color(0xFF17191F)
-}
+private fun primaryPanelColor(skin: SkinTheme): Color = skin.panel
 
 enum class ScreenNav {
     HOME, EXPLORE, LIBRARY, SEARCH, YOU, OFFLINE, RADIO, SETTINGS, APPEARANCE, APP_APPEARANCE,
-    HOME_LAYOUT, PLAYBACK_SETTINGS, ABOUT_UPDATES, ANDROID_AUTO_SETTINGS, PLAYER_STYLES, EQUALIZER, V2_ROADMAP,
+    HOME_LAYOUT, PLAYBACK_SETTINGS, ABOUT_UPDATES, ANDROID_AUTO_SETTINGS, PLAYER_STYLES, EQUALIZER, SOURCES, V2_ROADMAP,
     BROWSE_CATEGORY, ARTISTS, ARTIST_DETAIL, PLAYLIST_DETAIL, OFFICIAL_PLAYLISTS
 }
 
@@ -1087,6 +1109,7 @@ data class AppStateModel(
     val streamingQuality: String = "Auto",
     val downloadQuality: String = "Auto",
     val losslessSourceUrl: String = "",
+    val losslessSourceProvider: String = "Custom source",
     val losslessSourceEnabled: Boolean = false,
     val losslessSourceHasToken: Boolean = false,
     val losslessSourceStatus: String = "Optional: connect a compatible FLAC source",
@@ -1519,8 +1542,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences = application.getSharedPreferences("vybe_app_settings", Application.MODE_PRIVATE)
 
     init {
-        application.getSharedPreferences("kilo_spotify_oauth", Application.MODE_PRIVATE)
-            .edit().clear().apply()
+        SpotifyExperimentalDataCleanup.clearOnce(application, preferences)
     }
 
     private val equalizerController = EqualizerController(preferences)
@@ -1877,8 +1899,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         player.addListener(playbackListener)
         PlaybackSleepTimer.attach(player)
 
+        val savedSkin = SkinTheme.values().getOrElse(preferences.getInt("active_skin", 0)) { SkinTheme.SUNSET_GLASS }
         val savedCustomizations = UI_CUSTOMIZATION_OPTIONS.associate { option ->
             option.key to preferences.getBoolean("ui_${option.key}", option.enabledByDefault)
+        }.toMutableMap().apply { if (savedSkin.glassLocked) put("glassPanels", true) }
+        if (savedSkin.glassLocked && !preferences.getBoolean("ui_glassPanels", true)) {
+            preferences.edit().putBoolean("ui_glassPanels", true).apply()
         }
         val cachedHomeShelves = HomeCache.initialize(application)
         _state.value = _state.value.copy(
@@ -1924,7 +1950,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             notForCurrentMoodIds = MoodTrackFeedbackStore.hiddenIds(
                 preferences, preferences.getString("discovery_mood", "Discover") ?: "Discover"
             ),
-            activeSkin = SkinTheme.values().getOrElse(preferences.getInt("active_skin", 0)) { SkinTheme.SUNSET_GLASS },
+            activeSkin = savedSkin,
             displayName = preferences.getString("display_name", "Arnav") ?: "Arnav",
             autoMixEnabled = preferences.getBoolean("auto_mix_enabled", false),
             autoConnectCar = preferences.getBoolean("auto_connect_car_enabled", true),
@@ -1944,6 +1970,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             streamingQuality = AudioQualityPreset.fromPreference(preferences.getString("streaming_quality", "Auto")).label,
             downloadQuality = AudioQualityPreset.fromPreference(preferences.getString("download_quality", "Auto")).label,
             losslessSourceUrl = LosslessSource.root(application),
+            losslessSourceProvider = LosslessSource.provider(application),
             losslessSourceEnabled = LosslessSource.isEnabled(application),
             losslessSourceHasToken = LosslessSource.hasToken(application),
             losslessSourceStatus = preferences.getString("lossless_source_status", "Optional: connect a compatible FLAC source") ?: "Optional: connect a compatible FLAC source",
@@ -4788,6 +4815,7 @@ _state.value = _state.value.copy(
 
     fun toggleCustomization(key: String, enabled: Boolean) {
         if (UI_CUSTOMIZATION_OPTIONS.none { it.key == key }) return
+        if (key == "glassPanels" && _state.value.activeSkin.glassLocked && !enabled) return
         preferences.edit().putBoolean("ui_$key", enabled).apply()
         _state.value = _state.value.copy(uiCustomizations = _state.value.uiCustomizations + (key to enabled))
     }
@@ -5042,17 +5070,18 @@ _state.value = _state.value.copy(
         _state.value = _state.value.copy(downloadQuality = preset.label)
     }
 
-    fun configureLosslessSource(url: String, token: String) {
+    fun configureLosslessSource(url: String, token: String, provider: String = "Custom source") {
         val app = getApplication<Application>()
         val cleanedUrl = url.trim().trimEnd('/')
         _state.value = _state.value.copy(losslessSourceStatus = "Checking source…")
         viewModelScope.launch {
             val outcome = withContext(Dispatchers.IO) {
-                runCatching { LosslessSource.testAndSave(app, cleanedUrl, token.trim()) }
+                runCatching { LosslessSource.testAndSave(app, cleanedUrl, token.trim(), provider) }
             }
             val status = outcome.getOrElse { "Could not connect: ${it.localizedMessage ?: "check the URL"}" }
             _state.value = _state.value.copy(
                 losslessSourceUrl = if (outcome.isSuccess) cleanedUrl else _state.value.losslessSourceUrl,
+                losslessSourceProvider = if (outcome.isSuccess) provider else _state.value.losslessSourceProvider,
                 losslessSourceEnabled = outcome.isSuccess,
                 losslessSourceHasToken = LosslessSource.hasToken(app),
                 losslessSourceStatus = status
@@ -5073,7 +5102,11 @@ _state.value = _state.value.copy(
 
     fun setSkin(skin: SkinTheme) {
         preferences.edit().putInt("active_skin", skin.ordinal).apply()
-        _state.value = _state.value.copy(activeSkin = skin)
+        val customizations = if (skin.glassLocked) {
+            preferences.edit().putBoolean("ui_glassPanels", true).apply()
+            _state.value.uiCustomizations + ("glassPanels" to true)
+        } else _state.value.uiCustomizations
+        _state.value = _state.value.copy(activeSkin = skin, uiCustomizations = customizations)
     }
 
     private fun updateAudioEffectSession(open: Boolean) {
@@ -5097,6 +5130,10 @@ _state.value = _state.value.copy(
             _state.value = _state.value.copy(equalizerSnapshot = equalizerController.setEnabled(false))
         }
         AudioEngine.selectProfile(getApplication<Application>(), profileId)
+    }
+
+    fun setAudioMode(mode: com.example.kilo.audio.dsp.AudioPresentationMode) {
+        AudioEngine.selectAudioMode(getApplication<Application>(), mode)
     }
 
     fun setEqualizerEnabled(enabled: Boolean) {
@@ -6686,7 +6723,7 @@ private fun KiloAppTheme(vm: MainViewModel, content: @Composable () -> Unit) {
     KiloTheme(
         spec = KiloThemeSpec(
             accent = state.activeSkin.highlight,
-            background = Color(0xFF090A0F),
+            background = state.activeSkin.canvasBottom,
             surface = primaryPanelColor(state.activeSkin)
         ),
         content = content
@@ -7020,9 +7057,9 @@ fun BitchordWaveLogo(modifier: Modifier = Modifier.size(36.dp)) {
 fun VybeMainScaffold(vm: MainViewModel) {
     val state by vm.state.collectAsState()
     val backdropBrush = if (state.uiCustomizations["gradientBackdrop"] != false) primaryBackdrop(state.activeSkin)
-    else Brush.verticalGradient(listOf(Color(0xFF0A0B10), Color(0xFF0A0B10)))
+    else Brush.verticalGradient(listOf(state.activeSkin.canvasTop, state.activeSkin.canvasBottom))
 
-    Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF090A0F)) {
+    Surface(modifier = Modifier.fillMaxSize(), color = state.activeSkin.canvasBottom) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -7071,6 +7108,7 @@ fun VybeMainScaffold(vm: MainViewModel) {
                                 ScreenNav.ANDROID_AUTO_SETTINGS -> AndroidAutoSettingsScreen(vm)
                                 ScreenNav.PLAYER_STYLES -> PlayerStylesScreen(vm)
                                 ScreenNav.EQUALIZER -> EqualizerScreen(vm)
+                                ScreenNav.SOURCES -> SourcesScreen(vm)
                                 ScreenNav.V2_ROADMAP -> V2RoadmapScreen(vm)
                                 ScreenNav.BROWSE_CATEGORY -> BrowseCategoryResultsScreen(vm)
                                 ScreenNav.ARTISTS -> ArtistsBrowseScreen(vm)
@@ -7822,23 +7860,23 @@ private fun PrimaryStyleHeroCard(song: SongItemClean, skin: SkinTheme, eyebrow: 
 private fun PrimaryQuickTile(song: SongItemClean, skin: SkinTheme, modifier: Modifier = Modifier, onClick: () -> Unit) {
     Row(
         modifier.height(66.dp).clip(primaryCardShape(skin)).background(primaryPanelColor(skin)).clickable { onClick() }
-            .then(if (skin.layoutFamily == 0) Modifier.border(1.dp, Color.White.copy(alpha = 0.09f), primaryCardShape(skin)) else Modifier),
+            .then(if (skin.layoutFamily == 0) Modifier.border(1.dp, skin.foreground.copy(alpha = 0.09f), primaryCardShape(skin)) else Modifier),
         verticalAlignment = Alignment.CenterVertically
     ) {
         AsyncImage(song.coverUrl, contentDescription = song.title, modifier = Modifier.width(62.dp).fillMaxHeight().clip(primaryCardShape(skin)), contentScale = ContentScale.Crop)
-        Text(song.title, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 9.dp).weight(1f))
+        Text(song.title, color = skin.foreground, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(horizontal = 9.dp).weight(1f))
     }
 }
 
 @Composable
 private fun PrimaryArtworkTile(song: SongItemClean, skin: SkinTheme, family: Int, onClick: () -> Unit) {
-    val widths = listOf(168, 148, 164, 204, 142, 182, 164, 136, 158, 152, 198, 180, 206, 188, 156)
+    val widths = listOf(168, 148, 164, 204, 142, 182, 164, 136, 158, 152, 198, 180, 206, 188, 156, 176)
     val width = widths[skin.ordinal].dp
     Column(Modifier.width(width).clickable { onClick() }) {
         AsyncImage(song.coverUrl, contentDescription = song.title, modifier = Modifier.fillMaxWidth().height(if (family == 3) 204.dp else 154.dp).clip(primaryCardShape(skin)), contentScale = ContentScale.Crop)
         Spacer(Modifier.height(8.dp))
-        Text(song.title, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-        Text(song.artist, color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(song.title, color = skin.foreground, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(song.artist, color = skin.foreground.copy(alpha = 0.62f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 
@@ -7848,8 +7886,8 @@ private fun PrimaryWaveCard(song: SongItemClean, skin: SkinTheme, onClick: () ->
         AsyncImage(song.coverUrl, contentDescription = song.title, modifier = Modifier.size(76.dp).clip(primaryCardShape(skin)), contentScale = ContentScale.Crop)
         Column(Modifier.weight(1f).padding(horizontal = 13.dp)) {
             Text("NOW IN THE MIX", color = skin.highlight, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
-            Text(song.title, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(song.artist, color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(song.title, color = skin.foreground, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(song.artist, color = skin.foreground.copy(alpha = 0.66f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Canvas(Modifier.fillMaxWidth().height(22.dp).padding(top = 7.dp)) {
                 val gap = size.width / 30f
                 repeat(28) { index ->
@@ -7865,7 +7903,8 @@ private fun PrimaryWaveCard(song: SongItemClean, skin: SkinTheme, onClick: () ->
 @Composable
 private fun LegacyFreshFriendlyHomeScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
-    val accent = state.activeSkin.highlight
+    val skin = state.activeSkin
+    val accent = skin.highlight
 
     LazyColumn(
         modifier = Modifier
@@ -7972,7 +8011,7 @@ private fun LegacyFreshFriendlyHomeScreen(vm: MainViewModel) {
                     )
                     Text(
                         if (state.isPlaying) state.activeSong.title else "Find your next feeling",
-                        color = Color.White,
+                        color = skin.foreground,
                         fontSize = 17.sp,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
@@ -7980,7 +8019,7 @@ private fun LegacyFreshFriendlyHomeScreen(vm: MainViewModel) {
                     )
                     Text(
                         if (state.isPlaying) state.activeSong.artist else "Fresh picks, made for you",
-                        color = Color.White.copy(alpha = 0.68f),
+                        color = skin.foreground.copy(alpha = 0.68f),
                         fontSize = 12.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -8386,8 +8425,8 @@ fun BitchordSongRowItem(
             .fillMaxWidth()
             .padding(horizontal = 14.dp, vertical = if (compact) 3.dp else 5.dp)
             .clip(rowShape)
-            .background(if (isCurrent) skin.highlight.copy(alpha = 0.16f) else primaryPanelColor(skin).copy(alpha = if (skin.layoutFamily == 0) 0.58f else 0.56f))
-            .then(if (skin.layoutFamily == 0) Modifier.border(1.dp, Color.White.copy(alpha = 0.07f), rowShape) else Modifier)
+            .background(if (isCurrent) skin.highlight.copy(alpha = 0.16f) else primaryPanelColor(skin).copy(alpha = if (skin.glassStyle) 0.72f else 1f))
+            .then(if (skin.glassStyle) Modifier.border(1.dp, skin.foreground.copy(alpha = if (skin.isLight) 0.22f else 0.12f), rowShape) else Modifier)
             .clickable { onClick() }
             .padding(horizontal = 10.dp, vertical = if (compact) 6.dp else 8.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -8418,7 +8457,7 @@ fun BitchordSongRowItem(
                 }
                 Text(
                     text = song.title,
-                    color = if (isCurrent) skin.highlight else Color.White,
+                    color = if (isCurrent) skin.highlight else skin.foreground,
                     fontSize = if (custom["largeText"] == true) 17.sp else 15.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
@@ -8428,7 +8467,7 @@ fun BitchordSongRowItem(
             if (subtitleParts.isNotEmpty()) {
                 Text(
                     text = subtitleParts.joinToString(" • "),
-                    color = if (custom["highContrast"] == true) Color.White.copy(alpha = 0.88f) else Color.Gray,
+                    color = if (custom["highContrast"] == true) skin.foreground.copy(alpha = 0.88f) else skin.mutedForeground,
                     fontSize = if (custom["largeText"] == true) 14.sp else 12.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -8705,13 +8744,9 @@ fun BitchordFloatingMiniPlayer(
         .let { if (it.id == "style_custom") it.copy(accent = state.customPlayerAccent) else it }
     val playerAccent = playerStyle.accent
     val playerShape = primaryCardShape(skin)
-    val playerBrush = when (skin.layoutFamily) {
-        0 -> Brush.horizontalGradient(listOf(Color.White.copy(alpha = 0.12f), skin.highlight.copy(alpha = 0.13f), Color.White.copy(alpha = 0.06f)))
-        1 -> Brush.horizontalGradient(listOf(Color(0xFF1A251E), Color(0xFF101512)))
-        2 -> Brush.horizontalGradient(listOf(Color(0xFF29151A), Color(0xFF120C10)))
-        3 -> Brush.horizontalGradient(listOf(Color(0xFF38212C), Color(0xFF1B1219)))
-        else -> Brush.horizontalGradient(listOf(Color(0xFF252027), Color(0xFF111218)))
-    }
+    val playerBrush = if (skin.glassStyle) {
+        Brush.horizontalGradient(listOf(skin.foreground.copy(alpha = if (skin.isLight) 0.60f else 0.10f), skin.highlight.copy(alpha = 0.13f), skin.panel.copy(alpha = 0.92f)))
+    } else Brush.horizontalGradient(listOf(skin.panel, skin.canvasBottom))
 
     Column(
         modifier = Modifier
@@ -8772,7 +8807,7 @@ fun BitchordFloatingMiniPlayer(
                     }
                 }
                 IconButton(onClick = { vm.prevTrack() }) {
-                    Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous", tint = Color.White.copy(alpha = 0.85f))
+                    Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous", tint = skin.foreground.copy(alpha = 0.85f))
                 }
                 IconButton(
                     onClick = { vm.togglePlay() },
@@ -8792,7 +8827,7 @@ fun BitchordFloatingMiniPlayer(
                     }
                 }
                 IconButton(onClick = { vm.nextTrack() }) {
-                    Icon(Icons.Filled.SkipNext, contentDescription = "Next", tint = Color.White)
+                    Icon(Icons.Filled.SkipNext, contentDescription = "Next", tint = skin.foreground)
                 }
             }
         }
@@ -8951,7 +8986,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     IconButton(onClick = { vm.setFullScreenPlayer(false) }) {
-                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Minimize", tint = Color.White, modifier = Modifier.size(30.dp))
+                        Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Minimize", tint = skin.foreground, modifier = Modifier.size(30.dp))
                     }
                     Box(
                         modifier = Modifier
@@ -8959,16 +8994,16 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                             .background(
                                 Brush.linearGradient(
                                     listOf(
-                                        Color.White.copy(alpha = 0.26f),
+                                        skin.foreground.copy(alpha = 0.26f),
                                         playerAccent.copy(alpha = 0.18f),
-                                        Color.White.copy(alpha = 0.07f)
+                                        skin.foreground.copy(alpha = 0.07f)
                                     )
                                 )
                             )
                             .border(
                                 1.dp,
                                 Brush.verticalGradient(
-                                    listOf(Color.White.copy(alpha = 0.72f), playerAccent.copy(alpha = 0.32f), Color.White.copy(alpha = 0.10f))
+                                    listOf(skin.foreground.copy(alpha = 0.72f), playerAccent.copy(alpha = 0.32f), skin.foreground.copy(alpha = 0.10f))
                                 ),
                                 RoundedCornerShape(50)
                             )
@@ -8979,7 +9014,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                             }
                             .padding(horizontal = 14.dp, vertical = 6.dp)
                     ) {
-                        Text(skin.title, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(skin.title, color = skin.foreground, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
                     IconButton(onClick = { vm.closeAppCompletely() }) {
                         Icon(Icons.Default.PowerSettingsNew, contentDescription = "Close App", tint = Color(0xFFFF8A80))
@@ -9001,7 +9036,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         )
                         OverlayTab.QUEUE -> {
                             Column(modifier = Modifier.fillMaxSize()) {
-                                Text("Up Next Queue", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
+                                Text("Up Next Queue", color = skin.foreground, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold)
                                 Spacer(modifier = Modifier.height(10.dp))
                                 LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     itemsIndexed(
@@ -9013,7 +9048,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .clip(RoundedCornerShape(12.dp))
-                                                .background(if (idx == state.currentIndex) Color.White.copy(0.14f) else Color.Transparent)
+                                                .background(if (idx == state.currentIndex) skin.foreground.copy(0.14f) else Color.Transparent)
                                                 .clickable { vm.loadTrack(idx, autoPlay = true) }
                                                 .padding(8.dp),
                                             verticalAlignment = Alignment.CenterVertically
@@ -9026,8 +9061,8 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                             )
                                             Spacer(modifier = Modifier.width(12.dp))
                                             Column(modifier = Modifier.weight(1f)) {
-                                                Text(item.title, color = Color.White, fontWeight = FontWeight.Bold, maxLines = 1)
-                                                Text(item.artist, color = Color.Gray, fontSize = 12.sp, maxLines = 1)
+                                                Text(item.title, color = skin.foreground, fontWeight = FontWeight.Bold, maxLines = 1)
+                                                Text(item.artist, color = skin.mutedForeground, fontSize = 12.sp, maxLines = 1)
                                             }
                                         }
                                     }
@@ -9042,7 +9077,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                             PlayerArtworkContent(song, vm, state.videoMode, playerStyle, Modifier.fillMaxSize())
                                             Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.8f)))).padding(14.dp)) {
                                                 Text("IMMERSIVE MIX", color = playerAccent, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.5.sp)
-                                                Text(song.title, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Text(song.title, color = skin.foreground, fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                             }
                                         }
                                     }
@@ -9058,8 +9093,8 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                             PlayerArtworkContent(song, vm, state.videoMode, playerStyle, Modifier.size(146.dp))
                                             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                                 Text("SIDE A · NOW PLAYING", color = playerAccent, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.sp)
-                                                Text(song.title, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                                                Text(song.artist, color = Color.White.copy(alpha = 0.64f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                Text(song.title, color = skin.foreground, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                                Text(song.artist, color = skin.foreground.copy(alpha = 0.64f), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                                 PlayerSignalBars(playerAccent, song.id.hashCode(), 28.dp)
                                             }
                                         }
@@ -9079,7 +9114,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                 }
                                 Spacer(modifier = Modifier.height(12.dp))
                                 if (custom["showCodecLabels"] != false) {
-                                    Text(song.codecInfo, color = Color.White.copy(alpha = 0.68f), fontSize = 11.sp, fontWeight = FontWeight.Medium)
+                                    Text(song.codecInfo, color = skin.foreground.copy(alpha = 0.68f), fontSize = 11.sp, fontWeight = FontWeight.Medium)
                                 }
                             }
                         }
@@ -9097,9 +9132,9 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                     .background(
                                         Brush.linearGradient(
                                             listOf(
-                                                Color.White.copy(alpha = 0.22f),
+                                                skin.foreground.copy(alpha = 0.22f),
                                                 playerAccent.copy(alpha = 0.12f),
-                                                Color.White.copy(alpha = 0.055f)
+                                                skin.foreground.copy(alpha = 0.055f)
                                             )
                                         )
                                     )
@@ -9107,9 +9142,9 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                         1.dp,
                                         Brush.verticalGradient(
                                             listOf(
-                                                Color.White.copy(alpha = 0.76f),
+                                                skin.foreground.copy(alpha = 0.76f),
                                                 playerAccent.copy(alpha = 0.36f),
-                                                Color.White.copy(alpha = 0.11f)
+                                                skin.foreground.copy(alpha = 0.11f)
                                             )
                                         ),
                                         glassShape
@@ -9124,9 +9159,9 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(song.title, color = Color.White, fontSize = if (compactPhone) 20.sp else 24.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(song.title, color = skin.foreground, fontSize = if (compactPhone) 20.sp else 24.sp, fontWeight = FontWeight.ExtraBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             if (custom["showArtistNames"] != false) {
-                                Text(song.artist, color = Color.White.copy(alpha = 0.72f), fontSize = if (compactPhone) 13.sp else 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text(song.artist, color = skin.foreground.copy(alpha = 0.72f), fontSize = if (compactPhone) 13.sp else 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                             }
                         }
 
@@ -9134,12 +9169,12 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                             val isFav = state.favoriteIds.contains(song.id)
                             IconButton(
                                 onClick = { vm.toggleFavorite(song.id) },
-                                modifier = Modifier.size(48.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.12f))
+                                modifier = Modifier.size(48.dp).clip(CircleShape).background(skin.foreground.copy(alpha = 0.12f))
                             ) {
                                 Icon(
                                     imageVector = if (isFav) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder,
                                     contentDescription = "Favorite",
-                                    tint = if (isFav) Color(0xFFFF4081) else Color.White,
+                                    tint = if (isFav) Color(0xFFFF4081) else skin.foreground,
                                     modifier = Modifier.size(24.dp)
                                 )
                             }
@@ -9185,10 +9220,10 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(formatMillis(state.currentPosMs), color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp, maxLines = 1)
+                        Text(formatMillis(state.currentPosMs), color = skin.foreground.copy(alpha = 0.72f), fontSize = 12.sp, maxLines = 1)
                         val speedText = if (state.playbackSpeed % 1f == 0f) state.playbackSpeed.toInt().toString() else state.playbackSpeed.toString().trimEnd('0').trimEnd('.')
                         Text("${state.activeSong.codecInfo.substringBefore(" • ")} • ${speedText}×", color = playerAccent, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, modifier = Modifier.weight(1f), textAlign = TextAlign.Center, overflow = TextOverflow.Ellipsis)
-                        Text("-${formatMillis(remainingMs)}", color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp, maxLines = 1)
+                        Text("-${formatMillis(remainingMs)}", color = skin.foreground.copy(alpha = 0.72f), fontSize = 12.sp, maxLines = 1)
                     }
 
                     Spacer(modifier = Modifier.height(if (compactPhone) 8.dp else 14.dp))
@@ -9199,7 +9234,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(onClick = { vm.prevTrack() }, modifier = Modifier.size(52.dp)) {
-                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous track", tint = Color.White, modifier = Modifier.size(if (compactPhone) 34.dp else 40.dp))
+                            Icon(Icons.Filled.SkipPrevious, contentDescription = "Previous track", tint = skin.foreground, modifier = Modifier.size(if (compactPhone) 34.dp else 40.dp))
                         }
 
                         IconButton(
@@ -9210,7 +9245,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                 .background(
                                     Brush.linearGradient(
                                         if (skin.layoutFamily == 0) {
-                                            listOf(Color.White.copy(alpha = 0.96f), playerAccent, playerAccent.copy(alpha = 0.80f))
+                                            listOf(skin.foreground.copy(alpha = 0.96f), playerAccent, playerAccent.copy(alpha = 0.80f))
                                         } else {
                                             listOf(playerAccent, playerAccent.copy(alpha = 0.86f))
                                         }
@@ -9218,7 +9253,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                 )
                                 .border(
                                     1.dp,
-                                    Color.White.copy(alpha = if (skin.layoutFamily == 0) 0.72f else 0.22f),
+                                    skin.foreground.copy(alpha = if (skin.layoutFamily == 0) 0.72f else 0.22f),
                                     playerControlShape(playerStyle)
                                 )
                         ) {
@@ -9231,7 +9266,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         }
 
                         IconButton(onClick = { vm.nextTrack() }, modifier = Modifier.size(52.dp)) {
-                            Icon(Icons.Filled.SkipNext, contentDescription = "Next track", tint = Color.White, modifier = Modifier.size(if (compactPhone) 34.dp else 40.dp))
+                            Icon(Icons.Filled.SkipNext, contentDescription = "Next track", tint = skin.foreground, modifier = Modifier.size(if (compactPhone) 34.dp else 40.dp))
                         }
                     }
 
@@ -9243,16 +9278,16 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         IconButton(onClick = { showPlaybackTools = true }) {
-                            Icon(Icons.Filled.Tune, contentDescription = "Playback settings", tint = Color.White.copy(alpha = 0.85f))
+                            Icon(Icons.Filled.Tune, contentDescription = "Playback settings", tint = skin.foreground.copy(alpha = 0.85f))
                         }
                         IconButton(onClick = vm::openAndroidAuto) {
-                            Icon(Icons.Default.DirectionsCar, contentDescription = "Android Auto", tint = Color.White.copy(alpha = 0.85f))
+                            Icon(Icons.Default.DirectionsCar, contentDescription = "Android Auto", tint = skin.foreground.copy(alpha = 0.85f))
                         }
                         IconButton(onClick = vm::toggleVideoMode) {
                             Icon(
                                 imageVector = Icons.Outlined.VideoLibrary,
                                 contentDescription = "Video Mode",
-                                tint = if (state.videoMode) playerAccent else Color.White.copy(0.6f)
+                                tint = if (state.videoMode) playerAccent else skin.foreground.copy(0.6f)
                             )
                         }
                         IconButton(
@@ -9263,7 +9298,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                             Icon(
                                 imageVector = Icons.Default.Subtitles,
                                 contentDescription = "Lyrics",
-                                tint = if (state.playerOverlayTab == OverlayTab.LYRICS) playerAccent else Color.White.copy(0.6f)
+                                tint = if (state.playerOverlayTab == OverlayTab.LYRICS) playerAccent else skin.foreground.copy(0.6f)
                             )
                         }
                         if (custom["showQueueIndicator"] != false) {
@@ -9271,7 +9306,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                                 Icon(
                                     imageVector = Icons.Filled.FormatListBulleted,
                                     contentDescription = "Queue",
-                                    tint = if (state.playerOverlayTab == OverlayTab.QUEUE) playerAccent else Color.White.copy(0.6f)
+                                    tint = if (state.playerOverlayTab == OverlayTab.QUEUE) playerAccent else skin.foreground.copy(0.6f)
                                 )
                             }
                         }
@@ -9286,7 +9321,7 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                         Icon(
                             imageVector = if (state.outputVolume <= 0.01f) Icons.Default.VolumeOff else Icons.Default.VolumeDown,
                             contentDescription = "Volume",
-                            tint = Color.White.copy(alpha = 0.78f),
+                            tint = skin.foreground.copy(alpha = 0.78f),
                             modifier = Modifier.size(22.dp)
                         )
                         Slider(
@@ -9297,14 +9332,14 @@ fun BitchordFullScreenPlayer(state: AppStateModel, vm: MainViewModel) {
                             colors = SliderDefaults.colors(
                                 thumbColor = playerAccent,
                                 activeTrackColor = playerAccent,
-                                inactiveTrackColor = Color.White.copy(alpha = 0.26f)
+                                inactiveTrackColor = skin.foreground.copy(alpha = 0.26f)
                             ),
                             modifier = Modifier.weight(1f).height(38.dp)
                         )
                         Icon(
                             imageVector = Icons.Default.VolumeUp,
                             contentDescription = "Maximum volume",
-                            tint = Color.White.copy(alpha = 0.78f),
+                            tint = skin.foreground.copy(alpha = 0.78f),
                             modifier = Modifier.size(22.dp)
                         )
                     }
@@ -9439,8 +9474,8 @@ fun BitChordBottomNavPill(state: AppStateModel, vm: MainViewModel) {
             .fillMaxWidth()
             .height(if (skin.layoutFamily == 3) 70.dp else 64.dp)
             .clip(navShape)
-            .background(if (skin.layoutFamily == 0) Color(0xFF17151F).copy(alpha = 0.73f) else primaryPanelColor(skin).copy(alpha = 0.97f))
-            .border(1.dp, if (skin.layoutFamily == 0) Color.White.copy(alpha = 0.16f) else accent.copy(alpha = 0.16f), navShape)
+            .background(primaryPanelColor(skin).copy(alpha = if (skin.glassStyle) 0.82f else 0.98f))
+            .border(1.dp, if (skin.glassStyle) skin.foreground.copy(alpha = 0.22f) else accent.copy(alpha = 0.22f), navShape)
             .padding(5.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
@@ -9454,7 +9489,7 @@ fun BitChordBottomNavPill(state: AppStateModel, vm: MainViewModel) {
                     ScreenNav.SETTINGS,
                     ScreenNav.APPEARANCE, ScreenNav.APP_APPEARANCE, ScreenNav.PLAYER_STYLES,
                     ScreenNav.PLAYBACK_SETTINGS, ScreenNav.ABOUT_UPDATES,
-                    ScreenNav.ANDROID_AUTO_SETTINGS, ScreenNav.EQUALIZER, ScreenNav.V2_ROADMAP
+                    ScreenNav.ANDROID_AUTO_SETTINGS, ScreenNav.EQUALIZER, ScreenNav.SOURCES, ScreenNav.V2_ROADMAP
                 )) || (screen == ScreenNav.LIBRARY && state.currentScreen == ScreenNav.OFFLINE) ||
                 (screen == ScreenNav.EXPLORE && state.currentScreen in setOf(
                     ScreenNav.BROWSE_CATEGORY, ScreenNav.ARTISTS, ScreenNav.ARTIST_DETAIL,
@@ -9466,14 +9501,14 @@ fun BitChordBottomNavPill(state: AppStateModel, vm: MainViewModel) {
                     .weight(1f)
                     .fillMaxHeight()
                     .clip(primaryCardShape(skin))
-                    .background(if (selected) accent.copy(alpha = if (skin.layoutFamily == 0) 0.28f else 0.22f) else Color.Transparent)
+                    .background(if (selected) accent.copy(alpha = if (skin.glassStyle) 0.28f else 0.22f) else Color.Transparent)
                     .clickable { vm.setScreen(screen) },
                 contentAlignment = Alignment.Center
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Icon(icon, contentDescription = label, tint = if (selected) accent else Color.Gray, modifier = Modifier.size(20.dp))
+                    Icon(icon, contentDescription = label, tint = if (selected) accent else skin.mutedForeground, modifier = Modifier.size(20.dp))
                     Spacer(modifier = Modifier.height(2.dp))
-                    Text(label, color = if (selected) Color.White else Color.Gray, fontSize = 10.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
+                    Text(label, color = if (selected) skin.foreground else skin.mutedForeground, fontSize = 10.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium)
                 }
             }
         }
@@ -9546,24 +9581,25 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                     IconButton(
                         onClick = { vm.setScreen(ScreenNav.SEARCH) },
                         modifier = Modifier.size(46.dp).clip(CircleShape).background(primaryPanelColor(skin))
-                    ) { Icon(Icons.Default.Search, contentDescription = "Search", tint = Color.White) }
+                    ) { Icon(Icons.Default.Search, contentDescription = "Search", tint = skin.foreground) }
                 }
             )
         }
+        item(key = "reference_style_identity") { ReferenceStyleIdentityPanel(state, skin, vm) }
         if (state.updateAvailable || state.isDownloadingUpdate || state.downloadedUpdateUri != null) {
             item(key = "home_update_card") {
                 KiloCard(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp),
                     shape = RoundedCornerShape(22.dp),
                     backgroundBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.34f), primaryPanelColor(skin))),
-                    borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.68f), Color.White.copy(alpha = 0.06f))),
+                    borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.68f), skin.foreground.copy(alpha = 0.06f))),
                     contentPadding = 15.dp
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Icon(Icons.Filled.SystemUpdate, contentDescription = null, tint = accent, modifier = Modifier.size(24.dp))
                         Column(Modifier.weight(1f)) {
-                            Text("KILO ${state.updateVersionName}", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
-                            Text(state.updateCheckMessage, color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp)
+                            Text("KILO ${state.updateVersionName}", color = skin.foreground, fontSize = 15.sp, fontWeight = FontWeight.ExtraBold)
+                            Text(state.updateCheckMessage, color = skin.foreground.copy(alpha = 0.72f), fontSize = 12.sp)
                         }
                         when {
                             state.downloadedUpdateUri != null && !state.updateInstallerStarted -> Button(onClick = vm::installDownloadedUpdate) { Text("Install") }
@@ -9634,7 +9670,7 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
             if (state.savedPlaylists.isEmpty() && state.youtubeMusicPlaylists.isEmpty()) {
                 Text(
                     if (state.isLoadingYoutubeMusicPlaylists) "Loading your playlists…" else "Your saved playlists will appear here.",
-                    color = Color.White.copy(alpha = 0.58f), fontSize = 12.sp,
+                    color = skin.foreground.copy(alpha = 0.58f), fontSize = 12.sp,
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
                 )
             } else {
@@ -9678,24 +9714,24 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Column(Modifier.weight(1f)) {
-                        Text(discovery.title, color = Color.White, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(discovery.artist, color = Color.White.copy(alpha = 0.58f), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(discovery.title, color = skin.foreground, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(discovery.artist, color = skin.foreground.copy(alpha = 0.58f), fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     TextButton(onClick = { vm.recordDiscoveryFeedback(discovery, "keep") }, contentPadding = PaddingValues(horizontal = 5.dp)) {
                         Text("Keep", color = accent, fontSize = 10.sp)
                     }
                     TextButton(onClick = { vm.recordDiscoveryFeedback(discovery, "remove") }, contentPadding = PaddingValues(horizontal = 5.dp)) {
-                        Text("Remove", color = Color.White.copy(alpha = 0.76f), fontSize = 10.sp)
+                        Text("Remove", color = skin.foreground.copy(alpha = 0.76f), fontSize = 10.sp)
                     }
                     TextButton(onClick = { vm.recordDiscoveryFeedback(discovery, "never") }, contentPadding = PaddingValues(horizontal = 5.dp)) {
-                        Text("Never", color = Color.White.copy(alpha = 0.76f), fontSize = 10.sp)
+                        Text("Never", color = skin.foreground.copy(alpha = 0.76f), fontSize = 10.sp)
                     }
                 }
             }
         }
         if (state.infiniteDiscoveryStatus.isNotBlank() || state.activeJamSession != null) item(key = "home_discovery_status") {
             Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(state.infiniteDiscoveryStatus, color = Color.White.copy(alpha = 0.66f), fontSize = 11.sp, modifier = Modifier.weight(1f))
+                Text(state.infiniteDiscoveryStatus, color = skin.foreground.copy(alpha = 0.66f), fontSize = 11.sp, modifier = Modifier.weight(1f))
                 if (state.activeJamSession != null) TextButton(onClick = vm::shareJamSetlist) {
                     Icon(Icons.Default.Share, contentDescription = null, tint = accent, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(4.dp))
@@ -9728,11 +9764,11 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                     Box(
                         Modifier.clip(RoundedCornerShape(16.dp))
                             .background(if (selected) accent else primaryPanelColor(skin))
-                            .border(1.dp, if (selected) accent.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.08f), RoundedCornerShape(16.dp))
+                            .border(1.dp, if (selected) accent.copy(alpha = 0.8f) else skin.foreground.copy(alpha = 0.08f), RoundedCornerShape(16.dp))
                             .clickable { vm.selectHomeCategory(category) }
                             .padding(horizontal = 16.dp, vertical = 9.dp)
                     ) {
-                        Text(category, color = if (selected) Color.Black else Color.White.copy(alpha = 0.9f), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        Text(category, color = if (selected) Color.Black else skin.foreground.copy(alpha = 0.9f), fontSize = 13.sp, fontWeight = FontWeight.Bold)
                     }
                 }
             }
@@ -9831,7 +9867,7 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
         if (state.homeShelves.isEmpty() && state.companionSongs.isEmpty()) item {
             Text(
                 if (state.isSearching) "Building your personal music feed…" else "Your personal music feed will grow as you listen and save favorites.",
-                color = Color.White.copy(alpha = 0.65f), fontSize = 13.sp,
+                color = skin.foreground.copy(alpha = 0.65f), fontSize = 13.sp,
                 modifier = Modifier.fillMaxWidth().padding(24.dp), textAlign = TextAlign.Center
             )
         }
@@ -9856,10 +9892,145 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
 }
 
 @Composable
+private fun ReferenceStyleIdentityPanel(state: AppStateModel, skin: SkinTheme, vm: MainViewModel) {
+    val accent = skin.highlight
+    val tracks = (state.quickPicks + state.homeShelves.flatMap { it.songs }).distinctBy { it.id }.take(6).ifEmpty { INITIAL_TRACKS.take(6) }
+    val active = state.activeSong
+    when (skin) {
+        SkinTheme.SPOTIFY -> Column {
+            HomeSectionHeading("Your recent rotation", "Pick up an album, mix or song", accent)
+            LazyVerticalGrid(GridCells.Fixed(2), Modifier.fillMaxWidth().height(142.dp), userScrollEnabled = false, contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(7.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
+                items(tracks.take(4).size) { index -> val song = tracks[index]; Row(Modifier.fillMaxWidth().height(66.dp).clip(RoundedCornerShape(7.dp)).background(skin.panel).clickable { vm.playSongFromShelf(song, tracks) }, verticalAlignment = Alignment.CenterVertically) { AsyncImage(song.coverUrl, null, Modifier.size(66.dp), contentScale = ContentScale.Crop); Text(song.title, color = skin.foreground, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.padding(7.dp)) } }
+            }
+        }
+        SkinTheme.YT_MUSIC -> Column {
+            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) { items(listOf("Focus", "Workout", "Relax", "Energy", "Night Drive")) { mood -> Box(Modifier.clip(CircleShape).background(skin.panel).clickable { vm.openBrowseCategory(mood, BrowseCategoryKind.MOOD) }.padding(horizontal = 14.dp, vertical = 8.dp)) { Text(mood, color = skin.foreground, fontSize = 12.sp) } } }
+            HomeSectionHeading("Quick picks", "Start radio from a song", accent)
+            StyleIdentityTrackRows(tracks.take(3), tracks, skin, vm)
+        }
+        SkinTheme.JIOSAAVN -> ReferenceStyleHero(skin, tracks.first(), "Listen now", "A new release for your day", "ALBUM PREMIERE", 0) { vm.playSongFromShelf(tracks.first(), tracks) }
+        SkinTheme.PRISM_GLASS -> Column(Modifier.padding(horizontal = 18.dp)) {
+            KiloCard(modifier = Modifier.fillMaxWidth().height(130.dp), shape = primaryCardShape(skin), backgroundBrush = Brush.linearGradient(listOf(Color(0xFF895BCE), Color(0xFFC98B65), Color(0xFF4AAB84))), borderBrush = Brush.linearGradient(listOf(Color.White.copy(alpha = 0.45f), Color.Transparent)), contentPadding = 15.dp) {
+                Text("REPLAY · YOUR WEEK", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.2.sp)
+                Spacer(Modifier.weight(1f)); Text("${tracks.size * 3} tracks in your orbit", color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold); Text(tracks.first().artist + " · " + tracks.first().title, color = Color.White.copy(alpha = 0.82f), fontSize = 11.sp, maxLines = 1)
+            }
+            Spacer(Modifier.height(8.dp)); StyleIdentityShortcutGrid(skin, vm)
+        }
+        SkinTheme.DEEZER_FLOW -> Column {
+            HomeSectionHeading("Stories", "Artists in your orbit", accent)
+            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(13.dp)) {
+                items(state.listenerProfile.followedArtists.toList().ifEmpty { listOf("Flow", "Discover", "KILO") }.take(8)) { name -> Column(Modifier.width(58.dp).clickable { vm.openArtistByName(name) }, horizontalAlignment = Alignment.CenterHorizontally) { Box(Modifier.size(52.dp).clip(CircleShape).background(Brush.linearGradient(listOf(accent, skin.canvasBottom))).border(2.dp, accent, CircleShape), contentAlignment = Alignment.Center) { Text(name.take(1), color = skin.foreground, fontSize = 18.sp, fontWeight = FontWeight.Bold) }; Text(name, color = skin.foreground, fontSize = 9.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) } }
+            }
+        }
+        SkinTheme.GAANA_BEATS -> Column {
+            HomeSectionHeading("Playlists for you", "Your personal collection, ready to play", accent)
+            if (state.savedPlaylists.isNotEmpty() || state.youtubeMusicPlaylists.isNotEmpty()) StylePlaylistCards(state, skin, vm)
+            else StyleIdentityTrackRows(tracks.take(3), tracks, skin, vm)
+        }
+        SkinTheme.POCKET_MIX -> Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Box(Modifier.fillMaxWidth().height(138.dp).clip(RoundedCornerShape(7.dp)).background(Color(0xFFD6E9A5)).border(4.dp, Color(0xFF151B15), RoundedCornerShape(7.dp)).clickable { vm.setFullScreenPlayer(true) }) {
+                Column(Modifier.fillMaxSize().padding(11.dp), verticalArrangement = Arrangement.SpaceBetween) { Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("KILO POCKET", color = Color(0xFF172218), fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.2.sp); Text("▰", color = Color(0xFF172218)) }; Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) { AsyncImage(active.coverUrl, null, Modifier.size(62.dp).clip(RoundedCornerShape(4.dp)), contentScale = ContentScale.Crop); Column { Text("Now Playing", color = Color(0xFF4E5A42), fontSize = 10.sp); Text(active.title, color = Color(0xFF172218), fontWeight = FontWeight.Black, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(active.artist, color = Color(0xFF4E5A42), fontSize = 10.sp) } }; LinearProgressIndicator(progress = { state.progress.coerceIn(0f, 1f) }, color = Color(0xFF283522), trackColor = Color(0x55283522), modifier = Modifier.fillMaxWidth().height(4.dp)) }
+            }
+            Spacer(Modifier.height(9.dp)); Box(Modifier.size(142.dp).clip(CircleShape).background(Color(0xFFE2E4DF)).border(2.dp, Color(0xFFB6BAB3), CircleShape)) { IconButton(onClick = { vm.setScreen(ScreenNav.LIBRARY) }, modifier = Modifier.align(Alignment.TopCenter)) { Icon(Icons.Default.KeyboardArrowUp, "Library", tint = Color.DarkGray) }; IconButton(onClick = { vm.setScreen(ScreenNav.EXPLORE) }, modifier = Modifier.align(Alignment.CenterStart)) { Icon(Icons.Default.KeyboardArrowLeft, "Browse", tint = Color.DarkGray) }; IconButton(onClick = { vm.setScreen(ScreenNav.RADIO) }, modifier = Modifier.align(Alignment.CenterEnd)) { Icon(Icons.Default.KeyboardArrowRight, "Radio", tint = Color.DarkGray) }; IconButton(onClick = { vm.togglePlay() }, modifier = Modifier.align(Alignment.Center).size(58.dp).clip(CircleShape).background(Color.White)) { Icon(if (state.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, "Play or pause", tint = Color.DarkGray) }; Text("MENU", color = Color.Gray, fontSize = 7.sp, modifier = Modifier.align(Alignment.TopCenter).padding(top = 3.dp)) }
+        }
+        SkinTheme.JIOSAAVN_WAVE -> Column {
+            HomeSectionHeading("From your library", "Your music, one tap away", accent)
+            StyleIdentityShortcutGrid(skin, vm)
+            Spacer(Modifier.height(8.dp)); HomeSongCarousel("Recently played", SessionStore.recentSongs().take(8).ifEmpty { tracks }, skin, vm, "Return to something familiar")
+        }
+        SkinTheme.YANDEX_WAVE -> ReferenceStyleHero(skin, tracks.first(), "Your wave", "A personal stream that keeps moving", "NEW WAVE", 2) { vm.playSongFromShelf(tracks.first(), tracks) }
+        SkinTheme.NIGHT_DRIVE -> ReferenceStyleHero(skin, tracks.first(), "After dark", "The long way home sounds better", "KILO AFTER DARK", 3) { vm.playSongFromShelf(tracks.first(), tracks) }
+        SkinTheme.QOBUZ_EDITORIAL -> ReferenceStyleHero(skin, tracks.first(), "New releases", "Listen closely · selected for your taste", "EDITORIAL SELECTION", 0) { vm.playSongFromShelf(tracks.first(), tracks) }
+        SkinTheme.AMAZON_EDITORIAL -> Column(Modifier.padding(horizontal = 18.dp)) {
+            HomeSectionHeading("Insights", "Your listening, in focus", accent)
+            KiloCard(modifier = Modifier.fillMaxWidth().height(116.dp), shape = primaryCardShape(skin), backgroundBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.25f), skin.panel)), borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.58f), skin.foreground.copy(alpha = 0.04f))), contentPadding = 14.dp) {
+                Text("THIS WEEK", color = accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp); Spacer(Modifier.weight(1f)); Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text("${tracks.size * 4} tracks", color = skin.foreground, fontSize = 16.sp, fontWeight = FontWeight.Bold); Text("${state.listenerProfile.followedArtists.size} artists", color = skin.foreground, fontSize = 16.sp, fontWeight = FontWeight.Bold) }
+            }
+        }
+        SkinTheme.SOUNDCLOUD_WAVE -> Column {
+            HomeSectionHeading("Your stream", "New sounds from the artists you follow", accent)
+            StyleIdentityTrackRows(tracks.take(3), tracks, skin, vm, waveform = true)
+        }
+        SkinTheme.KILO_ORIGINAL -> Box(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 5.dp).height(178.dp).clip(RoundedCornerShape(28.dp)).clickable { vm.playSongFromShelf(tracks.first(), tracks) }) {
+            AsyncImage(tracks.first().coverUrl, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alpha = 0.5f)
+            Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(Color(0xDD07111B), Color(0xAA15132F), Color(0xEE070B14)))))
+            Text("K", color = accent.copy(alpha = 0.22f), fontSize = 148.sp, fontWeight = FontWeight.Black, modifier = Modifier.align(Alignment.CenterEnd).padding(end = 13.dp))
+            Column(Modifier.align(Alignment.CenterStart).fillMaxWidth(0.78f).padding(17.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) { Text("KILO ORIGINAL", color = accent, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.8.sp); Text("Made around you.", color = Color.White, fontSize = 23.sp, fontWeight = FontWeight.ExtraBold); Text("${tracks.first().title} · ${tracks.first().artist}", color = Color.White.copy(alpha = 0.82f), fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis); Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) { repeat(4) { Box(Modifier.width((20 + it * 10).dp).height(3.dp).clip(CircleShape).background(accent.copy(alpha = 1f - it * 0.15f))) } } }
+        }
+        SkinTheme.FROSTED_NIGHT -> KiloCard(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp).height(148.dp).clickable { vm.setFullScreenPlayer(true) }, shape = primaryCardShape(skin), backgroundBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.16f), skin.panel, skin.canvasBottom)), borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.55f), Color(0xFFE23AC7).copy(alpha = 0.28f))), contentPadding = 14.dp) {
+            Text("PLAYING FROM SESSION", color = accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp); Spacer(Modifier.weight(1f)); Text(active.title, color = skin.foreground, fontSize = 19.sp, fontWeight = FontWeight.Bold, maxLines = 1); Text(active.artist, color = skin.mutedForeground, fontSize = 11.sp); Icon(Icons.Default.GraphicEq, null, tint = Color(0xFFE23AC7), modifier = Modifier.align(Alignment.End))
+        }
+        SkinTheme.SUNSET_GLASS -> Box(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp).height(168.dp).clip(RoundedCornerShape(30.dp)).clickable { vm.playSongFromShelf(tracks.first(), tracks) }) {
+            AsyncImage(tracks.first().coverUrl, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alpha = 0.72f)
+            Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.82f)))))
+            Column(Modifier.align(Alignment.BottomStart).fillMaxWidth().padding(15.dp)) { Text("KILO LISTENING SPACE", color = Color.White.copy(alpha = 0.8f), fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp); Text(tracks.first().title, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold, maxLines = 1); Text(tracks.first().artist, color = Color.White.copy(alpha = 0.78f), fontSize = 11.sp) }
+            Box(Modifier.align(Alignment.TopEnd).padding(10.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.24f)).border(1.dp, Color.White.copy(alpha = 0.42f), CircleShape).padding(horizontal = 11.dp, vertical = 6.dp)) { Text("Explore", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+        }
+    }
+}
+
+@Composable
+private fun ReferenceStyleHero(skin: SkinTheme, song: SongItemClean, heading: String, subtitle: String, eyebrow: String, mode: Int, onPlay: () -> Unit) {
+    val shape = primaryCardShape(skin)
+    if (mode == 3) {
+        Box(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp).height(174.dp).clip(shape).clickable(onClick = onPlay)) {
+            AsyncImage(song.coverUrl, null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            Box(Modifier.fillMaxSize().background(Brush.horizontalGradient(listOf(Color.Black.copy(alpha = 0.84f), Color.Transparent))))
+            Column(Modifier.align(Alignment.CenterStart).fillMaxWidth(0.7f).padding(15.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { Text(eyebrow, color = skin.highlight, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp); Text(heading, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold); Text(subtitle, color = Color.White.copy(alpha = 0.78f), fontSize = 11.sp); Icon(Icons.Default.PlayArrow, "Play", tint = Color.Black, modifier = Modifier.size(32.dp).clip(CircleShape).background(skin.highlight).padding(6.dp)) }
+        }
+    } else {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 6.dp).height(168.dp).clip(shape).background(skin.panel).border(1.dp, skin.highlight.copy(alpha = 0.25f), shape).clickable(onClick = onPlay), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).fillMaxHeight().padding(14.dp), verticalArrangement = Arrangement.SpaceBetween) { Column { Text(eyebrow, color = skin.highlight, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp); Text(heading, color = skin.foreground, fontSize = 19.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 9.dp)); Text(subtitle, color = skin.mutedForeground, fontSize = 11.sp) }; Text("${song.title} · ${song.artist}", color = skin.foreground, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+            AsyncImage(song.coverUrl, null, Modifier.fillMaxHeight().width(135.dp), contentScale = ContentScale.Crop)
+        }
+    }
+}
+
+@Composable
+private fun StyleIdentityTrackRows(songs: List<SongItemClean>, queue: List<SongItemClean>, skin: SkinTheme, vm: MainViewModel, waveform: Boolean = false) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp).clip(primaryCardShape(skin)).background(skin.panel)) {
+        songs.forEach { song ->
+            Row(Modifier.fillMaxWidth().height(if (waveform) 70.dp else 62.dp).clickable { vm.playSongFromShelf(song, queue) }.padding(horizontal = 9.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                AsyncImage(song.coverUrl, null, Modifier.size(46.dp).clip(RoundedCornerShape(if (waveform) 9.dp else 5.dp)), contentScale = ContentScale.Crop)
+                Column(Modifier.weight(1f)) { Text(song.title, color = skin.foreground, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(song.artist, color = skin.mutedForeground, fontSize = 10.sp, maxLines = 1) }
+                if (waveform) Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) { repeat(14) { i -> Box(Modifier.width(2.dp).height((6 + ((i * 9 + song.title.length) % 14)).dp).clip(CircleShape).background(skin.highlight)) } }
+                else Icon(Icons.Default.MoreVert, "More options", tint = skin.mutedForeground)
+            }
+        }
+    }
+}
+
+@Composable
+private fun StylePlaylistCards(state: AppStateModel, skin: SkinTheme, vm: MainViewModel) {
+    LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+        items(state.savedPlaylists.take(6), key = { "theme_playlist_${it.id}" }) { playlist -> PlaylistQuickCard(playlist.name, "${playlist.songs.size} songs", playlist.coverUrl.ifBlank { playlist.songs.firstOrNull()?.coverUrl.orEmpty() }, skin, skin.highlight, onSmartShuffle = { vm.startSmartShuffle(playlist.songs, playlist.name) }, onAutoplay = { vm.addPlaylistToAutoplay(playlist.id) }, onClick = { vm.openSavedPlaylistDetail(playlist) }) }
+        items(state.youtubeMusicPlaylists.take(6), key = { "theme_yt_playlist_${it.playlistId}" }) { playlist -> PlaylistQuickCard(playlist.title, "YouTube Music playlist", playlist.coverUrl, skin, skin.highlight, onClick = { vm.openYoutubeMusicPlaylistDetail(playlist) }) }
+    }
+}
+
+@Composable
+private fun StyleIdentityShortcutGrid(skin: SkinTheme, vm: MainViewModel) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 18.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        HomeShortcutCard("Library", Icons.Default.LibraryMusic, skin.highlight, skin, Modifier.weight(1f)) {
+            vm.setScreen(ScreenNav.LIBRARY)
+        }
+        HomeShortcutCard("Browse", Icons.Default.Explore, skin.highlight, skin, Modifier.weight(1f)) {
+            vm.setScreen(ScreenNav.EXPLORE)
+        }
+        HomeShortcutCard("Radio", Icons.Default.Radio, skin.highlight, skin, Modifier.weight(1f)) {
+            vm.setScreen(ScreenNav.RADIO)
+        }
+    }
+}
+@Composable
 private fun HomeSectionHeading(title: String, subtitle: String, accent: Color) {
+    val skin = LocalPrimarySkin.current
     Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 9.dp)) {
-        Text(title, color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold)
-        Text(subtitle, color = Color.White.copy(alpha = 0.62f), fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
+        Text(title, color = skin.foreground, fontSize = 19.sp, fontWeight = FontWeight.ExtraBold)
+        Text(subtitle, color = skin.mutedForeground, fontSize = 11.sp, modifier = Modifier.padding(top = 2.dp))
     }
 }
 
@@ -10088,7 +10259,7 @@ private fun CompactHomeActionCard(
         if (busy) CircularProgressIndicator(color = accent, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
         else Icon(icon, contentDescription = null, tint = accent, modifier = Modifier.size(18.dp))
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(title, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+            Text(title, color = skin.foreground, fontSize = 11.sp, fontWeight = FontWeight.Bold,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(subtitle, color = Color.White.copy(alpha = 0.62f), fontSize = 9.sp,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -10118,21 +10289,21 @@ private fun PlaylistQuickCard(
         contentPadding = 8.dp
     ) {
         Row(Modifier.fillMaxSize(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Box(Modifier.size(58.dp).clip(RoundedCornerShape(12.dp)).background(Color.White.copy(alpha = 0.06f))) {
+            Box(Modifier.size(58.dp).clip(RoundedCornerShape(12.dp)).background(skin.foreground.copy(alpha = 0.06f))) {
                 if (artwork.isNotBlank()) AsyncImage(
                     model = artwork, contentDescription = title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()
                 ) else Icon(Icons.Default.QueueMusic, contentDescription = null, tint = accent, modifier = Modifier.align(Alignment.Center))
             }
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(title, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                Text(title, color = skin.foreground, fontSize = 11.sp, fontWeight = FontWeight.Bold,
                     maxLines = 2, overflow = TextOverflow.Ellipsis)
-                Text(subtitle, color = Color.White.copy(alpha = 0.58f), fontSize = 9.sp,
+                Text(subtitle, color = skin.mutedForeground, fontSize = 9.sp,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (onSmartShuffle != null || onAutoplay != null) {
                 Box {
                     IconButton(onClick = { actionsExpanded = true }, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.MoreVert, contentDescription = "$title options", tint = Color.White.copy(alpha = 0.78f))
+                        Icon(Icons.Default.MoreVert, contentDescription = "$title options", tint = skin.foreground.copy(alpha = 0.78f))
                     }
                     DropdownMenu(expanded = actionsExpanded, onDismissRequest = { actionsExpanded = false }) {
                         DropdownMenuItem(
@@ -10157,7 +10328,7 @@ private fun PlaylistQuickCard(
                     }
                 }
             } else {
-                Icon(Icons.Default.ArrowForward, contentDescription = "Open $title", tint = Color.White.copy(alpha = 0.58f), modifier = Modifier.size(16.dp))
+                Icon(Icons.Default.ArrowForward, contentDescription = "Open $title", tint = skin.mutedForeground, modifier = Modifier.size(16.dp))
             }
         }
     }
@@ -10177,14 +10348,14 @@ private fun YouScreen(vm: MainViewModel) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         item {
-            Text("You", color = Color.White, fontSize = 30.sp, fontWeight = FontWeight.ExtraBold)
-            Text("Your profile, listening history, and KILO preferences", color = Color.White.copy(alpha = 0.63f), fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
+            Text("You", color = skin.foreground, fontSize = 30.sp, fontWeight = FontWeight.ExtraBold)
+            Text("Your profile, listening history, and KILO preferences", color = skin.foreground.copy(alpha = 0.63f), fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
         }
         item {
             KiloCard(
                 modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp),
                 backgroundBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.3f), primaryPanelColor(skin))),
-                borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.45f), Color.White.copy(alpha = 0.06f))),
+                borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.45f), skin.foreground.copy(alpha = 0.06f))),
                 contentPadding = 18.dp
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(13.dp)) {
@@ -10192,11 +10363,11 @@ private fun YouScreen(vm: MainViewModel) {
                         Icon(Icons.Default.Person, contentDescription = null, tint = accent, modifier = Modifier.size(27.dp))
                     }
                     Column(Modifier.weight(1f)) {
-                        Text(state.displayName.trim().ifBlank { "Listener" }, color = Color.White, fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                        Text(state.displayName.trim().ifBlank { "Listener" }, color = skin.foreground, fontSize = 19.sp, fontWeight = FontWeight.Bold)
                         Text(
                             if (state.isLoggedIn) "YouTube Music connected"
                             else "On-device profile · sign in for online playlists",
-                            color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp
+                            color = skin.foreground.copy(alpha = 0.66f), fontSize = 12.sp
                         )
                     }
                     if (state.isLoggedIn) {
@@ -10224,33 +10395,125 @@ private fun YouScreen(vm: MainViewModel) {
             KiloCard(
                 modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(22.dp),
                 backgroundBrush = Brush.linearGradient(listOf(Color(0xFF17283A), primaryPanelColor(skin))),
-                borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.25f), Color.White.copy(alpha = 0.05f))), contentPadding = 16.dp
+                borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.25f), skin.foreground.copy(alpha = 0.05f))), contentPadding = 16.dp
             ) {
                 Text("Genres", color = accent, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                Text((dna?.topGenres.orEmpty().ifEmpty { state.listenerProfile.favoriteGenres.toList() }.take(4).joinToString(" · ")).ifBlank { "Choose genres in Personalisation" }, color = Color.White, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
+                Text((dna?.topGenres.orEmpty().ifEmpty { state.listenerProfile.favoriteGenres.toList() }.take(4).joinToString(" · ")).ifBlank { "Choose genres in Personalisation" }, color = skin.foreground, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
                 Text("Artists", color = accent, fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.padding(top = 12.dp))
-                Text((dna?.topArtists.orEmpty().ifEmpty { state.listenerProfile.followedArtists.toList() }.take(4).joinToString(" · ")).ifBlank { "Follow artists to shape your recommendations" }, color = Color.White, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
+                Text((dna?.topArtists.orEmpty().ifEmpty { state.listenerProfile.followedArtists.toList() }.take(4).joinToString(" · ")).ifBlank { "Follow artists to shape your recommendations" }, color = skin.foreground, fontSize = 14.sp, modifier = Modifier.padding(top = 4.dp))
             }
         }
         item {
             HomeSectionHeading("Personalisation & Settings", "Adjust how KILO fits you", accent)
             SettingsGroupCard {
                 SettingsRowItem(Icons.Default.Tune, "Personalisation Settings", "Moods, genres, artists, languages and discovery", onClick = vm::openPersonalizationWizard)
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+                HorizontalDivider(color = skin.foreground.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
                 SettingsRowItem(Icons.Default.PlayArrow, "Playback Settings", "Speed, repeat, DJ mode and sleep timer", onClick = { vm.setScreen(ScreenNav.PLAYBACK_SETTINGS) })
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+                HorizontalDivider(color = skin.foreground.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
                 SettingsRowItem(Icons.Default.Equalizer, "Audio Settings", "Equalizer and sound controls", onClick = { vm.setScreen(ScreenNav.EQUALIZER) })
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+                HorizontalDivider(color = skin.foreground.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
                 SettingsRowItem(Icons.Default.DirectionsCar, "Android Auto Settings", "Layouts and driving options", onClick = { vm.setScreen(ScreenNav.ANDROID_AUTO_SETTINGS) })
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+                HorizontalDivider(color = skin.foreground.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
                 SettingsRowItem(Icons.Default.Download, "Downloads & Storage", "Manage offline music", onClick = { vm.setScreen(ScreenNav.OFFLINE) })
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+                HorizontalDivider(color = skin.foreground.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
                 SettingsRowItem(Icons.Default.Palette, "Appearance", "Themes and player styles", onClick = { vm.setScreen(ScreenNav.APPEARANCE) })
-                HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+                HorizontalDivider(color = skin.foreground.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+                SettingsRowItem(Icons.Default.Link, "Sources", "Optional lossless source bridge", onClick = { vm.setScreen(ScreenNav.SOURCES) })
+                HorizontalDivider(color = skin.foreground.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
                 SettingsRowItem(Icons.Default.Info, "About & Updates", "Version details and in-app updates", onClick = { vm.setScreen(ScreenNav.ABOUT_UPDATES) })
             }
         }
     }
+}
+
+@Composable
+private fun SourcesScreen(vm: MainViewModel) {
+    val state by vm.state.collectAsState()
+    val skin = state.activeSkin
+    val accent = skin.highlight
+    var provider by remember(state.losslessSourceProvider) { mutableStateOf(state.losslessSourceProvider) }
+    var sourceUrl by remember(state.losslessSourceUrl) { mutableStateOf(state.losslessSourceUrl) }
+    var sourceToken by remember { mutableStateOf("") }
+
+    Column(Modifier.fillMaxSize().background(primaryBackdrop(skin))) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = { vm.handleSystemBack() }) {
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = skin.foreground)
+            }
+            Column {
+                Text("CONNECTIONS", color = accent, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp)
+                Text("Sources", color = skin.foreground, fontSize = 25.sp, fontWeight = FontWeight.ExtraBold)
+            }
+        }
+        LazyColumn(
+            contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Text("LOSSLESS SOURCE", color = skin.mutedForeground, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, modifier = Modifier.padding(start = 6.dp, bottom = 2.dp))
+                SettingsGroupCard {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                        Text("Connect a source bridge", color = skin.foreground, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                        Text(
+                            "Choose the provider label, then enter a KILO-compatible HTTPS manifest URL and credentials supplied by a source you’re authorized to use. This does not connect directly to Qobuz, Tidal, or Deezer by itself.",
+                            color = skin.mutedForeground, fontSize = 12.sp, lineHeight = 17.sp
+                        )
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            items(listOf("Qobuz", "Tidal", "Deezer", "Custom")) { name ->
+                                FilterChip(
+                                    selected = provider.equals(if (name == "Custom") "Custom source" else "$name bridge", ignoreCase = true),
+                                    onClick = { provider = if (name == "Custom") "Custom source" else "$name bridge" },
+                                    label = { Text(name) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = accent.copy(alpha = 0.25f),
+                                        selectedLabelColor = skin.foreground,
+                                        labelColor = skin.mutedForeground
+                                    )
+                                )
+                            }
+                        }
+                        OutlinedTextField(
+                            value = sourceUrl,
+                            onValueChange = { sourceUrl = it },
+                            label = { Text("${provider} manifest URL") },
+                            placeholder = { Text("https://your-authorized-bridge.example") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = skin.foreground, unfocusedTextColor = skin.foreground,
+                                focusedBorderColor = accent, unfocusedBorderColor = skin.mutedForeground.copy(alpha = 0.35f),
+                                focusedLabelColor = accent, unfocusedLabelColor = skin.mutedForeground
+                            )
+                        )
+                        OutlinedTextField(
+                            value = sourceToken,
+                            onValueChange = { sourceToken = it },
+                            label = { Text(if (state.losslessSourceHasToken) "Access token (saved securely; blank keeps current)" else "Optional access token") },
+                            singleLine = true,
+                            visualTransformation = PasswordVisualTransformation(),
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = skin.foreground, unfocusedTextColor = skin.foreground,
+                                focusedBorderColor = accent, unfocusedBorderColor = skin.mutedForeground.copy(alpha = 0.35f),
+                                focusedLabelColor = accent, unfocusedLabelColor = skin.mutedForeground
+                            )
+                        )
+                        Text(state.losslessSourceStatus, color = accent, fontSize = 12.sp)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Button(
+                                onClick = { vm.configureLosslessSource(sourceUrl, sourceToken, provider); sourceToken = "" },
+                                enabled = sourceUrl.isNotBlank(),
+                                colors = ButtonDefaults.buttonColors(containerColor = accent)
+                            ) { Text("Test & save", color = if (skin.isLight) Color.White else Color.Black) }
+                            if (state.losslessSourceEnabled) TextButton(onClick = vm::disableLosslessSource) { Text("Disconnect", color = accent) }
+                        }
+                        Text("KILO checks that the bridge offers search and stream endpoints, validates matching track metadata, and falls back to YouTube Music when no lossless match is available.", color = skin.mutedForeground, fontSize = 11.sp, lineHeight = 15.sp)
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 @Composable
@@ -10751,8 +11014,8 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
     ) {
         item {
             Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp)) {
-                Text("Explore", color = Color.White, fontSize = 29.sp, fontWeight = FontWeight.ExtraBold)
-                Text("Music for what you’re into right now", color = Color.White.copy(alpha = 0.63f), fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp))
+                Text("Explore", color = skin.foreground, fontSize = 29.sp, fontWeight = FontWeight.ExtraBold)
+                Text("Music for what you’re into right now", color = skin.foreground.copy(alpha = 0.63f), fontSize = 13.sp, modifier = Modifier.padding(top = 3.dp))
             }
         }
         item(key = "browse_quick_access") {
@@ -10824,7 +11087,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
             if (state.savedPlaylists.isEmpty() && state.youtubeMusicPlaylists.isEmpty()) {
                 Text(
                     if (state.isLoadingYoutubeMusicPlaylists) "Loading your playlists…" else "Your saved playlists will appear here.",
-                    color = Color.White.copy(alpha = 0.58f), fontSize = 12.sp,
+                    color = skin.foreground.copy(alpha = 0.58f), fontSize = 12.sp,
                     modifier = Modifier.padding(horizontal = browseGutter, vertical = 8.dp)
                 )
             } else {
@@ -10895,11 +11158,11 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                 else Box(Modifier.fillMaxSize().background(Brush.linearGradient(listOf(Color(0xFF0A8297), Color(0xFF322463), Color(0xFF131722)))))
                 Box(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color.Black.copy(alpha = 0.03f), Color.Black.copy(alpha = 0.84f)))))
                 Column(Modifier.align(Alignment.BottomStart).padding(18.dp)) {
-                    Text("KILO DISCOVERY", color = Color.White.copy(alpha = 0.78f), fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.3.sp)
-                    Text("Find your next favourite", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(top = 4.dp))
-                    Text("New sounds shaped around your taste", color = Color.White.copy(alpha = 0.8f), fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
+                    Text("KILO DISCOVERY", color = skin.foreground.copy(alpha = 0.78f), fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.3.sp)
+                    Text("Find your next favourite", color = skin.foreground, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, modifier = Modifier.padding(top = 4.dp))
+                    Text("New sounds shaped around your taste", color = skin.foreground.copy(alpha = 0.8f), fontSize = 12.sp, modifier = Modifier.padding(top = 2.dp))
                 }
-                Icon(Icons.Default.ArrowForward, contentDescription = "Explore discovery", tint = Color.White, modifier = Modifier.align(Alignment.BottomEnd).padding(18.dp))
+                Icon(Icons.Default.ArrowForward, contentDescription = "Explore discovery", tint = skin.foreground, modifier = Modifier.align(Alignment.BottomEnd).padding(18.dp))
             }
         }
         if (browseSongPicks.isNotEmpty()) {
@@ -10926,7 +11189,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     CircularProgressIndicator(color = accent, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                    Text("Loading picks for you…", color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+                    Text("Loading picks for you…", color = skin.foreground.copy(alpha = 0.7f), fontSize = 13.sp)
                 }
             }
         }
@@ -10997,7 +11260,7 @@ private fun KiloBrowseScreen(vm: MainViewModel) {
                 )
                 else -> Text(
                     "YouTube Music curated playlists are unavailable right now.",
-                    color = Color.White.copy(alpha = 0.58f),
+                    color = skin.foreground.copy(alpha = 0.58f),
                     fontSize = 12.sp,
                     modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)
                 )
@@ -11470,6 +11733,14 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
             )
             HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
             SettingsRowItem(
+                icon = Icons.Default.Link,
+                title = "Sources",
+                subtitle = "Optional lossless source bridge",
+                trailingValue = "Manage",
+                onClick = { vm.setScreen(ScreenNav.SOURCES) }
+            )
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            SettingsRowItem(
                 icon = Icons.Default.SwitchAccount,
                 title = "Switch Profiles",
                 subtitle = "Manage multiple listeners",
@@ -11806,6 +12077,7 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
                         description = option.description,
                         checked = state.uiCustomizations[option.key] ?: option.enabledByDefault,
                         accent = accent,
+                        enabled = !(option.key == "glassPanels" && state.activeSkin.glassLocked),
                         onCheckedChange = { vm.toggleCustomization(option.key, it) }
                     )
                     if (index < groupOptions.size - 1) {
@@ -11846,6 +12118,21 @@ fun EqualizerScreen(vm: MainViewModel) {
                 )
             }
         }
+        SettingsSectionHeader("AUDIO MODE")
+        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(horizontal = 2.dp)) {
+            items(com.example.kilo.audio.dsp.AudioPresentationMode.values().toList(), key = { it.name }) { mode ->
+                FilterChip(
+                    selected = soundEngine.audioMode.equals(mode.name, ignoreCase = true),
+                    onClick = { vm.setAudioMode(mode) },
+                    label = { Text(mode.title) }
+                )
+            }
+        }
+        Text(
+            "${soundEngine.loudnessMode.lowercase().replaceFirstChar { it.uppercase() }} normalization · ${soundEngine.output.kind.label} · ${"%.1f".format(soundEngine.currentGainDb)} dB adjustment. KILO never changes device volume.",
+            color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp,
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
+        )
         Text(
             "${soundEngine.output.kind.label} · ${soundEngine.message}",
             color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp, lineHeight = 17.sp,
@@ -12054,21 +12341,22 @@ private fun HomeLayoutScreen(vm: MainViewModel) {
 @Composable
 fun AppearanceScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
-    val accent = state.activeSkin.highlight
+    val skin = state.activeSkin
+    val accent = skin.highlight
     val activePlayerStyle = PLAYER_STYLE_PRESETS.firstOrNull { it.id == state.selectedPlayerStyleId }?.name ?: "Default player style"
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
+    Column(Modifier.fillMaxSize().background(primaryBackdrop(skin)).verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { vm.handleSystemBack() }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back", tint = skin.foreground)
             }
             Column(Modifier.weight(1f)) {
                 Text("PERSONALIZE KILO", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.6.sp)
-                Text("Appearance", color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.ExtraBold)
+                Text("Appearance", color = skin.foreground, fontSize = 27.sp, fontWeight = FontWeight.ExtraBold)
             }
         }
         Text(
             "Choose a look for the whole app or customize the player separately.",
-            color = Color.White.copy(alpha = 0.68f), fontSize = 13.sp, lineHeight = 19.sp,
+            color = skin.mutedForeground, fontSize = 13.sp, lineHeight = 19.sp,
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
         )
         SettingsSectionHeader("LOOK & FEEL")
@@ -12080,7 +12368,7 @@ fun AppearanceScreen(vm: MainViewModel) {
                 trailingValue = HOME_LAYOUT_PRESETS.firstOrNull { it.id == state.homeLayoutId }?.title ?: "Balanced",
                 onClick = { vm.setScreen(ScreenNav.HOME_LAYOUT) }
             )
-            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            HorizontalDivider(color = skin.foreground.copy(alpha = 0.08f), modifier = Modifier.padding(horizontal = 16.dp))
             SettingsRowItem(
                 icon = Icons.Default.Palette,
                 title = "Themes",
@@ -12088,7 +12376,7 @@ fun AppearanceScreen(vm: MainViewModel) {
                 trailingValue = "Customize",
                 onClick = { vm.setScreen(ScreenNav.APP_APPEARANCE) }
             )
-            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            HorizontalDivider(color = skin.foreground.copy(alpha = 0.08f), modifier = Modifier.padding(horizontal = 16.dp))
             SettingsRowItem(
                 icon = Icons.Default.Equalizer,
                 title = "Player Styles",
@@ -12103,45 +12391,46 @@ fun AppearanceScreen(vm: MainViewModel) {
 @Composable
 fun AppAppearanceScreen(vm: MainViewModel) {
     val state by vm.state.collectAsState()
-    val accent = state.activeSkin.highlight
-    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
+    val skin = state.activeSkin
+    val accent = skin.highlight
+    Column(Modifier.fillMaxSize().background(primaryBackdrop(skin)).verticalScroll(rememberScrollState()).padding(horizontal = 18.dp, vertical = 12.dp)) {
         Row(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 14.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { vm.handleSystemBack() }) {
-                Icon(Icons.Default.ArrowBack, contentDescription = "Back to appearance", tint = Color.White)
+                Icon(Icons.Default.ArrowBack, contentDescription = "Back to appearance", tint = skin.foreground)
             }
             Column(Modifier.weight(1f)) {
                 Text("KILO DESIGN STUDIO", color = accent, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 1.6.sp)
-                Text("Themes", color = Color.White, fontSize = 27.sp, fontWeight = FontWeight.ExtraBold)
+                Text("Themes", color = skin.foreground, fontSize = 27.sp, fontWeight = FontWeight.ExtraBold)
             }
         }
         Text(
             "Choose a complete look for Home, Browse, Library, navigation and the player.",
-            color = Color.White.copy(alpha = 0.68f), fontSize = 13.sp, lineHeight = 19.sp,
+            color = skin.mutedForeground, fontSize = 13.sp, lineHeight = 19.sp,
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp)
         )
         SettingsSectionHeader("CHOOSE A COMPLETE LOOK")
-        SkinTheme.values().toList().chunked(3).forEach { rowSkins ->
+        SkinTheme.values().toList().chunked(2).forEach { rowSkins ->
             Row(horizontalArrangement = Arrangement.spacedBy(9.dp), modifier = Modifier.fillMaxWidth()) {
                 rowSkins.forEach { skin ->
                     val selected = state.activeSkin == skin
                     val shape = primaryCardShape(skin)
                     Column(
-                        modifier = Modifier.weight(1f).heightIn(min = 128.dp).clip(shape)
-                            .background(if (skin.layoutFamily == 0) Brush.linearGradient(listOf(skin.highlight.copy(alpha = 0.25f), Color(0xFF181A24))) else primaryBackdrop(skin))
-                            .border(1.dp, if (selected) skin.highlight else Color.White.copy(alpha = 0.08f), shape)
+                        modifier = Modifier.weight(1f).heightIn(min = 188.dp).clip(shape)
+                            .background(primaryBackdrop(skin))
+                            .border(1.dp, if (selected) skin.highlight else skin.foreground.copy(alpha = 0.15f), shape)
                             .clickable { vm.setSkin(skin) }.padding(10.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                             Box(Modifier.size(9.dp).clip(CircleShape).background(skin.highlight))
-                            Text(skin.title, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Text(skin.title, color = skin.foreground, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
-                        AppLayoutPreview(skin.ordinal, skin.highlight)
-                        Text(skin.description, color = Color.White.copy(alpha = 0.70f), fontSize = 9.sp, lineHeight = 12.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                        AppLayoutPreview(skin)
+                        Text(skin.description, color = skin.mutedForeground, fontSize = 9.sp, lineHeight = 12.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
                         Text(if (selected) "ACTIVE" else "TAP TO APPLY", color = skin.highlight, fontSize = 8.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 0.8.sp)
                     }
                 }
-                repeat(3 - rowSkins.size) { Spacer(Modifier.weight(1f)) }
+                repeat(2 - rowSkins.size) { Spacer(Modifier.weight(1f)) }
             }
             Spacer(Modifier.height(9.dp))
         }
@@ -12149,72 +12438,106 @@ fun AppAppearanceScreen(vm: MainViewModel) {
 }
 
 @Composable
-private fun AppLayoutPreview(index: Int, accent: Color) {
-    val panel = Color(0xFF11151E)
-    val shapes = listOf(24.dp, 6.dp, 16.dp, 28.dp, 20.dp)
+private fun AppLayoutPreview(skin: SkinTheme) {
+    val accent = skin.highlight
+    val surface = skin.panel
+    val ink = skin.foreground
+    val muted = skin.mutedForeground
+    val artShape = RoundedCornerShape((skin.cardRadius / 2).coerceAtLeast(5).dp)
+    val label = when (skin) {
+        SkinTheme.SUNSET_GLASS -> "LISTENING SPACE"
+        SkinTheme.SPOTIFY -> "YOUR ROTATION"
+        SkinTheme.YT_MUSIC -> "START RADIO FROM"
+        SkinTheme.JIOSAAVN -> "ALBUM PREMIERE"
+        SkinTheme.PRISM_GLASS -> "REPLAY · YOUR WEEK"
+        SkinTheme.FROSTED_NIGHT -> "NOW PLAYING"
+        SkinTheme.DEEZER_FLOW -> "ARTIST STORIES"
+        SkinTheme.GAANA_BEATS -> "PLAYLISTS FOR YOU"
+        SkinTheme.POCKET_MIX -> "KILO POCKET"
+        SkinTheme.JIOSAAVN_WAVE -> "RECENTLY PLAYED"
+        SkinTheme.YANDEX_WAVE -> "YOUR WAVE"
+        SkinTheme.NIGHT_DRIVE -> "AFTER DARK"
+        SkinTheme.QOBUZ_EDITORIAL -> "NEW RELEASES"
+        SkinTheme.AMAZON_EDITORIAL -> "MONTHLY INSIGHTS"
+        SkinTheme.SOUNDCLOUD_WAVE -> "YOUR STREAM"
+        SkinTheme.KILO_ORIGINAL -> "KILO ORIGINAL"
+    }
     Column(
-        Modifier.fillMaxWidth().height(104.dp).clip(RoundedCornerShape(12.dp))
-            .background(Color(0xFF080B11)).padding(7.dp),
+        Modifier.fillMaxWidth().height(120.dp).clip(RoundedCornerShape(14.dp))
+            .background(skin.canvasBottom).border(1.dp, ink.copy(alpha = 0.12f), RoundedCornerShape(14.dp)).padding(7.dp),
         verticalArrangement = Arrangement.spacedBy(5.dp)
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            Text(when (index) { 0 -> "Listen Now"; 1 -> "Good afternoon"; 2 -> "Home"; 3 -> "Listen Now"; 9 -> "For you"; 14 -> "Your stream"; else -> "Discover" }, color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
-            Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) {
-                repeat(2) { Box(Modifier.size(5.dp).clip(CircleShape).background(accent.copy(alpha = 0.85f))) }
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = accent, fontSize = 6.sp, fontWeight = FontWeight.ExtraBold, letterSpacing = 0.6.sp, modifier = Modifier.weight(1f), maxLines = 1)
+            Box(Modifier.size(5.dp).clip(CircleShape).background(accent))
+        }
+        when (skin) {
+            SkinTheme.SPOTIFY -> Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                repeat(2) { row -> Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) { repeat(2) { col -> Row(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(5.dp)).background(surface), verticalAlignment = Alignment.CenterVertically) { Box(Modifier.fillMaxHeight().aspectRatio(1f).background(Brush.linearGradient(listOf(accent.copy(alpha = .72f), surface)))); Box(Modifier.padding(4.dp).fillMaxWidth(.68f).height(3.dp).clip(CircleShape).background(ink.copy(alpha = .72f))) } } } }
+            }
+            SkinTheme.YT_MUSIC -> Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(3.dp)) { repeat(4) { Box(Modifier.weight(1f).height(10.dp).clip(CircleShape).background(surface).border(1.dp, ink.copy(alpha = .14f), CircleShape)) } }
+                repeat(2) { Box(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(5.dp)).background(surface).padding(5.dp)) { Row(verticalAlignment = Alignment.CenterVertically) { Box(Modifier.size(20.dp).clip(RoundedCornerShape(4.dp)).background(Brush.linearGradient(listOf(accent, skin.canvasTop)))); Box(Modifier.padding(start = 5.dp).fillMaxWidth(.6f).height(4.dp).clip(CircleShape).background(ink.copy(alpha = .6f))) } } }
+            }
+            SkinTheme.JIOSAAVN -> Row(Modifier.weight(1f).fillMaxWidth().clip(artShape).background(surface)) {
+                Column(Modifier.weight(1f).fillMaxHeight().padding(7.dp), verticalArrangement = Arrangement.SpaceBetween) { Text("FEATURED", color = accent, fontSize = 5.sp, fontWeight = FontWeight.Bold); Column { Text("New release", color = ink, fontSize = 9.sp, fontWeight = FontWeight.Bold); Text("Listen now  ›", color = muted, fontSize = 6.sp) } }
+                Box(Modifier.fillMaxHeight().width(66.dp).background(Brush.linearGradient(listOf(accent.copy(alpha = .65f), skin.canvasTop, surface))))
+            }
+            SkinTheme.PRISM_GLASS -> Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Box(Modifier.fillMaxWidth().weight(1.1f).clip(RoundedCornerShape(7.dp)).background(Brush.linearGradient(listOf(accent.copy(alpha = .9f), Color(0xFFC69C67), Color(0xFF55A58A)))).padding(6.dp), contentAlignment = Alignment.BottomStart) { Text("REPLAY 2026 · 18h 24m", color = Color.White, fontSize = 7.sp, fontWeight = FontWeight.Bold) }
+                Row(Modifier.weight(.8f), horizontalArrangement = Arrangement.spacedBy(3.dp)) { repeat(2) { Box(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(6.dp)).background(surface).border(1.dp, ink.copy(alpha = .1f), RoundedCornerShape(6.dp))) } }
+            }
+            SkinTheme.DEEZER_FLOW -> Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) { repeat(5) { i -> Box(Modifier.size(19.dp).clip(CircleShape).background(Brush.linearGradient(listOf(accent.copy(alpha = 1f - i * .1f), Color(0xFF3D93EE)))).border(1.dp, ink.copy(alpha = .6f), CircleShape)) } }
+                Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) { repeat(3) { i -> Box(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(5.dp)).background(Brush.linearGradient(listOf(accent.copy(alpha = .62f + i * .08f), surface)))) } }
+            }
+            SkinTheme.GAANA_BEATS -> Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) { repeat(3) { i -> Column(Modifier.weight(1f)) { Box(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(5.dp)).background(Brush.linearGradient(listOf(accent.copy(alpha = .72f - i * .12f), surface)))); Box(Modifier.padding(top = 3.dp).fillMaxWidth(.72f).height(3.dp).clip(CircleShape).background(ink.copy(alpha = .62f))) } } }
+                Box(Modifier.fillMaxWidth(.5f).height(4.dp).clip(CircleShape).background(accent))
+            }
+            SkinTheme.POCKET_MIX -> Row(Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(6.dp)).background(Color(0xFFD6E9A5)).border(3.dp, Color(0xFF172018), RoundedCornerShape(6.dp)).padding(5.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) { Text("NOW PLAYING", color = Color(0xFF263123), fontSize = 6.sp, fontWeight = FontWeight.Black); Box(Modifier.fillMaxWidth(.8f).height(4.dp).clip(CircleShape).background(Color(0xFF48553C))); Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) { Text("◀", color = Color.DarkGray, fontSize = 8.sp); Text("Ⅱ", color = Color.DarkGray, fontSize = 8.sp); Text("▶", color = Color.DarkGray, fontSize = 8.sp) } }
+                Box(Modifier.size(54.dp).clip(CircleShape).background(Color(0xFFE9EBE4)).border(1.dp, Color(0xFFABB0A5), CircleShape), contentAlignment = Alignment.Center) { Box(Modifier.size(19.dp).clip(CircleShape).background(Color.White).border(1.dp, Color.LightGray, CircleShape)) }
+            }
+            SkinTheme.JIOSAAVN_WAVE -> Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(5.dp)) { repeat(4) { i -> Column(Modifier.weight(1f)) { Box(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(5.dp)).background(Brush.linearGradient(listOf(accent.copy(alpha = .55f + i * .08f), surface)))); Text("Mix ${i + 1}", color = ink, fontSize = 5.sp, maxLines = 1) } } }
+                Box(Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(5.dp)).background(surface))
+            }
+            SkinTheme.YANDEX_WAVE -> Box(Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Brush.linearGradient(listOf(Color(0xFFFFC444), Color(0xFFFF3E9D), Color(0xFF7955F8))))) {
+                Column(Modifier.align(Alignment.CenterStart).padding(7.dp)) { Text("YOUR WAVE", color = Color.White.copy(alpha = .75f), fontSize = 5.sp, fontWeight = FontWeight.Bold); Text("Made for this moment", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+                Box(Modifier.align(Alignment.CenterEnd).padding(7.dp).size(20.dp).clip(CircleShape).background(Color.White.copy(alpha = .9f)), contentAlignment = Alignment.Center) { Icon(Icons.Default.PlayArrow, null, tint = accent, modifier = Modifier.size(13.dp)) }
+            }
+            SkinTheme.NIGHT_DRIVE -> Box(Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(7.dp)).background(Brush.horizontalGradient(listOf(Color(0xFF071526), Color(0xFF17365A), Color(0xFF090C1A))))) {
+                repeat(4) { i -> Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth(.22f + i * .12f).height((10 + i * 6).dp).background(accent.copy(alpha = .1f + i * .04f))) }
+                Column(Modifier.align(Alignment.CenterStart).padding(7.dp)) { Text("AFTER DARK", color = accent, fontSize = 6.sp, fontWeight = FontWeight.Bold); Text("Night Drive", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+            }
+            SkinTheme.QOBUZ_EDITORIAL -> Row(Modifier.weight(1f).fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Box(Modifier.fillMaxHeight().weight(.8f).clip(RoundedCornerShape(3.dp)).background(Brush.verticalGradient(listOf(accent.copy(alpha = .5f), skin.canvasTop, surface))))
+                Column(Modifier.weight(1f).fillMaxHeight().padding(vertical = 5.dp), verticalArrangement = Arrangement.SpaceBetween) { Text("EDITOR'S PICK", color = accent, fontSize = 5.sp, fontWeight = FontWeight.Bold); Column { Text("Listen closely", color = ink, fontSize = 9.sp, fontWeight = FontWeight.SemiBold); Text("24-bit · Hi-Res", color = muted, fontSize = 6.sp) }; Box(Modifier.fillMaxWidth(.55f).height(2.dp).background(accent)) }
+            }
+            SkinTheme.AMAZON_EDITORIAL -> Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) { listOf("MINUTES", "ARTISTS").forEachIndexed { i, item -> Column(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(5.dp)).background(surface).padding(6.dp), verticalArrangement = Arrangement.SpaceBetween) { Text(item, color = accent, fontSize = 5.sp, fontWeight = FontWeight.Bold); Text(if (i == 0) "1,248" else "36", color = ink, fontSize = 12.sp, fontWeight = FontWeight.Bold) } } }
+                Box(Modifier.fillMaxWidth().height(5.dp).clip(CircleShape).background(Brush.horizontalGradient(listOf(accent, surface))))
+            }
+            SkinTheme.SOUNDCLOUD_WAVE -> Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) { repeat(32) { i -> Box(Modifier.weight(1f).height((5 + ((i * 11) % 25)).dp).clip(CircleShape).background(accent.copy(alpha = .65f + (i % 3) * .1f))) } }
+                repeat(2) { Box(Modifier.fillMaxWidth().height(12.dp).clip(RoundedCornerShape(4.dp)).background(surface)) }
+            }
+            SkinTheme.KILO_ORIGINAL -> Box(Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Brush.linearGradient(listOf(Color(0xFF10283A), Color(0xFF11162A), Color(0xFF261441))))) {
+                Text("K", color = accent.copy(alpha = .22f), fontSize = 84.sp, fontWeight = FontWeight.Black, modifier = Modifier.align(Alignment.CenterEnd))
+                Column(Modifier.align(Alignment.CenterStart).padding(8.dp)) { Text("KILO ORIGINAL", color = accent, fontSize = 6.sp, fontWeight = FontWeight.Black, letterSpacing = 1.sp); Text("Made around you.", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.ExtraBold); Text("Personal sound · live", color = Color.White.copy(alpha = .75f), fontSize = 6.sp) }
+            }
+            SkinTheme.SUNSET_GLASS -> Box(Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Brush.linearGradient(listOf(accent.copy(alpha = .4f), surface, skin.canvasTop))).border(1.dp, ink.copy(alpha = .3f), RoundedCornerShape(14.dp))) {
+                Column(Modifier.align(Alignment.BottomStart).padding(7.dp)) { Text("FLOATING GLASS PLAYER", color = ink.copy(alpha = .72f), fontSize = 5.sp, fontWeight = FontWeight.Bold); Text("A softer listening space", color = ink, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
+                Box(Modifier.align(Alignment.TopEnd).padding(5.dp).size(width = 26.dp, height = 12.dp).clip(CircleShape).background(ink.copy(alpha = .14f)).border(1.dp, ink.copy(alpha = .23f), CircleShape))
+            }
+            SkinTheme.FROSTED_NIGHT -> Column(Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(surface).padding(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(Modifier.weight(1f).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) { Box(Modifier.fillMaxHeight().aspectRatio(1f).clip(RoundedCornerShape(5.dp)).background(Brush.linearGradient(listOf(accent.copy(alpha = .55f), Color(0xFF18212C))))); Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) { Text("NOW PLAYING", color = accent, fontSize = 5.sp, fontWeight = FontWeight.Bold); Box(Modifier.fillMaxWidth(.75f).height(4.dp).clip(CircleShape).background(ink.copy(alpha = .78f))); Box(Modifier.fillMaxWidth(.48f).height(3.dp).clip(CircleShape).background(muted.copy(alpha = .55f))) } }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) { Text("◀      Ⅱ      ▶", color = ink, fontSize = 7.sp) }
             }
         }
-        when (index) {
-            0, 4, 5 -> {
-                Box(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(shapes[index % shapes.size])).background(Brush.linearGradient(listOf(accent.copy(alpha = 0.85f), panel, accent.copy(alpha = 0.24f))))) {
-                    Column(Modifier.align(Alignment.BottomStart).padding(6.dp)) {
-                        Text(if (index == 0) "FROSTED NOW PLAYING" else "MADE FOR YOUR MOMENT", color = Color.White.copy(0.72f), fontSize = 5.sp)
-                        Text("Your soundtrack", color = Color.White, fontSize = 8.sp, fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
-            1, 6, 7, 8 -> {
-                Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    repeat(if (index == 8) 3 else 2) { i ->
-                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                            Box(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(shapes[index % shapes.size])).background(Brush.verticalGradient(listOf(accent.copy(alpha = 0.9f - i * 0.15f), panel))))
-                            Box(Modifier.fillMaxWidth(0.7f).height(3.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.55f)))
-                        }
-                    }
-                }
-            }
-            2, 9, 10, 11 -> {
-                Row(Modifier.fillMaxWidth().weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    repeat(3) { i ->
-                        Box(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(shapes[index % shapes.size])).background(Brush.linearGradient(listOf(accent.copy(alpha = 0.75f - i * 0.15f), panel))))
-                    }
-                }
-            }
-            3, 12, 13 -> {
-                Row(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(shapes[index % shapes.size])).background(panel).padding(5.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Box(Modifier.fillMaxHeight().weight(0.8f).clip(RoundedCornerShape(7.dp)).background(Brush.linearGradient(listOf(accent, Color(0xFF20152A)))))
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(if (index == 12) "HI-RES ALBUMS" else "PICKED FOR YOU", color = accent, fontSize = 5.sp)
-                        Box(Modifier.fillMaxWidth().height(4.dp).clip(CircleShape).background(Color.White.copy(0.8f)))
-                        Box(Modifier.fillMaxWidth(0.6f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.3f)))
-                    }
-                }
-            }
-            else -> {
-                Column(Modifier.fillMaxWidth().weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                    repeat(3) { i ->
-                        Row(Modifier.fillMaxWidth().weight(1f).clip(RoundedCornerShape(5.dp)).background(panel).padding(horizontal = 5.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                            Box(Modifier.size(12.dp).clip(RoundedCornerShape(4.dp)).background(accent.copy(alpha = 0.7f)))
-                            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                                Box(Modifier.fillMaxWidth(0.55f + i * 0.1f).height(3.dp).clip(CircleShape).background(Color.White.copy(0.75f)))
-                                Box(Modifier.fillMaxWidth(0.35f).height(2.dp).clip(CircleShape).background(Color.White.copy(0.3f)))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            repeat(4) { i -> Box(Modifier.width(if (i == index % 4) 16.dp else 9.dp).height(3.dp).clip(CircleShape).background(if (i == index % 4) accent else Color.White.copy(0.26f))) }
+        Row(Modifier.fillMaxWidth().height(5.dp), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+            repeat(4) { i -> Box(Modifier.width(if (i == skin.ordinal % 4) 17.dp else 8.dp).height(2.dp).clip(CircleShape).background(if (i == skin.ordinal % 4) accent else muted.copy(alpha = .38f))) }
         }
     }
 }
@@ -12609,22 +12932,25 @@ fun CustomizationToggleRow(
     description: String,
     checked: Boolean,
     accent: Color,
-    onCheckedChange: (Boolean) -> Unit
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true
 ) {
+    val skin = LocalPrimarySkin.current
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) }
+            .clickable(enabled = enabled) { onCheckedChange(!checked) }
             .padding(horizontal = 16.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f).padding(end = 10.dp)) {
-            Text(title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-            Text(description, color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp, lineHeight = 15.sp)
+            Text(title, color = skin.foreground, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text(if (enabled) description else "$description · Required by this theme", color = skin.mutedForeground.copy(alpha = 0.82f), fontSize = 11.sp, lineHeight = 15.sp)
         }
         Switch(
             checked = checked,
-            onCheckedChange = onCheckedChange,
+            onCheckedChange = onCheckedChange.takeIf { enabled },
+            enabled = enabled,
             colors = SwitchDefaults.colors(checkedThumbColor = Color.Black, checkedTrackColor = accent)
         )
     }
@@ -12632,9 +12958,10 @@ fun CustomizationToggleRow(
 
 @Composable
 fun SettingsSectionHeader(title: String) {
+    val skin = LocalPrimarySkin.current
     Text(
         text = title,
-        color = Color.Gray,
+        color = skin.mutedForeground,
         fontSize = 12.sp,
         fontWeight = FontWeight.Bold,
         letterSpacing = 1.sp,
@@ -12644,19 +12971,19 @@ fun SettingsSectionHeader(title: String) {
 
 @Composable
 fun SettingsGroupCard(content: @Composable ColumnScope.() -> Unit) {
-    val glass = LocalUiCustomizations.current["glassPanels"] != false
     val skin = LocalPrimarySkin.current
+    val glass = skin.glassLocked || LocalUiCustomizations.current["glassPanels"] != false
     val shape = RoundedCornerShape(20.dp)
-    val liquidGlass = glass && skin.layoutFamily == 0
+    val liquidGlass = glass && skin.glassStyle
     KiloCard(
         modifier = Modifier.fillMaxWidth(),
         shape = shape,
-        containerColor = if (glass) Color(0xFF1C1829).copy(alpha = 0.82f) else Color(0xFF15121E),
+        containerColor = if (liquidGlass) skin.panel.copy(alpha = if (skin.isLight) 0.64f else 0.50f) else skin.panel,
         backgroundBrush = if (liquidGlass) Brush.linearGradient(
-            listOf(Color.White.copy(alpha = 0.19f), skin.highlight.copy(alpha = 0.10f), Color.White.copy(alpha = 0.045f))
+            listOf(skin.foreground.copy(alpha = if (skin.isLight) 0.42f else 0.18f), skin.highlight.copy(alpha = 0.14f), skin.foreground.copy(alpha = 0.045f))
         ) else null,
         borderBrush = if (liquidGlass) Brush.verticalGradient(
-            listOf(Color.White.copy(alpha = 0.62f), skin.highlight.copy(alpha = 0.28f), Color.White.copy(alpha = 0.09f))
+            listOf(skin.foreground.copy(alpha = if (skin.isLight) 0.62f else 0.52f), skin.highlight.copy(alpha = 0.32f), skin.foreground.copy(alpha = 0.12f))
         ) else null,
         contentPadding = 0.dp,
         content = content
@@ -12672,13 +12999,14 @@ fun SettingsRowItem(
     trailingValue: String? = null,
     onClick: () -> Unit
 ) {
+    val skin = LocalPrimarySkin.current
     KiloListItem(
         title = title,
         subtitle = subtitle,
         onClick = onClick,
-        leadingContent = { Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(24.dp)) },
+        leadingContent = { Icon(icon, contentDescription = null, tint = skin.foreground, modifier = Modifier.size(24.dp)) },
         titleContent = {
-            Text(title, color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(title, color = skin.foreground, fontSize = 16.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             if (badgeText != null) {
                 Spacer(modifier = Modifier.width(8.dp))
                 Box(Modifier.clip(RoundedCornerShape(6.dp)).background(Color(0xFF2C2C34)).padding(horizontal = 6.dp, vertical = 2.dp)) {
@@ -12849,7 +13177,7 @@ fun SearchScreen(vm: MainViewModel) {
         ) {
             Text(
                 when (skin.layoutFamily) { 0 -> "Find your frequency"; 1 -> "Search"; 2 -> "Search YouTube Music"; 3 -> "What do you want to hear?"; else -> "Search the sound" },
-                color = Color.White,
+                color = skin.foreground,
                 fontSize = if (skin.layoutFamily == 3) 30.sp else 27.sp,
                 fontWeight = FontWeight.ExtraBold,
                 modifier = Modifier.weight(1f)
@@ -12871,7 +13199,7 @@ fun SearchScreen(vm: MainViewModel) {
             Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
                 if (state.isRecognizingSong) {
                     LinearProgressIndicator(Modifier.fillMaxWidth(), color = accent)
-                    Text("Listening and checking with AudD…", color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                    Text("Listening and checking with AudD…", color = skin.foreground.copy(alpha = 0.72f), fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
                 } else if (state.recognitionResult != null) {
                     val match = requireNotNull(state.recognitionResult)
                     Row(
@@ -12880,7 +13208,7 @@ fun SearchScreen(vm: MainViewModel) {
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Column(Modifier.weight(1f)) {
-                            Text("${match.title} · ${match.artist}", color = Color.White, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Text("${match.title} · ${match.artist}", color = skin.foreground, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                             Text("Identified by AudD", color = accent, fontSize = 11.sp)
                             Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
                                 TextButton(onClick = vm::playRecognizedSongNow, contentPadding = PaddingValues(horizontal = 5.dp)) {
@@ -12896,29 +13224,29 @@ fun SearchScreen(vm: MainViewModel) {
                         }
                     }
                 } else {
-                    Text(state.recognitionMessage.orEmpty(), color = Color.White.copy(alpha = 0.72f), fontSize = 12.sp)
+                    Text(state.recognitionMessage.orEmpty(), color = skin.foreground.copy(alpha = 0.72f), fontSize = 12.sp)
                 }
             }
         }
         OutlinedTextField(
             value = state.searchQuery,
             onValueChange = { vm.onSearchQueryChanged(it) },
-            placeholder = { Text("Search songs, artists, albums, playlists...", color = Color.Gray) },
+            placeholder = { Text("Search songs, artists, albums, playlists...", color = skin.mutedForeground) },
             trailingIcon = {
                 if (state.isSearching) {
                     CircularProgressIndicator(color = accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 } else {
-                    Icon(Icons.Default.Search, contentDescription = null, tint = Color.White)
+                    Icon(Icons.Default.Search, contentDescription = null, tint = skin.foreground)
                 }
             },
             modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
             singleLine = true,
             shape = primaryCardShape(skin),
             colors = OutlinedTextFieldDefaults.colors(
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White,
+                focusedTextColor = skin.foreground,
+                unfocusedTextColor = skin.foreground,
                 focusedBorderColor = accent,
-                unfocusedBorderColor = Color.White.copy(alpha = 0.15f)
+                unfocusedBorderColor = skin.foreground.copy(alpha = 0.15f)
             )
         )
 
@@ -12947,7 +13275,7 @@ fun SearchScreen(vm: MainViewModel) {
                 ) {
                     Text(
                         titleWithCount,
-                        color = if (selected) Color.Black else Color.White,
+                        color = if (selected) Color.Black else skin.foreground,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold
                     )
@@ -13021,7 +13349,7 @@ fun SearchScreen(vm: MainViewModel) {
                                 vm.onSearchQueryChanged(applied)
                             }
                             .padding(horizontal = 13.dp, vertical = 8.dp)
-                    ) { Text(filter.label, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+                    ) { Text(filter.label, color = skin.foreground, fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
                 }
             }
         }
@@ -13034,7 +13362,7 @@ fun SearchScreen(vm: MainViewModel) {
                 state.searchQuery.isBlank() -> item {
                     Text(
                         "Search for a song, artist, album, or playlist to see results here.",
-                        color = Color.White.copy(alpha = 0.62f),
+                        color = skin.foreground.copy(alpha = 0.62f),
                         fontSize = 13.sp,
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 20.dp)
                     )
@@ -13046,13 +13374,13 @@ fun SearchScreen(vm: MainViewModel) {
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         CircularProgressIndicator(color = accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                        Text("Searching music…", color = Color.White.copy(alpha = 0.72f), fontSize = 13.sp)
+                        Text("Searching music…", color = skin.foreground.copy(alpha = 0.72f), fontSize = 13.sp)
                     }
                 }
                 displayList.isEmpty() -> item {
                     Text(
                         "No results found. Try another search.",
-                        color = Color.White.copy(alpha = 0.62f),
+                        color = skin.foreground.copy(alpha = 0.62f),
                         fontSize = 13.sp,
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 20.dp)
                     )
@@ -13073,7 +13401,7 @@ fun SearchScreen(vm: MainViewModel) {
             }
         } else if (selectedSearchTab == 1) {
             if (state.searchQuery.isNotBlank() && !state.isSearching && state.artistSearchResults.isEmpty()) {
-                item { Text("No artists found for this search.", color = Color.White.copy(alpha = 0.62f), modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp)) }
+                item { Text("No artists found for this search.", color = skin.foreground.copy(alpha = 0.62f), modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp)) }
             }
             itemsIndexed(state.artistSearchResults, key = { _, artist -> "artist-tab-${artist.id}" }, contentType = { _, _ -> "artist" }) { _, artist ->
                 ArtistSearchRow(artist, artist.name in state.listenerProfile.followedArtists, { vm.toggleFollowedArtist(artist.name) }) { vm.openArtist(artist) }
@@ -13086,7 +13414,7 @@ fun SearchScreen(vm: MainViewModel) {
                     } else {
                         "No playlists found. Try another search."
                     }
-                    Text(emptyMessage, color = Color.White.copy(alpha = 0.62f), modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp))
+                    Text(emptyMessage, color = skin.foreground.copy(alpha = 0.62f), modifier = Modifier.padding(horizontal = 24.dp, vertical = 20.dp))
                 }
             }
             if (state.isSearchingYouTubePlaylists && !hasPlaylistResults) {
@@ -13097,7 +13425,7 @@ fun SearchScreen(vm: MainViewModel) {
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
                         CircularProgressIndicator(color = accent, modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                        Text("Searching YouTube playlists…", color = Color.White.copy(alpha = 0.72f), fontSize = 13.sp)
+                        Text("Searching YouTube playlists…", color = skin.foreground.copy(alpha = 0.72f), fontSize = 13.sp)
                     }
                 }
             }
@@ -13174,8 +13502,8 @@ fun SearchScreen(vm: MainViewModel) {
             },
             dismissButton = { TextButton(onClick = { showRecognitionDisclosure = false }) { Text("Not now") } },
             containerColor = Color(0xFF17131F),
-            titleContentColor = Color.White,
-            textContentColor = Color.White.copy(alpha = 0.82f)
+            titleContentColor = skin.foreground,
+            textContentColor = skin.foreground.copy(alpha = 0.82f)
         )
     }
 
@@ -13185,7 +13513,7 @@ fun SearchScreen(vm: MainViewModel) {
             title = { Text("Recognize a song", fontWeight = FontWeight.Bold) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("Enter your AudD API token. KILO saves it encrypted on this device.", color = Color.White.copy(alpha = 0.74f), fontSize = 13.sp)
+                    Text("Enter your AudD API token. KILO saves it encrypted on this device.", color = skin.foreground.copy(alpha = 0.74f), fontSize = 13.sp)
                     OutlinedTextField(
                         value = recognitionToken,
                         onValueChange = { recognitionToken = it },
@@ -13195,7 +13523,7 @@ fun SearchScreen(vm: MainViewModel) {
                         visualTransformation = PasswordVisualTransformation()
                     )
                     if (state.recognitionMessage != null && !state.isRecognizingSong) {
-                        Text(state.recognitionMessage.orEmpty(), color = Color.White.copy(alpha = 0.68f), fontSize = 12.sp)
+                        Text(state.recognitionMessage.orEmpty(), color = skin.foreground.copy(alpha = 0.68f), fontSize = 12.sp)
                     }
                 }
             },
@@ -13220,8 +13548,8 @@ fun SearchScreen(vm: MainViewModel) {
                 TextButton(onClick = { showRecognitionTokenDialog = false }) { Text("Cancel") }
             },
             containerColor = Color(0xFF17131F),
-            titleContentColor = Color.White,
-            textContentColor = Color.White.copy(alpha = 0.82f)
+            titleContentColor = skin.foreground,
+            textContentColor = skin.foreground.copy(alpha = 0.82f)
         )
     }
 }
@@ -13614,7 +13942,7 @@ fun LibraryScreen(vm: MainViewModel) {
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(when (skin.layoutFamily) { 0 -> "Your collection"; 1 -> "Your Library"; 2 -> "Library"; 3 -> "Your music"; else -> "My collection" }, color = Color.White, fontSize = if (skin.layoutFamily == 3) 30.sp else 28.sp, fontWeight = FontWeight.ExtraBold)
+            Text(when (skin.layoutFamily) { 0 -> "Your collection"; 1 -> "Your Library"; 2 -> "Library"; 3 -> "Your music"; else -> "My collection" }, color = skin.foreground, fontSize = if (skin.layoutFamily == 3) 30.sp else 28.sp, fontWeight = FontWeight.ExtraBold)
             if (state.libraryTab == 3) {
                 IconButton(onClick = { showCreatePlaylist = true }) {
                     Icon(Icons.Default.Add, contentDescription = "Create playlist", tint = accent)
@@ -13639,7 +13967,7 @@ fun LibraryScreen(vm: MainViewModel) {
                         .clickable { vm.setLibraryTab(tabIndex) }
                         .padding(horizontal = 16.dp, vertical = 8.dp)
                 ) {
-                    Text(tabName, color = if (active) Color.Black else Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text(tabName, color = if (active) Color.Black else skin.foreground, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
             }
         }
@@ -13651,7 +13979,7 @@ fun LibraryScreen(vm: MainViewModel) {
         if (activeLibraryTab == 5) {
             if (followedArtists.isEmpty()) {
                 Box(Modifier.fillMaxSize().padding(horizontal = 32.dp), contentAlignment = Alignment.Center) {
-                    Text("Follow artists in Personalisation to build your artist library.", color = Color.Gray, textAlign = TextAlign.Center)
+                    Text("Follow artists in Personalisation to build your artist library.", color = skin.mutedForeground, textAlign = TextAlign.Center)
                 }
             } else LazyColumn(contentPadding = PaddingValues(bottom = 24.dp)) {
                 items(followedArtists, key = { "library_artist_${it.lowercase(Locale.ROOT)}" }, contentType = { "artist" }) { name ->
@@ -13673,7 +14001,7 @@ fun LibraryScreen(vm: MainViewModel) {
                     text = if (state.libraryTab == 3) {
                         if (state.isLoggedIn) "No playlists found yet. Your saved YouTube Music playlists will appear here." else "Connect YouTube Music to see your playlists here. You can also create KILO playlists from any song's menu."
                     } else "No tracks here yet.",
-                    color = Color.Gray,
+                    color = skin.mutedForeground,
                     textAlign = TextAlign.Center
                 )
             }
@@ -13684,7 +14012,7 @@ fun LibraryScreen(vm: MainViewModel) {
                         Row(Modifier.fillMaxWidth().padding(20.dp), verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             CircularProgressIndicator(color = accent, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                            Text("Loading your YouTube Music playlists…", color = Color.White.copy(alpha = 0.7f), fontSize = 13.sp)
+                            Text("Loading your YouTube Music playlists…", color = skin.foreground.copy(alpha = 0.7f), fontSize = 13.sp)
                         }
                     }
                 }
@@ -13701,8 +14029,8 @@ fun LibraryScreen(vm: MainViewModel) {
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Column(Modifier.weight(1f)) {
-                                Text(savedPlaylist.name, color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                                Text("${savedPlaylist.songs.size} songs", color = Color.Gray, fontSize = 12.sp)
+                                Text(savedPlaylist.name, color = skin.foreground, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                                Text("${savedPlaylist.songs.size} songs", color = skin.mutedForeground, fontSize = 12.sp)
                             }
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 IconButton(onClick = { savedPlaylist.songs.firstOrNull()?.let { vm.playSongFromShelf(it, savedPlaylist.songs) } }) {
@@ -13720,7 +14048,7 @@ fun LibraryScreen(vm: MainViewModel) {
                                     Icon(Icons.Filled.AutoAwesome, contentDescription = "Find similar songs", tint = accent.copy(alpha = 0.9f))
                                 }
                                 IconButton(onClick = { vm.deletePlaylist(savedPlaylist.id) }) {
-                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Delete playlist", tint = Color.White.copy(alpha = 0.62f))
+                                    Icon(Icons.Default.DeleteOutline, contentDescription = "Delete playlist", tint = skin.foreground.copy(alpha = 0.62f))
                                 }
                             }
                         }
@@ -13786,8 +14114,8 @@ fun LibraryScreen(vm: MainViewModel) {
             },
             dismissButton = { TextButton(onClick = { showCreatePlaylist = false }) { Text("Cancel") } },
             containerColor = Color(0xFF17131F),
-            titleContentColor = Color.White,
-            textContentColor = Color.White.copy(alpha = 0.82f)
+            titleContentColor = skin.foreground,
+            textContentColor = skin.foreground.copy(alpha = 0.82f)
         )
     }
     editingPlaylist?.let { playlist ->
@@ -13809,8 +14137,8 @@ fun LibraryScreen(vm: MainViewModel) {
             },
             dismissButton = { TextButton(onClick = { editingPlaylist = null }) { Text("Cancel") } },
             containerColor = Color(0xFF17131F),
-            titleContentColor = Color.White,
-            textContentColor = Color.White.copy(alpha = 0.82f)
+            titleContentColor = skin.foreground,
+            textContentColor = skin.foreground.copy(alpha = 0.82f)
         )
     }
 }
