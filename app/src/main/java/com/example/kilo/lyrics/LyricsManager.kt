@@ -4,7 +4,9 @@ import android.content.Context
 import android.util.Log
 import com.example.kilo.SongItemClean
 import com.example.kilo.lyrics.models.Lyrics
+import com.example.kilo.lyrics.models.LyricsLine
 import com.example.kilo.lyrics.models.LyricsMetadata
+import com.example.kilo.LyricsRepository
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -17,7 +19,6 @@ object LyricsManager {
     fun initialize(context: Context) {
         LyricsManagerContext.applicationContext = context.applicationContext
         LyricsCache.initialize(context.applicationContext)
-        LyricsRepository.initialize(context.applicationContext)
     }
 
     suspend fun find(song: SongItemClean): Lyrics? = withContext(Dispatchers.IO) {
@@ -31,22 +32,28 @@ object LyricsManager {
             LyricsMetrics.lookup(song.id, "disk", started)
             return@withContext it
         }
-        val existing = LyricsRepository.cached(song)
-        val lines = existing.ifEmpty { LyricsRepository.fetch(song) }
+        val lines = LyricsRepository.find(song)
         if (lines.isEmpty()) {
             LyricsMetrics.lookup(song.id, "miss", started)
             return@withContext null
         }
-        val parsed = LyricsParser.withEstimatedWords(LyricsParser.fromProvider(lines, song.durationMs))
+        var parsedLines = LyricsParser.withEstimatedWords(LyricsParser.fromProvider(lines, song.durationMs))
+        // Translate lyrics if enabled
+        if (appContext != null && LyricsRepository.isTranslateEnabled(appContext)) {
+            val translated = LyricsRepository.translateLyrics(parsedLines)
+            if (translated.isNotEmpty()) {
+                parsedLines = translated
+            }
+        }
         val result = Lyrics(
             LyricsMetadata(song.videoId.ifBlank { song.id }, song.title, song.artist, song.album, song.durationMs),
-            parsed
+            parsedLines
         )
         LyricsCache.putMemory(key, result)
         LyricsManagerContext.applicationContext?.takeIf { LyricsSettings.offlineCache(it) }?.let {
             LyricsCache.putDisk(key, result)
         }
-        LyricsMetrics.loaded(song.id, if (existing.isNotEmpty()) "provider-memory" else "provider", android.os.SystemClock.elapsedRealtime() - started, result.lines.size)
+        LyricsMetrics.loaded(song.id, "provider", android.os.SystemClock.elapsedRealtime() - started, result.lines.size)
         result
     }
 
@@ -65,9 +72,12 @@ object LyricsManager {
         if (appContext != null && !LyricsSettings.enabled(appContext)) return null
         return LyricsCache.memory(key(song))
         ?: LyricsRepository.cached(song).takeIf { it.isNotEmpty() }?.let { lines ->
+            val parsedLines = LyricsParser.withEstimatedWords(LyricsParser.fromProvider(lines, song.durationMs))
+            // Note: Translation is not applied here since it requires suspend context.
+            // Full translation happens in find() which is suspend.
             Lyrics(
                 LyricsMetadata(song.videoId.ifBlank { song.id }, song.title, song.artist, song.album, song.durationMs),
-                LyricsParser.withEstimatedWords(LyricsParser.fromProvider(lines, song.durationMs))
+                parsedLines
             ).also { LyricsCache.putMemory(key(song), it) }
         }
     }

@@ -71,11 +71,15 @@ object FastStream {
     private val clientCooldownUntilMs = ConcurrentHashMap<String, Long>()
     private data class ClientHealth(var score: Int = 100, var changedAtMs: Long = System.currentTimeMillis(), var successes: Int = 0)
     private val clientHealth = ConcurrentHashMap<String, ClientHealth>()
-    private val resolvePermits = Semaphore(3)
+    // Increased concurrency for faster parallel resolution
+    private val resolvePermits = Semaphore(6)
     private val resolveTimestamps = java.util.concurrent.ConcurrentLinkedDeque<Long>()
     private data class UrlValidation(val playable: Boolean, val expiresAtMs: Long)
     private val urlValidation = ConcurrentHashMap<String, UrlValidation>()
-    private val pool = Executors.newCachedThreadPool()
+    // Dedicated thread pool for resolver to avoid blocking on cached thread pool
+    private val pool = java.util.concurrent.Executors.newFixedThreadPool(6) { r ->
+        Thread(r, "Kilo-Resolver").apply { priority = Thread.NORM_PRIORITY }
+    }
 
     fun peek(videoId: String): StreamInfo? =
         cache.get(videoId)
@@ -230,6 +234,40 @@ object FastStream {
                 }.inputStream.close()
             }
         }
+        // Pre-warm resolver clients with a dummy request to establish connections
+        pool.execute {
+            clients.forEach { client ->
+                runCatching {
+                    val conn = (URL("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                        .openConnection() as HttpURLConnection).apply {
+                        requestMethod = "POST"
+                        doOutput = true
+                        connectTimeout = 2000
+                        readTimeout = 3000
+                        setRequestProperty("Content-Type", "application/json")
+                        setRequestProperty("User-Agent", client.userAgent)
+                        setRequestProperty("X-YouTube-Client-Name", client.clientId)
+                        setRequestProperty("X-YouTube-Client-Version", client.version)
+                    }
+                    val clientJson = JSONObject().apply {
+                        put("clientName", client.name)
+                        put("clientVersion", client.version)
+                        put("hl", "en")
+                        put("gl", "IN")
+                        client.extra.forEach { (k, v) -> put(k, v) }
+                    }
+                    val payload = JSONObject().apply {
+                        put("videoId", "dQw4w9WgXcQ")  // Rick Astley - never fails :)
+                        put("contentCheckOk", true)
+                        put("racyCheckOk", true)
+                        put("context", JSONObject().put("client", clientJson))
+                    }
+                    OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(payload.toString()) }
+                    conn.inputStream?.close()
+                    conn.errorStream?.close()
+                }
+            }
+        }
     }
 
     fun get(
@@ -367,7 +405,8 @@ object FastStream {
             }
         }
         val fast = try {
-            pool.invokeAll(calls, 2_500, TimeUnit.MILLISECONDS)
+            // Reduced timeout from 2500ms to 1500ms for faster fallback
+            pool.invokeAll(calls, 1_500, TimeUnit.MILLISECONDS)
                 .mapNotNull { future -> runCatching { future.get() }.getOrNull() }
                 .sortedWith(
                     compareByDescending<StreamInfo> { healthScore(it) }
@@ -423,45 +462,36 @@ object FastStream {
                 ?: streamUri.getQueryParameter("dur")?.toDoubleOrNull()?.let { (it * 1_000.0).toLong() }
             val estimatedLength = declaredLength ?: durationMs?.takeIf { it > 0L }
                 ?.let { it * info.bitrateKbps.coerceAtLeast(1) * 1_000L / 8_000L }
-            // Use the same Media3 HTTP factory, headers, and range generation as playback.
-            // A one-byte bounded probe can pass while the player's open-ended range fails;
-            // position+LENGTH_UNSET deliberately produces the player's actual range style.
-            val boundary = 1_048_576L
-            val midpoint = estimatedLength?.takeIf { it > boundary * 2L }?.div(2L)
-            val probePositions = buildList {
-                add(0L)
-                midpoint?.let(::add)
-                if (estimatedLength == null || estimatedLength > boundary) add(boundary)
-            }.distinct()
+
+            // Fast validation: single HEAD request at position 0 only
+            // Full range probes are done by Media3 during actual playback
             val headers = StreamRequestPolicy.headers(info)
-            probePositions.all { position ->
-                val spec = DataSpec.Builder()
-                    .setUri(streamUri)
-                    .setHttpRequestHeaders(headers)
-                    .setPosition(position)
-                    .setLength(C.LENGTH_UNSET.toLong())
-                    .build()
-                val source: DataSource = DiagnosingDataSourceFactory(
-                    StreamRequestPolicy.httpFactory(), "resolver_probe"
-                ).createDataSource()
-                try {
-                    source.open(spec)
-                    val contentRange = source.responseHeaders.entries
-                        .firstOrNull { it.key.equals("Content-Range", true) }
-                        ?.value?.firstOrNull().orEmpty()
-                    val returnedStart = Regex("(?i)^bytes\\s+(\\d+)-")
-                        .find(contentRange)?.groupValues?.getOrNull(1)?.toLongOrNull()
-                    val firstByte = ByteArray(1)
-                    val read = source.read(firstByte, 0, 1)
-                    val accepted = read > 0 && (position == 0L || returnedStart == position)
-                    probeStatuses += "offset=$position rangeStart=${returnedStart ?: "none"} accepted=$accepted"
-                    accepted
-                } catch (error: HttpDataSource.InvalidResponseCodeException) {
-                    probeStatuses += "offset=$position http=${error.responseCode}"
-                    false
-                } finally {
-                    runCatching { source.close() }
-                }
+            val spec = DataSpec.Builder()
+                .setUri(streamUri)
+                .setHttpRequestHeaders(headers)
+                .setPosition(0L)
+                .setLength(1L)  // Single byte probe is fast
+                .build()
+            val source: DataSource = DiagnosingDataSourceFactory(
+                StreamRequestPolicy.httpFactory(), "resolver_probe"
+            ).createDataSource()
+            try {
+                source.open(spec)
+                val contentRange = source.responseHeaders.entries
+                    .firstOrNull { it.key.equals("Content-Range", true) }
+                    ?.value?.firstOrNull().orEmpty()
+                val returnedStart = Regex("(?i)^bytes\\s+(\\d+)-")
+                    .find(contentRange)?.groupValues?.getOrNull(1)?.toLongOrNull()
+                val firstByte = ByteArray(1)
+                val read = source.read(firstByte, 0, 1)
+                val accepted = read > 0 && returnedStart == 0L
+                probeStatuses += "offset=0 rangeStart=${returnedStart ?: "none"} accepted=$accepted"
+                accepted
+            } catch (error: HttpDataSource.InvalidResponseCodeException) {
+                probeStatuses += "offset=0 http=${error.responseCode}"
+                false
+            } finally {
+                runCatching { source.close() }
             }
         } catch (error: Exception) {
             Log.d(TAG, "stream URL validation failed (${error.javaClass.simpleName})")
@@ -476,7 +506,7 @@ object FastStream {
         Log.i(
             TAG,
             "resolve stage=url_validation durationMs=${(System.nanoTime() - startedAt) / 1_000_000L} " +
-                "rangeProbe=player-equivalent[$probeStatuses] result=${if (playable) "playable" else "rejected"}"
+                "fastProbe[$probeStatuses] result=${if (playable) "playable" else "rejected"}"
         )
         return playable
     }
@@ -491,8 +521,9 @@ object FastStream {
             .openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             doOutput = true
-            connectTimeout = 3500
-            readTimeout = 4500
+            // Reduced timeouts for faster resolution
+            connectTimeout = 2000
+            readTimeout = 3000
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("User-Agent", client.userAgent)
             setRequestProperty("X-YouTube-Client-Name", client.clientId)

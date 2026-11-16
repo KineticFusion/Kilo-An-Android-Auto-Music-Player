@@ -657,7 +657,6 @@ object PlayerHolder {
     )
     private var player: ExoPlayer? = null
     private var standbyPlayer: ExoPlayer? = null
-    private var crossfadeOrchestrator: CrossfadeOrchestrator? = null
     private var standbyPlayerFactory: (() -> ExoPlayer)? = null
     private var bandwidthMeter: DefaultBandwidthMeter? = null
     private var analysisService: AudioAnalysisService? = null
@@ -711,33 +710,6 @@ object PlayerHolder {
                 getAudioAnalysisService()?.loadCachedAsync(trackId, bgPool)?.get()
             }.onFailure { Log.d("KiloCrossfade", "cached analysis lookup skipped id=$trackId", it) }
         }
-    }
-
-    /** Lazy so users who leave AutoMix off do not pay for a second decoder/player. */
-    @Synchronized
-    private fun crossfadeEngine(context: Context): CrossfadeOrchestrator? {
-        val app = context.applicationContext
-        if (!CrossfadeConfig.read(app).enabled) return crossfadeOrchestrator
-        crossfadeOrchestrator?.let { return it }
-        val main = player ?: return null
-        val factory = standbyPlayerFactory ?: return null
-        val standby = runCatching { factory() }.onFailure {
-            Log.e("KiloCrossfade", "standby_player_create_failed; normal playback remains active", it)
-        }.getOrNull() ?: return null
-        standbyPlayer = standby
-        return CrossfadeOrchestrator(app, main, standby).also { crossfadeOrchestrator = it }
-    }
-
-    fun tickCrossfade(context: Context): Long {
-        val app = context.applicationContext
-        if (!CrossfadeConfig.read(app).enabled) {
-            return crossfadeOrchestrator?.tick() ?: 250L
-        }
-        return crossfadeEngine(app)?.tick() ?: 250L
-    }
-
-    fun cancelCrossfade(reason: String) {
-        crossfadeOrchestrator?.cancel(reason)
     }
 
     // Keep analysis controls as compatibility shims. The dual-deck path uses cached
@@ -828,22 +800,34 @@ object PlayerHolder {
             .setBandwidthMeter(meter)
             .setLoadControl(
                 DefaultLoadControl.Builder()
-                    // Keep the generous rebuffer target for stable playback, but start
-                    // the first audio sooner once 1.5 seconds are safely buffered.
-                    .setBufferDurationsMs(30_000, 90_000, 1_500, 5_000)
+                    // Optimized for faster startup: smaller initial buffer, larger rebuffer
+                    // minBuffer: 15s (was 30s), maxBuffer: 60s (was 90s)
+                    // bufferForPlayback: 1s (was 1.5s) - start audio sooner
+                    // bufferForPlaybackAfterRebuffer: 3s (was 5s) - faster recovery
+                    .setBufferDurationsMs(15_000, 60_000, 1_000, 3_000)
+                    // Prioritize audio quality over buffer size
+                    .setTargetBufferBytes(-1)
+                    .setPrioritizeTimeOverSizeThresholds(true)
                     .build()
             )
             .setMediaSourceFactory(createMediaSourceFactory())
             .setAudioAttributes(audioAttributes, handleCallAudioFocus)
             .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
+            // Enable high-quality audio rendering
+            .setRenderersFactory(
+                androidx.media3.exoplayer.DefaultRenderersFactory(app)
+                    .setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+            )
             .build()
         standbyPlayerFactory = {
             ExoPlayer.Builder(app)
                 .setBandwidthMeter(meter)
                 .setLoadControl(
                     DefaultLoadControl.Builder()
-                        .setBufferDurationsMs(30_000, 90_000, 1_500, 5_000)
+                        .setBufferDurationsMs(15_000, 60_000, 1_000, 3_000)
+                        .setTargetBufferBytes(-1)
+                        .setPrioritizeTimeOverSizeThresholds(true)
                         .build()
                 )
                 .setMediaSourceFactory(createMediaSourceFactory())
@@ -852,6 +836,10 @@ object PlayerHolder {
                 .setAudioAttributes(audioAttributes, false)
                 .setHandleAudioBecomingNoisy(false)
                 .setWakeMode(C.WAKE_MODE_NONE)
+                .setRenderersFactory(
+                    androidx.media3.exoplayer.DefaultRenderersFactory(app)
+                        .setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+                )
                 .build()
         }
         p.setPlaybackSpeed(playbackPreferences.getFloat("playback_speed", 1f).coerceIn(0.5f, 2f))
@@ -866,7 +854,8 @@ object PlayerHolder {
         val positionHandler = Handler(Looper.getMainLooper())
         val positionSampler = object : Runnable {
             override fun run() {
-                val crossfadeTickMs = tickCrossfade(app)
+                // Crossfade tick is now handled by CrossfadeOrchestrator's internal coroutine
+                val crossfadeTickMs = 16L
                 p.currentMediaItem?.mediaId?.takeIf { p.isPlaying }?.let { id ->
                     val position = p.currentPosition.coerceAtLeast(0L)
                     lastKnownPositionMs[id] = position
@@ -1796,6 +1785,24 @@ object PlayerHolder {
             .setHttpRequestHeaders(spec.httpRequestHeaders + StreamRequestPolicy.headers(info))
             .build()
     }
+
+    /** Cancel any active crossfade. Called from UI (MainActivity) when user skips/seeks. */
+    fun cancelCrossfade(reason: String) {
+        VybeMediaService.crossfadeOrchestrator?.cancel(reason)
+    }
+
+    /** Check if crossfade is currently active. */
+    fun isCrossfadeActive(): Boolean = VybeMediaService.crossfadeOrchestrator?.isCrossfading() ?: false
+
+    /** Update crossfade configuration. */
+    fun updateCrossfadeConfig(enabled: Boolean, durationMs: Long) {
+        VybeMediaService.crossfadeOrchestrator?.getController()?.setCrossfadeConfig(
+            enabled = enabled,
+            durationMs = durationMs,
+            minMs = 1000L,
+            maxMs = 12000L
+        )
+    }
 }
 
 class VybeMediaService : MediaLibraryService() {
@@ -1815,6 +1822,12 @@ class VybeMediaService : MediaLibraryService() {
     private var backgroundPlaybackCoordinator: BackgroundPlaybackCoordinator? = null
     private var lifecycleManager: PlaybackLifecycleManager? = null
     private var servicePlayer: ExoPlayer? = null
+    private var crossfadeOrchestratorInstance: CrossfadeOrchestrator? = null
+
+    companion object {
+        @Volatile
+        var crossfadeOrchestrator: CrossfadeOrchestrator? = null
+    }
 
     private val index = ConcurrentHashMap<String, MediaItem>()
     private val siblings = ConcurrentHashMap<String, List<MediaItem>>()
@@ -1992,10 +2005,22 @@ class VybeMediaService : MediaLibraryService() {
         }
         ContextCompat.registerReceiver(this, notifReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
+        // Always use the main PlayerHolder player for the session
         val player = PlayerHolder.get(this)
         servicePlayer = player
         ResumeCoordinator.restoreQueueIfNeeded(this, player)
-        backgroundPlaybackCoordinator = BackgroundPlaybackCoordinator(this, player, main).also { it.attach() }
+
+        // Initialize native crossfade integration if enabled (before coordinator so it can be passed)
+        val crossfadeEnabled = CrossfadeConfig.read(this).enabled
+        val orchestrator = if (crossfadeEnabled) {
+            val o = CrossfadeOrchestrator(this)
+            crossfadeOrchestratorInstance = o
+            crossfadeOrchestrator = o
+            o.initializeWithMainPlayer(player)
+            o
+        } else null
+
+        backgroundPlaybackCoordinator = BackgroundPlaybackCoordinator(this, player, main, orchestrator).also { it.attach() }
         lifecycleManager = PlaybackLifecycleManager(player).also { it.serviceCreated() }
         currentTrackSnapshot = player.currentMediaItem
         lyricsSessionPlayer = AndroidAutoLyricsSessionPlayer(
@@ -2184,10 +2209,25 @@ class VybeMediaService : MediaLibraryService() {
         DriveRecapStore.serviceDestroyed(session?.player?.isPlaying == true)
         runCatching { unregisterReceiver(notifReceiver) }
         wifiLock?.let { if (it.isHeld) it.release() }
-        PlayerHolder.get(this).let {
+
+        // Release native crossfade orchestrator if used
+        val crossfadeEnabled = CrossfadeConfig.read(this).enabled
+        crossfadeOrchestratorInstance?.onStop()
+        crossfadeOrchestratorInstance = null
+        crossfadeOrchestrator = null
+
+        // Save session state using the appropriate player
+        val playerForSessionSave = if (crossfadeEnabled) {
+            // Need to get active player before releasing
+            PlayerHolder.get(this)
+        } else {
+            PlayerHolder.get(this)
+        }
+        playerForSessionSave.let {
             SessionStore.save(it)
             it.removeListener(layoutListener)
         }
+
         Favorites.removeListener(favListener)
         getSharedPreferences("vybe_app_settings", MODE_PRIVATE)
             .unregisterOnSharedPreferenceChangeListener(carBrowsePreferenceListener)

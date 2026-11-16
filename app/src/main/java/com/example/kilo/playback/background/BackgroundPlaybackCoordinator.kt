@@ -1,21 +1,26 @@
 package com.example.kilo.playback.background
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Handler
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import com.example.kilo.playback.crossfade.CrossfadeConfig
+import com.example.kilo.playback.crossfade.CrossfadeOrchestrator
 import com.example.kilo.playback.resume.PlaybackCheckpointEngine
 import com.example.kilo.playback.stability.PlaybackCommandLedger
 
 /** Command and persistence wrapper around the existing ExoPlayer owned by PlayerHolder. */
 class BackgroundPlaybackCoordinator(
-    context: Context,
+    private val context: Context,
     private val player: Player,
-    private val handler: Handler
+    private val handler: Handler,
+    private val crossfadeOrchestrator: CrossfadeOrchestrator? = null
 ) : Player.Listener {
     private val checkpoints = PlaybackCheckpointEngine(context)
     private val saveSnapshot = Runnable { persist("coalesced_player_change") }
     private var attached = false
+    private val prefs: SharedPreferences = context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
 
     fun attach() {
         if (attached) return
@@ -57,14 +62,63 @@ class BackgroundPlaybackCoordinator(
 
     fun seekBy(deltaMs: Long) = seekTo((player.currentPosition + deltaMs).coerceAtLeast(0L))
 
+    /** Trigger crossfade to next track if enabled, otherwise use default seekToNextMediaItem */
     fun next(playAfter: Boolean = false) = command("next", "playAfter=$playAfter", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
-        if (player.mediaItemCount > 0) player.seekToNextMediaItem()
-        if (playAfter) player.play()
+        if (player.mediaItemCount > 0) {
+            val crossfadeConfig = CrossfadeConfig.read(context)
+            if (crossfadeConfig.enabled && crossfadeOrchestrator != null) {
+                // Use native crossfade for smooth transition
+                crossfadeOrchestrator!!.cancel("manual_skip_next")
+                // The crossfade orchestrator will handle the transition
+                // For now, fall back to default behavior but with crossfade preparation
+                if (player.currentMediaItemIndex < player.mediaItemCount - 1) {
+                    // Prepare next track for crossfade
+                    val nextMediaItem = player.getMediaItemAt(player.currentMediaItemIndex + 1)
+                    nextMediaItem?.let {
+                        crossfadeOrchestrator!!.prepareNext(it, crossfadeConfig.durationMs)
+                        crossfadeOrchestrator!!.startCrossfade()
+                        if (playAfter) player.play()
+                    } ?: run {
+                        player.seekToNextMediaItem()
+                        if (playAfter) player.play()
+                    }
+                } else {
+                    // At end of queue, just seek to next
+                    player.seekToNextMediaItem()
+                    if (playAfter) player.play()
+                }
+            } else {
+                player.seekToNextMediaItem()
+                if (playAfter) player.play()
+            }
+        }
     }
 
     fun previous(playAfter: Boolean = false) = command("previous", "playAfter=$playAfter", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
-        if (player.mediaItemCount > 0) player.seekToPreviousMediaItem()
-        if (playAfter) player.play()
+        if (player.mediaItemCount > 0) {
+            val crossfadeConfig = CrossfadeConfig.read(context)
+            if (crossfadeConfig.enabled && crossfadeOrchestrator != null) {
+                // Use native crossfade for smooth transition
+                crossfadeOrchestrator!!.cancel("manual_skip_previous")
+                if (player.currentMediaItemIndex > 0) {
+                    val prevMediaItem = player.getMediaItemAt(player.currentMediaItemIndex - 1)
+                    prevMediaItem?.let {
+                        crossfadeOrchestrator!!.prepareNext(it, crossfadeConfig.durationMs)
+                        crossfadeOrchestrator!!.startCrossfade()
+                        if (playAfter) player.play()
+                    } ?: run {
+                        player.seekToPreviousMediaItem()
+                        if (playAfter) player.play()
+                    }
+                } else {
+                    player.seekToPreviousMediaItem()
+                    if (playAfter) player.play()
+                }
+            } else {
+                player.seekToPreviousMediaItem()
+                if (playAfter) player.play()
+            }
+        }
     }
 
     fun seekNextWindow(playAfter: Boolean = false) = command("next_window", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {

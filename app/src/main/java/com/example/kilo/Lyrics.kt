@@ -30,6 +30,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
 import com.example.kilo.lyrics.LyricsManager
+import com.example.kilo.lyrics.models.LyricsLine
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URLEncoder
@@ -50,6 +51,7 @@ object LyricsRepository {
     private const val TAG = "KiloLyrics"
     private const val ORDER_KEY = "lyrics_provider_order"
     private const val SPOTIFY_API_BASE_URL_KEY = "spotify_lyrics_api_base_url"
+    private const val TRANSLATE_LYRICS_KEY = "lyrics_translate_enabled"
     data class Provider(val id: String, val title: String)
     val providers = listOf(
         Provider("betterlyrics", "Better Lyrics"),
@@ -257,6 +259,68 @@ object LyricsRepository {
         saveProviderOrder(context, order)
         activeOrder = providerOrder(context)
     }
+
+    fun isTranslateEnabled(context: Context): Boolean {
+        return context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE)
+            .getBoolean(TRANSLATE_LYRICS_KEY, false)
+    }
+
+    fun setTranslateEnabled(context: Context, enabled: Boolean) {
+        context.getSharedPreferences("vybe_app_settings", Context.MODE_PRIVATE).edit()
+            .putBoolean(TRANSLATE_LYRICS_KEY, enabled).apply()
+        cache.clear()
+    }
+
+    suspend fun translateLyrics(lines: List<LyricsLine>, targetLang: String = "en"): List<LyricsLine> =
+        withContext(Dispatchers.IO) {
+            if (lines.isEmpty()) return@withContext lines
+            val texts = lines.map { it.content.trim() }.filter(String::isNotBlank).distinct()
+            if (texts.isEmpty()) return@withContext lines
+            val translatedMap = translateBatch(texts, targetLang)
+            lines.map { line ->
+                val translated = translatedMap[line.content.trim()]
+                if (translated != null && translated != line.content.trim()) {
+                    line.copy(content = translated)
+                } else line
+            }
+        }
+
+    private suspend fun translateBatch(texts: List<String>, targetLang: String): Map<String, String> =
+        withContext(Dispatchers.IO) {
+            val result = mutableMapOf<String, String>()
+            // Use MyMemory translation API (free, no key needed for small amounts)
+            val chunkSize = 10
+            for (chunk in texts.chunked(chunkSize)) {
+                val query = chunk.map { URLEncoder.encode(it, "UTF-8") }.joinToString("|")
+                val url = "https://api.mymemory.translated.net/get?q=$query&langpair=auto|$targetLang&de=a@b.c"
+                val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 5000; readTimeout = 10000
+                    setRequestProperty("User-Agent", "Kilo Android Music Player (lyrics translate)")
+                }
+                try {
+                    if (connection.responseCode in 200..299) {
+                        val body = connection.inputStream.bufferedReader().use { it.readText() }
+                        val json = JSONObject(body)
+                        val matches = json.optJSONArray("matches")
+                        if (matches != null) {
+                            for (i in 0 until matches.length()) {
+                                val match = matches.optJSONObject(i)
+                                val translation = match?.optString("translation") ?: ""
+                                val original = match?.optString("segment") ?: ""
+                                if (translation.isNotBlank() && original.isNotBlank()) {
+                                    result[original.trim()] = translation.trim()
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Translation batch failed: ${e.message}")
+                } finally {
+                    connection.disconnect()
+                }
+            }
+            result
+        }
 
     private fun findBetterLyrics(song: SongItemClean): List<LyricLine> {
         if (song.title.isBlank() || song.artist.isBlank()) return emptyList()

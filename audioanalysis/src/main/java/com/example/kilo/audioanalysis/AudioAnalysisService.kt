@@ -18,7 +18,9 @@ import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.pow
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
+import kotlin.math.sin
 
 @Entity(tableName = "track_analysis")
 data class TrackAnalysisEntity(
@@ -29,11 +31,12 @@ data class TrackAnalysisEntity(
     val mood: String,
     val danceability: Double,
     val loudnessDb: Double,
+    val loudnessDbAlbum: Double? = null, // Album-normalized loudness
     val instrumentalGenerated: Boolean = false,
     val analysisVersion: Int = CURRENT_ANALYSIS_VERSION,
     val updatedAtMs: Long = System.currentTimeMillis()
 ) {
-    companion object { const val CURRENT_ANALYSIS_VERSION = 1 }
+    companion object { const val CURRENT_ANALYSIS_VERSION = 2 } // Bumped for album loudness
 }
 
 @Dao
@@ -73,7 +76,7 @@ interface RecognitionHistoryDao {
     fun trim()
 }
 
-@Database(entities = [TrackAnalysisEntity::class, RecognitionHistoryEntity::class], version = 1, exportSchema = false)
+@Database(entities = [TrackAnalysisEntity::class, RecognitionHistoryEntity::class], version = 2, exportSchema = false)
 abstract class AudioAnalysisDatabase : RoomDatabase() {
     abstract fun trackAnalysisDao(): TrackAnalysisDao
     abstract fun recognitionHistoryDao(): RecognitionHistoryDao
@@ -87,7 +90,7 @@ object AudioAnalysisDatabaseProvider {
             context.applicationContext,
             AudioAnalysisDatabase::class.java,
             "kilo_audio_analysis.db"
-        ).build().also { instance = it }
+        ).fallbackToDestructiveMigration().build().also { instance = it }
     }
 }
 
@@ -147,6 +150,12 @@ class AudioAnalysisService(
 
 /** Dependency-free PCM feature extraction, intended for bounded background jobs only. */
 class PcmTrackAnalyzer {
+    // Analyze up to 30 seconds for more accurate loudness, but cap at reasonable duration
+    companion object {
+        private const val MAX_ANALYSIS_SECONDS = 30
+        private const val ANALYSIS_RATE_HZ = 22050
+    }
+
     fun analyze(trackId: String, interleaved: FloatArray, sampleRateHz: Int, channels: Int): TrackAnalysisEntity {
         val (mono, analysisRate) = downmixAndLimit(interleaved, channels, sampleRateHz, MAX_ANALYSIS_SECONDS)
         var squareSum = 0.0
@@ -174,7 +183,8 @@ class PcmTrackAnalyzer {
             energy = energy,
             mood = mood,
             danceability = danceability,
-            loudnessDb = loudness
+            loudnessDb = loudness,
+            loudnessDbAlbum = null // Will be computed at album level if needed
         )
     }
 
@@ -198,95 +208,144 @@ class PcmTrackAnalyzer {
     private fun estimateBpm(signal: FloatArray, analysisSampleRate: Int): Pair<Double?, Double> {
         if (signal.size < ANALYSIS_RATE_HZ * 3) return null to 0.0
         val hop = 256
-        val envelope = FloatArray(signal.size / hop)
-        for (index in envelope.indices) {
-            val start = index * hop
-            var sum = 0.0
-            val end = min(signal.size, start + hop)
-            for (sample in start until end) sum += signal[sample].toDouble() * signal[sample]
-            envelope[index] = sqrt(sum / (end - start).coerceAtLeast(1)).toFloat()
+        val window = 2048
+        val frames = (signal.size - window) / hop
+        if (frames <= 0) return null to 0.0
+        val flux = DoubleArray(frames)
+        var prevMag = 0.0
+        for (i in 0 until frames) {
+            val start = i * hop
+            var mag = 0.0
+            for (j in 0 until window) {
+                val s = signal[start + j].toDouble()
+                mag += s * s
+            }
+            mag = sqrt(mag / window)
+            flux[i] = max(0.0, mag - prevMag)
+            prevMag = mag
         }
-        val mean = envelope.average().toFloat()
-        for (i in envelope.indices) envelope[i] = (envelope[i] - mean).coerceAtLeast(0f)
-        val envelopeRate = analysisSampleRate.toDouble() / hop
-        val minLag = (envelopeRate * 60.0 / 200.0).toInt().coerceAtLeast(1)
-        val maxLag = (envelopeRate * 60.0 / 55.0).toInt().coerceAtMost(envelope.size / 2)
+        val acf = autocorrelate(flux)
+        val minLag = analysisSampleRate / hop / 200  // 200 BPM max
+        val maxLag = analysisSampleRate / hop / 50   // 50 BPM min
         var bestLag = -1
-        var bestScore = 0.0
-        var baseEnergy = 0.0
-        for (i in envelope.indices) baseEnergy += envelope[i].toDouble() * envelope[i]
-        if (baseEnergy <= 1e-7) return null to 0.0
-        for (lag in minLag..maxLag) {
-            var correlation = 0.0
-            for (i in 0 until envelope.size - lag) correlation += envelope[i].toDouble() * envelope[i + lag]
-            val score = correlation / baseEnergy
-            if (score > bestScore) { bestScore = score; bestLag = lag }
-        }
-        if (bestLag <= 0) return null to 0.0
-        val bpm = 60.0 * envelopeRate / bestLag
-        return bpm.takeIf { it in 55.0..200.0 } to bestScore.coerceIn(0.0, 1.0)
-    }
-
-    private fun estimateKey(signal: FloatArray, sampleRate: Int): String? {
-        if (signal.size < 4096) return null
-        val downsampled = signal.take(KEY_SAMPLE_LIMIT).toFloatArray()
-        val actualRate = sampleRate.toDouble()
-        val chroma = DoubleArray(12)
-        for (note in 0 until 12) {
-            for (octave in 2..6) {
-                val frequency = 440.0 * 2.0.pow((note - 9 + (octave - 4) * 12) / 12.0)
-                if (frequency !in 55.0..3_500.0) continue
-                chroma[note] += goertzelPower(downsampled, actualRate, frequency)
+        var bestVal = 0.0
+        for (lag in minLag..maxLag.coerceAtMost(acf.size - 1)) {
+            if (acf[lag] > bestVal) {
+                bestVal = acf[lag]
+                bestLag = lag
             }
         }
-        val total = chroma.sum()
-        if (total <= 1e-10) return null
-        val major = doubleArrayOf(6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
-        val minor = doubleArrayOf(6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
-        val names = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
-        var best = Double.NEGATIVE_INFINITY
-        var key: String? = null
+        if (bestLag <= 0 || bestVal < 0.2) return null to 0.0
+        val bpm = (60.0 * analysisSampleRate) / (hop * bestLag)
+        val confidence = bestVal.coerceIn(0.0, 1.0)
+        return bpm to confidence
+    }
+
+    private fun autocorrelate(signal: DoubleArray): DoubleArray {
+        val n = signal.size
+        val result = DoubleArray(n)
+        for (lag in 0 until n) {
+            var sum = 0.0
+            var count = 0
+            for (i in 0 until n - lag) {
+                sum += signal[i] * signal[i + lag]
+                count++
+            }
+            result[lag] = if (count > 0) sum / count else 0.0
+        }
+        return result
+    }
+
+    private fun estimateKey(signal: FloatArray, analysisSampleRate: Int): String? {
+        if (signal.size < ANALYSIS_RATE_HZ * 5) return null
+        val hop = 1024
+        val window = 4096
+        val frames = (signal.size - window) / hop
+        if (frames <= 0) return null
+        val chroma = Array(12) { DoubleArray(frames) { 0.0 } }
+        val fftSize = 4096
+        val twiddleRe = DoubleArray(fftSize)
+        val twiddleIm = DoubleArray(fftSize)
+        for (k in 0 until fftSize) {
+            val angle = -2.0 * kotlin.math.PI * k / fftSize
+            twiddleRe[k] = cos(angle)
+            twiddleIm[k] = sin(angle)
+        }
+        val windowFn = DoubleArray(window)
+        for (i in 0 until window) {
+            windowFn[i] = 0.5 - 0.5 * cos(2.0 * kotlin.math.PI * i / (window - 1))
+        }
+        for (i in 0 until frames) {
+            val start = i * hop
+            val re = DoubleArray(fftSize) { 0.0 }
+            val im = DoubleArray(fftSize) { 0.0 }
+            for (j in 0 until window) {
+                re[j] = signal[start + j].toDouble() * windowFn[j]
+            }
+            fft(re, im, fftSize, twiddleRe, twiddleIm)
+            val binHz = analysisSampleRate.toDouble() / fftSize
+            for (bin in 1 until fftSize / 2) {
+                val freq = bin * binHz
+                if (freq < 60.0 || freq > 2000.0) continue
+                val mag = sqrt(re[bin] * re[bin] + im[bin] * im[bin])
+                if (mag < 1e-6) continue
+                val midi = 69.0 + 12.0 * kotlin.math.log2(freq / 440.0)
+                val pitchClass = ((midi.roundToInt() % 12) + 12) % 12
+                chroma[pitchClass][i] += mag
+            }
+        }
+        val profileMajor = doubleArrayOf(6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88)
+        val profileMinor = doubleArrayOf(6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17)
+        val meanChroma = DoubleArray(12) { chroma[it].average() }
+        val sum = meanChroma.sum()
+        if (sum < 1e-6) return null
+        val norm = meanChroma.map { it / sum }
+        var bestKey = ""
+        var bestCorr = -1.0
+        val keyNames = arrayOf("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
         for (root in 0 until 12) {
-            val majorScore = profileCorrelation(chroma, major, root)
-            if (majorScore > best) { best = majorScore; key = "${names[root]} Major" }
-            val minorScore = profileCorrelation(chroma, minor, root)
-            if (minorScore > best) { best = minorScore; key = "${names[root]} Minor" }
+            var corrMaj = 0.0
+            var corrMin = 0.0
+            for (i in 0 until 12) {
+                corrMaj += norm[i] * profileMajor[(i - root + 12) % 12]
+                corrMin += norm[i] * profileMinor[(i - root + 12) % 12]
+            }
+            if (corrMaj > bestCorr) { bestCorr = corrMaj; bestKey = "${keyNames[root]} Major" }
+            if (corrMin > bestCorr) { bestCorr = corrMin; bestKey = "${keyNames[root]} Minor" }
         }
-        return key
+        return if (bestCorr > 0.1) bestKey else null
     }
 
-    private fun goertzelPower(samples: FloatArray, sampleRate: Double, frequency: Double): Double {
-        val omega = 2.0 * Math.PI * frequency / sampleRate
-        val coefficient = 2.0 * cos(omega)
-        var previous = 0.0
-        var previous2 = 0.0
-        for (sample in samples) {
-            val current = sample + coefficient * previous - previous2
-            previous2 = previous
-            previous = current
+    private fun fft(re: DoubleArray, im: DoubleArray, n: Int, twiddleRe: DoubleArray, twiddleIm: DoubleArray) {
+        var j = 0
+        for (i in 1 until n - 1) {
+            var bit = n shr 1
+            while (j and bit != 0) {
+                j = j xor bit
+                bit = bit shr 1
+            }
+            j = j xor bit
+            if (i < j) {
+                val tmp = re[i]; re[i] = re[j]; re[j] = tmp
+                val tmp2 = im[i]; im[i] = im[j]; im[j] = tmp2
+            }
         }
-        return max(0.0, previous2 * previous2 + previous * previous - coefficient * previous * previous2)
-    }
-
-    private fun profileCorrelation(chroma: DoubleArray, template: DoubleArray, root: Int): Double {
-        val meanChroma = chroma.average()
-        val meanTemplate = template.average()
-        var numerator = 0.0
-        var left = 0.0
-        var right = 0.0
-        for (index in 0 until 12) {
-            val a = chroma[(index + root) % 12] - meanChroma
-            val b = template[index] - meanTemplate
-            numerator += a * b
-            left += a * a
-            right += b * b
+        var len = 2
+        while (len <= n) {
+            val step = n / len
+            for (i in 0 until n step len) {
+                for (k in 0 until len / 2) {
+                    val even = i + k
+                    val odd = i + k + len / 2
+                    val tr = re[odd] * twiddleRe[k * step] - im[odd] * twiddleIm[k * step]
+                    val ti = re[odd] * twiddleIm[k * step] + im[odd] * twiddleRe[k * step]
+                    re[odd] = re[even] - tr
+                    im[odd] = im[even] - ti
+                    re[even] = re[even] + tr
+                    im[even] = im[even] + ti
+                }
+            }
+            len = len shl 1
         }
-        return numerator / sqrt((left * right).coerceAtLeast(1e-12))
-    }
-
-    private companion object {
-        const val ANALYSIS_RATE_HZ = 11_025
-        const val MAX_ANALYSIS_SECONDS = 8
-        const val KEY_SAMPLE_LIMIT = ANALYSIS_RATE_HZ * 8
     }
 }

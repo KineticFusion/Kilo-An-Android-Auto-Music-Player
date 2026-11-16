@@ -35,12 +35,14 @@ class SoundProfileRepository(private val preferences: SharedPreferences) {
     fun forOutput(route: AudioOutputRoute): SoundProfile {
         val selected = profiles.firstOrNull { it.id == selectedId() } ?: profiles.first()
         if (selected.id != ORIGINAL) return selected
+        // Reduced gains to prevent over-amplification with new limiter settings
+        // The new limiter (threshold -6dB, ratio 6:1) allows more natural dynamics
         val routeGain = when (route.kind) {
-            AudioOutputKind.CAR_BLUETOOTH, AudioOutputKind.ANDROID_AUTO -> 5.0f
-            AudioOutputKind.BLUETOOTH_SPEAKER -> 4.0f
-            AudioOutputKind.EARBUDS, AudioOutputKind.HEADPHONES, AudioOutputKind.WIRED, AudioOutputKind.USB_DAC -> 4.0f
-            AudioOutputKind.BUILT_IN -> 4.0f
-            AudioOutputKind.OTHER -> 4.0f
+            AudioOutputKind.CAR_BLUETOOTH, AudioOutputKind.ANDROID_AUTO -> 3.5f  // Was 5.0f
+            AudioOutputKind.BLUETOOTH_SPEAKER -> 3.0f  // Was 4.0f
+            AudioOutputKind.EARBUDS, AudioOutputKind.HEADPHONES, AudioOutputKind.WIRED, AudioOutputKind.USB_DAC -> 2.5f  // Was 4.0f
+            AudioOutputKind.BUILT_IN -> 3.0f  // Was 4.0f
+            AudioOutputKind.OTHER -> 3.0f  // Was 4.0f
         }
         return selected.copy(inputGainDb = routeGain, virtualizerStrength = 0, gainsDb = flat)
     }

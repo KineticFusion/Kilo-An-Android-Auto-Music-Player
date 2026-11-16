@@ -1,3 +1,4 @@
+@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
 package com.example.kilo.lyrics.ui
 
 import android.graphics.BitmapFactory

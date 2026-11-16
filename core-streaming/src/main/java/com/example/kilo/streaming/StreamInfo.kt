@@ -4,6 +4,7 @@ enum class StreamOrigin {
     PARALLEL_CLIENT,
     REPOSITORY_FALLBACK,
     LOSSLESS,
+    YOUTUBE_MUSIC,
     UNKNOWN
 }
 

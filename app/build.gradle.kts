@@ -10,14 +10,35 @@ android {
         version = release(37)
     }
 
+    buildFeatures {
+        prefab = true
+    }
+
     defaultConfig {
         applicationId = "com.example.kilo"
         minSdk = 24
         targetSdk = 37
-        versionCode = 345
-        versionName = "3.4.5"
+        versionCode = 350
+        versionName = "3.5.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        ndkVersion = "27.0.12077973"
+
+        // NDK Configuration
+        externalNativeBuild {
+            cmake {
+                cppFlags.add("-std=c++20")
+                cppFlags.add("-fexceptions")
+                cppFlags.add("-frtti")
+                cppFlags.add("-O3")
+                cppFlags.add("-ffast-math")
+                // 16KB page alignment for Android 15+ (NDK r27 requires explicit linker flag)
+                cppFlags.add("-Wl,-z,max-page-size=16384")
+                arguments.add("-DANDROID_STL=c++_shared")
+                abiFilters.add("arm64-v8a")
+                abiFilters.add("armeabi-v7a")
+            }
+        }
     }
 
     buildTypes {
@@ -38,6 +59,18 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+    externalNativeBuild {
+        cmake {
+            path("src/main/cpp/CMakeLists.txt")
+        }
+    }
+
+    // 16KB page alignment: ensure .so files are stored uncompressed and zip-aligned
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
     }
 }
 
@@ -103,13 +136,17 @@ androidComponents {
         // Additional libraries needed for VYBE / ExoPlayer / Coil / Icons
         implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.5")
         implementation("androidx.compose.material:material-icons-extended")
-        implementation("androidx.media3:media3-exoplayer:1.4.1")
-        implementation("androidx.media3:media3-exoplayer-hls:1.4.1")
-        implementation("androidx.media3:media3-exoplayer-dash:1.4.1")
-        implementation("androidx.media3:media3-common:1.4.1")
-        implementation("androidx.media3:media3-datasource:1.4.1")
-        implementation("androidx.media3:media3-session:1.4.1")
-        implementation("androidx.media3:media3-ui:1.4.1")
+        implementation("androidx.webkit:webkit:1.14.0")
+        implementation("androidx.browser:browser:1.7.0")
+        implementation("androidx.media3:media3-exoplayer:1.6.0")
+        implementation("androidx.media3:media3-exoplayer-hls:1.6.0")
+        implementation("androidx.media3:media3-exoplayer-dash:1.6.0")
+        implementation("androidx.media3:media3-common:1.6.0")
+        implementation("androidx.media3:media3-datasource:1.6.0")
+        implementation("androidx.media3:media3-session:1.6.0")
+        implementation("androidx.media3:media3-ui:1.6.0")
         implementation("io.coil-kt:coil-compose:2.7.0")
         implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.5")
+        // Oboe for low-latency audio output (native crossfade engine) - 1.9.0+ for 16KB page alignment
+        implementation(libs.oboe)
     }

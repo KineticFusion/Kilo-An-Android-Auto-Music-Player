@@ -35,6 +35,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -122,6 +123,17 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import com.example.kilo.streaming.*
+import com.example.kilo.streaming.ConfiguredSource
+import com.example.kilo.streaming.HybridSourceRegistry
+import com.example.kilo.streaming.HybridTrack
+import com.example.kilo.streaming.SourceType
+import com.example.kilo.spotify.SpotifyAuthManager
+import com.example.kilo.spotify.SpotifyLoginDialog
+import com.example.kilo.spotify.SpotifyPlaylistSummary
+import com.example.kilo.spotify.SpotifyCategorySummary
+import com.example.kilo.spotify.SpotifyAlbumSummary
+import com.example.kilo.spotify.SpotifySourceProvider
+import com.example.kilo.spotify.SpotifyColors
 import com.example.kilo.playbackoptimization.PlaybackCriticalPathAnalyzer
 import com.example.kilo.profile.*
 import com.example.kilo.companion.CompanionContext
@@ -764,6 +776,13 @@ data class SavedPlaylist(
     val updatedAtMs: Long = System.currentTimeMillis()
 )
 
+data class SpotifyPlaylistDetail(
+    val id: String,
+    val name: String,
+    val coverUrl: String,
+    val tracks: List<SongItemClean>
+)
+
 enum class SearchedPlaylistBulkAction {
     DOWNLOAD_ALL,
     LIKE_ALL,
@@ -1095,6 +1114,19 @@ data class AppStateModel(
     val pendingDriveRecap: DriveRecapPending? = null,
     val youtubeMusicPlaylists: List<SongItemClean> = emptyList(),
     val isLoadingYoutubeMusicPlaylists: Boolean = false,
+    val spotifyPlaylists: List<SpotifyPlaylistSummary> = emptyList(),
+    val isLoadingSpotifyPlaylists: Boolean = false,
+    val expandedSpotifyPlaylist: SpotifyPlaylistDetail? = null,
+    val isLoadingSpotifyPlaylistTracks: Boolean = false,
+    val spotifyNewReleases: List<SongItemClean> = emptyList(),
+    val isLoadingSpotifyNewReleases: Boolean = false,
+    val spotifyFeaturedPlaylists: List<SpotifyPlaylistSummary> = emptyList(),
+    val isLoadingSpotifyFeaturedPlaylists: Boolean = false,
+    val spotifyCategories: List<SpotifyCategorySummary> = emptyList(),
+    val isLoadingSpotifyCategories: Boolean = false,
+    val selectedSpotifyCategory: SpotifyCategorySummary? = null,
+    val spotifyCategoryPlaylists: List<SpotifyPlaylistSummary> = emptyList(),
+    val isLoadingSpotifyCategoryPlaylists: Boolean = false,
     val notRecommendedIds: Set<String> = emptySet(),
     val notForCurrentMoodIds: Set<String> = emptySet(),
     val selectedAutoMenus: List<String> = listOf(
@@ -1113,6 +1145,11 @@ data class AppStateModel(
     val losslessSourceEnabled: Boolean = false,
     val losslessSourceHasToken: Boolean = false,
     val losslessSourceStatus: String = "Optional: connect a compatible FLAC source",
+    val spotifyEnabled: Boolean = false,
+    val spotifyLoggedIn: Boolean = false,
+    val spotifyStatus: String = "Connect Spotify for catalog & hybrid playback",
+    val showSpotifyLoginDialog: Boolean = false,
+    val sourceMode: String = "both", // "both", "spotify_only", "youtube_only"
     val downloadWifiOnly: Boolean = true,
     val dolbyAtmosEnabled: Boolean = false,
     val activeSkin: SkinTheme = SkinTheme.SUNSET_GLASS,
@@ -1157,6 +1194,7 @@ data class AppStateModel(
     val isLoadingStream: Boolean = false,
     val videoMode: Boolean = false,
     val autoMixEnabled: Boolean = false,
+    val crossfadeDurationMs: Long = 5000L,
     val autoConnectCar: Boolean = true,
     val autoPlayOnCarConnect: Boolean = false,
     val pauseForCalls: Boolean = true,
@@ -1580,6 +1618,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _state.value = _state.value.copy(pendingDriveRecap = DriveRecapStore.pending(prefs))
         }
     }
+    private val crossfadePreferenceListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
+        if (key == "harmony_crossfade_duration_ms" && prefs != null) {
+            _state.value = _state.value.copy(crossfadeDurationMs = prefs.getLong(key, CrossfadeSettings.DEFAULT_DURATION_MS))
+        }
+    }
 
     private var searchJob: Job? = null
     private var youtubePlaylistSearchJob: Job? = null
@@ -1895,6 +1938,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         SessionStore.init(application)
         DriveRecapStore.init(application)
         preferences.registerOnSharedPreferenceChangeListener(driveRecapPreferenceListener)
+        preferences.registerOnSharedPreferenceChangeListener(crossfadePreferenceListener)
         FastStream.warmUp()
         player.addListener(playbackListener)
         PlaybackSleepTimer.attach(player)
@@ -1953,6 +1997,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             activeSkin = savedSkin,
             displayName = preferences.getString("display_name", "Arnav") ?: "Arnav",
             autoMixEnabled = preferences.getBoolean("auto_mix_enabled", false),
+            crossfadeDurationMs = preferences.getLong("harmony_crossfade_duration_ms", CrossfadeSettings.DEFAULT_DURATION_MS),
             autoConnectCar = preferences.getBoolean("auto_connect_car_enabled", true),
             autoLayoutMode = normalizeAutoLayoutMode(preferences.getString("auto_layout_mode", AUTO_LAYOUT_MODES.first())),
             autoPlayOnCarConnect = preferences.getBoolean("auto_play_car_connect", false),
@@ -2046,6 +2091,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         loadHome()
         loadYoutubeMusicPlaylists()
+        loadSpotifyPlaylists()
+        loadSpotifyNewReleases()
+        loadSpotifyFeaturedPlaylists()
+        loadSpotifyCategories()
         if (_state.value.downloadDirectoryUri != null) scanDownloadedFolder(showMessage = false)
 
         viewModelScope.launch {
@@ -2184,6 +2233,247 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
             Log.i("VybeVM", "YouTube Music library playlists loaded account=$accountId count=${playlists.size}")
         }
+    }
+
+    /**
+     * Loads Spotify user playlists
+     */
+    fun loadSpotifyPlaylists(force: Boolean = false) {
+        val snapshot = _state.value
+        if (!snapshot.spotifyLoggedIn) return
+        if (!force && (snapshot.spotifyPlaylists.isNotEmpty() || snapshot.isLoadingSpotifyPlaylists)) return
+
+        _state.value = _state.value.copy(isLoadingSpotifyPlaylists = true)
+        viewModelScope.launch {
+            val config = ConfiguredSource(
+                id = HybridSourceRegistry.SOURCE_ID_SPOTIFY,
+                name = "Spotify",
+                type = SourceType.SPOTIFY,
+                enabled = true,
+                priority = 0
+            )
+            val provider = SpotifySourceProvider(getApplication<Application>(), config)
+            val playlists = withContext(Dispatchers.IO) {
+                runCatching { provider.fetchUserPlaylists(50) }
+                    .onFailure { Log.w("VybeVM", "Could not load Spotify playlists", it) }
+                    .getOrDefault(emptyList())
+            }
+            _state.value = _state.value.copy(
+                spotifyPlaylists = playlists,
+                isLoadingSpotifyPlaylists = false
+            )
+            Log.i("VybeVM", "Spotify playlists loaded count=${playlists.size}")
+        }
+    }
+
+    /**
+     * Expands a Spotify playlist to show all tracks
+     */
+    fun expandSpotifyPlaylist(playlist: SpotifyPlaylistSummary) {
+        _state.value = _state.value.copy(
+            expandedSpotifyPlaylist = SpotifyPlaylistDetail(
+                id = playlist.id,
+                name = playlist.name,
+                coverUrl = playlist.coverUrl,
+                tracks = emptyList()
+            ),
+            isLoadingSpotifyPlaylistTracks = true
+        )
+        viewModelScope.launch {
+            val config = ConfiguredSource(
+                id = HybridSourceRegistry.SOURCE_ID_SPOTIFY,
+                name = "Spotify",
+                type = SourceType.SPOTIFY,
+                enabled = true,
+                priority = 0
+            )
+            val provider = SpotifySourceProvider(getApplication<Application>(), config)
+            val hybridTracks = withContext(Dispatchers.IO) {
+                runCatching { provider.fetchPlaylistTracks(playlist.id, 200) }
+                    .onFailure { Log.w("VybeVM", "Could not load Spotify playlist tracks", it) }
+                    .getOrDefault(emptyList())
+            }
+            val tracks = hybridTracks.map { hybridToSongItemClean(it) }
+            _state.value = _state.value.copy(
+                expandedSpotifyPlaylist = SpotifyPlaylistDetail(
+                    id = playlist.id,
+                    name = playlist.name,
+                    coverUrl = playlist.coverUrl,
+                    tracks = tracks
+                ),
+                isLoadingSpotifyPlaylistTracks = false
+            )
+            Log.i("VybeVM", "Spotify playlist expanded: ${playlist.name} with ${tracks.size} tracks")
+        }
+    }
+
+    /**
+     * Converts HybridTrack to SongItemClean for UI display
+     */
+    private fun hybridToSongItemClean(track: HybridTrack): SongItemClean {
+        return SongItemClean(
+            id = track.rawId,
+            videoId = "", // Spotify tracks don't have video IDs
+            playlistId = "",
+            albumBrowseId = "",
+            title = track.title,
+            artist = track.artist,
+            album = track.album,
+            coverUrl = track.coverUrl,
+            themeColor = Color(0xFF1DB954), // Spotify green
+            durationMs = track.durationMs,
+            isExplicit = track.isExplicit,
+            spotifyTrackId = track.rawId
+        )
+    }
+
+    /**
+     * Collapses the expanded Spotify playlist
+     */
+    fun collapseSpotifyPlaylist() {
+        _state.value = _state.value.copy(
+            expandedSpotifyPlaylist = null,
+            isLoadingSpotifyPlaylistTracks = false
+        )
+    }
+
+    /**
+     * Loads Spotify new releases for home feed
+     */
+    fun loadSpotifyNewReleases(force: Boolean = false) {
+        val snapshot = _state.value
+        if (!snapshot.spotifyLoggedIn) return
+        if (!force && (snapshot.spotifyNewReleases.isNotEmpty() || snapshot.isLoadingSpotifyNewReleases)) return
+
+        _state.value = _state.value.copy(isLoadingSpotifyNewReleases = true)
+        viewModelScope.launch {
+            val config = ConfiguredSource(
+                id = HybridSourceRegistry.SOURCE_ID_SPOTIFY,
+                name = "Spotify",
+                type = SourceType.SPOTIFY,
+                enabled = true,
+                priority = 0
+            )
+            val provider = SpotifySourceProvider(getApplication<Application>(), config)
+            val hybridTracks = withContext(Dispatchers.IO) {
+                runCatching { provider.fetchNewReleases(20) }
+                    .onFailure { Log.w("VybeVM", "Could not load Spotify new releases", it) }
+                    .getOrDefault(emptyList())
+            }
+            val tracks = hybridTracks.map { hybridToSongItemClean(it) }
+            _state.value = _state.value.copy(
+                spotifyNewReleases = tracks,
+                isLoadingSpotifyNewReleases = false
+            )
+            Log.i("VybeVM", "Spotify new releases loaded count=${tracks.size}")
+        }
+    }
+
+    /**
+     * Loads Spotify featured playlists for home feed
+     */
+    fun loadSpotifyFeaturedPlaylists(force: Boolean = false) {
+        val snapshot = _state.value
+        if (!snapshot.spotifyLoggedIn) return
+        if (!force && (snapshot.spotifyFeaturedPlaylists.isNotEmpty() || snapshot.isLoadingSpotifyFeaturedPlaylists)) return
+
+        _state.value = _state.value.copy(isLoadingSpotifyFeaturedPlaylists = true)
+        viewModelScope.launch {
+            val config = ConfiguredSource(
+                id = HybridSourceRegistry.SOURCE_ID_SPOTIFY,
+                name = "Spotify",
+                type = SourceType.SPOTIFY,
+                enabled = true,
+                priority = 0
+            )
+            val provider = SpotifySourceProvider(getApplication<Application>(), config)
+            val playlists = withContext(Dispatchers.IO) {
+                runCatching { provider.fetchFeaturedPlaylists(10) }
+                    .onFailure { Log.w("VybeVM", "Could not load Spotify featured playlists", it) }
+                    .getOrDefault(emptyList())
+            }
+            _state.value = _state.value.copy(
+                spotifyFeaturedPlaylists = playlists,
+                isLoadingSpotifyFeaturedPlaylists = false
+            )
+            Log.i("VybeVM", "Spotify featured playlists loaded count=${playlists.size}")
+        }
+    }
+
+    /**
+     * Loads Spotify categories for home feed
+     */
+    fun loadSpotifyCategories(force: Boolean = false) {
+        val snapshot = _state.value
+        if (!snapshot.spotifyLoggedIn) return
+        if (!force && (snapshot.spotifyCategories.isNotEmpty() || snapshot.isLoadingSpotifyCategories)) return
+
+        _state.value = _state.value.copy(isLoadingSpotifyCategories = true)
+        viewModelScope.launch {
+            val config = ConfiguredSource(
+                id = HybridSourceRegistry.SOURCE_ID_SPOTIFY,
+                name = "Spotify",
+                type = SourceType.SPOTIFY,
+                enabled = true,
+                priority = 0
+            )
+            val provider = SpotifySourceProvider(getApplication<Application>(), config)
+            val categories = withContext(Dispatchers.IO) {
+                runCatching { provider.fetchCategories(20) }
+                    .onFailure { Log.w("VybeVM", "Could not load Spotify categories", it) }
+                    .getOrDefault(emptyList())
+            }
+            _state.value = _state.value.copy(
+                spotifyCategories = categories,
+                isLoadingSpotifyCategories = false
+            )
+            Log.i("VybeVM", "Spotify categories loaded count=${categories.size}")
+        }
+    }
+
+    /**
+     * Loads playlists for a specific Spotify category
+     */
+    fun loadSpotifyCategoryPlaylists(category: SpotifyCategorySummary) {
+        val snapshot = _state.value
+        if (!snapshot.spotifyLoggedIn) return
+
+        _state.value = _state.value.copy(
+            selectedSpotifyCategory = category,
+            spotifyCategoryPlaylists = emptyList(),
+            isLoadingSpotifyCategoryPlaylists = true
+        )
+        viewModelScope.launch {
+            val config = ConfiguredSource(
+                id = HybridSourceRegistry.SOURCE_ID_SPOTIFY,
+                name = "Spotify",
+                type = SourceType.SPOTIFY,
+                enabled = true,
+                priority = 0
+            )
+            val provider = SpotifySourceProvider(getApplication<Application>(), config)
+            val playlists = withContext(Dispatchers.IO) {
+                runCatching { provider.fetchCategoryPlaylists(category.id, 20) }
+                    .onFailure { Log.w("VybeVM", "Could not load Spotify category playlists", it) }
+                    .getOrDefault(emptyList())
+            }
+            _state.value = _state.value.copy(
+                spotifyCategoryPlaylists = playlists,
+                isLoadingSpotifyCategoryPlaylists = false
+            )
+            Log.i("VybeVM", "Spotify category playlists loaded for ${category.name} count=${playlists.size}")
+        }
+    }
+
+    /**
+     * Clears the selected Spotify category and returns to category browsing
+     */
+    fun clearSpotifyCategory() {
+        _state.value = _state.value.copy(
+            selectedSpotifyCategory = null,
+            spotifyCategoryPlaylists = emptyList(),
+            isLoadingSpotifyCategoryPlaylists = false
+        )
     }
 
     private fun loadHome() {
@@ -3391,6 +3681,7 @@ _state.value = _state.value.copy(
 
     fun openWebLogin() { _state.value = _state.value.copy(showWebLoginDialog = true) }
     fun closeWebLogin() { _state.value = _state.value.copy(showWebLoginDialog = false) }
+    fun closeSpotifyLogin() { _state.value = _state.value.copy(showSpotifyLoginDialog = false) }
     fun toggleAccountManager(show: Boolean) { _state.value = _state.value.copy(showAccountManagerDialog = show) }
 
     fun openCreateProfileDialog() {
@@ -4447,6 +4738,15 @@ _state.value = _state.value.copy(
         }
     }
 
+    fun setCrossfadeDuration(durationMs: Long) {
+        val clampedDuration = durationMs.coerceIn(CrossfadeSettings.choicesMs.first(), CrossfadeSettings.choicesMs.last())
+        preferences.edit().putLong("harmony_crossfade_duration_ms", clampedDuration).apply()
+        _state.value = _state.value.copy(crossfadeDurationMs = clampedDuration)
+        if (PlayerHolder.isCrossfadeActive()) {
+            PlayerHolder.updateCrossfadeConfig(enabled = clampedDuration > 0, durationMs = clampedDuration)
+        }
+    }
+
     fun toggleAutoConnectCar() {
         val enabled = !_state.value.autoConnectCar
         preferences.edit().putBoolean("auto_connect_car_enabled", enabled).apply()
@@ -5070,6 +5370,18 @@ _state.value = _state.value.copy(
         _state.value = _state.value.copy(downloadQuality = preset.label)
     }
 
+    fun setSourceMode(mode: String) {
+        val validMode = when (mode) {
+            "spotify_only", "youtube_only", "both" -> mode
+            else -> "both"
+        }
+        preferences.edit().putString("source_mode", validMode).apply()
+        _state.value = _state.value.copy(sourceMode = validMode)
+        // Notify registry to refresh providers
+        HybridSourceRegistry.setSourceMode(getApplication<Application>(), validMode)
+        reloadHome()
+    }
+
     fun configureLosslessSource(url: String, token: String, provider: String = "Custom source") {
         val app = getApplication<Application>()
         val cleanedUrl = url.trim().trimEnd('/')
@@ -5095,6 +5407,57 @@ _state.value = _state.value.copy(
         _state.value = _state.value.copy(
             losslessSourceEnabled = false,
             losslessSourceStatus = "YouTube Music fallback enabled"
+        )
+    }
+
+    fun setSpotifyEnabled(enabled: Boolean) {
+        val app = getApplication<Application>()
+        HybridSourceRegistry.setSourceEnabled(app, HybridSourceRegistry.SOURCE_ID_SPOTIFY, enabled)
+        _state.value = _state.value.copy(
+            spotifyEnabled = enabled,
+            spotifyStatus = if (enabled) "Spotify active • hybrid playback ready" else "Spotify disabled"
+        )
+    }
+
+    fun checkSpotifyStatus() {
+        val app = getApplication<Application>()
+        HybridSourceRegistry.ensureInitialized(app)
+        val isEnabled = HybridSourceRegistry.isSpotifyEnabled(app)
+        val isLoggedIn = SpotifyAuthManager.isLoggedIn(app)
+        val status = if (!isEnabled) "Spotify disabled"
+        else if (isLoggedIn) "Connected • Spotify Web Session active"
+        else "Not signed in"
+        _state.value = _state.value.copy(
+            spotifyEnabled = isEnabled,
+            spotifyLoggedIn = isLoggedIn,
+            spotifyStatus = status
+        )
+    }
+
+    fun openSpotifyLogin() {
+        _state.value = _state.value.copy(showSpotifyLoginDialog = true)
+    }
+
+    fun onSpotifyLoginSuccess() {
+        val app = getApplication<Application>()
+        checkSpotifyStatus()
+        // Also enable Spotify source if it was disabled
+        HybridSourceRegistry.setSourceEnabled(app, HybridSourceRegistry.SOURCE_ID_SPOTIFY, true)
+        _state.value = _state.value.copy(
+            showSpotifyLoginDialog = false,
+            spotifyEnabled = true,
+            spotifyLoggedIn = true,
+            spotifyStatus = "Connected • Spotify Web Session active"
+        )
+    }
+
+    fun signOutSpotify() {
+        val app = getApplication<Application>()
+        SpotifyAuthManager.clearSession(app)
+        HybridSourceRegistry.setSourceEnabled(app, HybridSourceRegistry.SOURCE_ID_SPOTIFY, true)
+        _state.value = _state.value.copy(
+            spotifyLoggedIn = false,
+            spotifyStatus = "Signed out • Tap to sign in again"
         )
     }
 
@@ -6757,6 +7120,14 @@ fun VybeRootApp(vm: MainViewModel) {
         )
     }
 
+    if (state.showSpotifyLoginDialog) {
+        SpotifyLoginDialog(
+            onLoginSuccess = { vm.onSpotifyLoginSuccess() },
+            onDismiss = { vm.closeSpotifyLogin() }
+        )
+    }
+
+
     if (state.showAccountManagerDialog) {
         AccountManagerDialog(
             accounts = state.accountsList,
@@ -7357,11 +7728,31 @@ fun FreshFriendlyHomeScreen(vm: MainViewModel) {
                 items(homeTabs, key = { "home_tab_$it" }, contentType = { "tab" }) { label ->
                     val selected = activeHomeTab == label
                     val chipShape = if (family == 2) RoundedCornerShape(50) else primaryCardShape(skin)
+                    val animatedBgColor = animateColorAsState(
+                        targetValue = if (selected) accent.copy(alpha = 0.24f) else primaryPanelColor(skin),
+                        animationSpec = tween(250, 0, LinearEasing)
+                    )
+                    val animatedBorderColor = animateColorAsState(
+                        targetValue = if (selected) accent.copy(alpha = 0.55f) else Color.White.copy(alpha = 0.07f),
+                        animationSpec = tween(250, 0, LinearEasing)
+                    )
                     Box(
-                        Modifier.clip(chipShape).background(if (selected) accent.copy(alpha = 0.24f) else primaryPanelColor(skin))
-                            .border(1.dp, if (selected) accent.copy(alpha = 0.55f) else Color.White.copy(alpha = 0.07f), chipShape)
-                            .clickable { vm.selectHomeCategory(label) }.padding(horizontal = 15.dp, vertical = 9.dp)
-                    ) { Text(label, color = Color.White, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, maxLines = 1) }
+                        Modifier
+                            .clip(chipShape)
+                            .background(animatedBgColor.value)
+                            .border(1.dp, animatedBorderColor.value, chipShape)
+                            .clickable { vm.selectHomeCategory(label) }
+                            .padding(horizontal = 15.dp, vertical = 9.dp)
+                            .animateContentSize(animationSpec = tween(200, 0, LinearEasing))
+                    ) {
+                        Text(
+                            label,
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                            maxLines = 1
+                        )
+                    }
                 }
             }
         }
@@ -8088,16 +8479,25 @@ private fun LegacyFreshFriendlyHomeScreen(vm: MainViewModel) {
             ) {
                 itemsIndexed(tabs, key = { _, tab -> "home_category_tab_$tab" }, contentType = { _, _ -> "tab" }) { _, tab ->
                     val active = state.activeHomeTab == tab
+                    val animatedBgColor = animateColorAsState(
+                        targetValue = if (active) accent else Color.White.copy(alpha = 0.06f),
+                        animationSpec = tween(250, 0, LinearEasing)
+                    )
+                    val animatedTextColor = animateColorAsState(
+                        targetValue = if (active) Color.Black else Color.White.copy(0.88f),
+                        animationSpec = tween(250, 0, LinearEasing)
+                    )
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(14.dp))
-                            .background(if (active) accent else Color.White.copy(alpha = 0.06f))
+                            .background(animatedBgColor.value)
                             .clickable { vm.selectHomeCategory(tab) }
                             .padding(horizontal = 16.dp, vertical = 9.dp)
+                            .animateContentSize(animationSpec = tween(200, 0, LinearEasing))
                     ) {
                         Text(
                             text = tab,
-                            color = if (active) Color.Black else Color.White.copy(0.88f),
+                            color = animatedTextColor.value,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Bold
                         )
@@ -8128,52 +8528,57 @@ private fun LegacyFreshFriendlyHomeScreen(vm: MainViewModel) {
         state.homeShelves.forEachIndexed { idx, shelf ->
             val showShelf = if (idx == 0) state.uiCustomizations["showQuickPicks"] != false else state.uiCustomizations["showCuratedShelves"] != false
             val visibleSongs = shelf.songs.filterNot { it.id in state.notRecommendedIds }
-            if (showShelf && visibleSongs.isNotEmpty() && (state.activeHomeTab == "All" || state.activeHomeTab == shelf.title)) {
+            val isTabVisible = state.activeHomeTab == "All" || state.activeHomeTab == shelf.title
+            if (showShelf && visibleSongs.isNotEmpty() && isTabVisible) {
                 item(key = "shelf_$idx") {
-                    Column {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .animateContentSize(animationSpec = tween(300, 100, LinearEasing))
+                    ) {
                         Spacer(modifier = Modifier.height(16.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(shelf.title, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
-                            Text(
-                                "Play all",
-                                color = accent,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                                modifier = Modifier.clickable {
-                                    visibleSongs.firstOrNull()?.let { vm.playSongFromShelf(it, visibleSongs) }
-                                }
-                            )
-                        }
-                        if (shelf.isList) {
-                            visibleSongs.take(6).forEach { song ->
-                                BitchordSongRowItem(
-                                    song = song,
-                                    isCurrent = state.activeSong.id == song.id,
-                                    onClick = { vm.playSongFromShelf(song, visibleSongs) },
-                                    vm = vm
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(shelf.title, color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.ExtraBold)
+                                Text(
+                                    "Play all",
+                                    color = accent,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.clickable {
+                                        visibleSongs.firstOrNull()?.let { vm.playSongFromShelf(it, visibleSongs) }
+                                    }
                                 )
                             }
-                        } else {
-                            LazyRow(
-                                contentPadding = PaddingValues(horizontal = 20.dp),
-                                horizontalArrangement = Arrangement.spacedBy(14.dp)
-                            ) {
-                                itemsIndexed(
-                                    visibleSongs,
-                                    key = { songIndex, song -> "home_shelf_${song.videoId.ifBlank { song.id }}_$songIndex" },
-                                    contentType = { _, _ -> "song_card" }
-                                ) { _, song ->
-                                    if (idx == 0) {
-                                        BitchordLargeQuickPickCard(
-                                            song = song,
-                                            onClick = { vm.playSongFromShelf(song, visibleSongs) }
-                                        )
-                                    } else {
-                                        BitchordSquareAlbumCard(
+                            if (shelf.isList) {
+                                visibleSongs.take(6).forEach { song ->
+                                    BitchordSongRowItem(
+                                        song = song,
+                                        isCurrent = state.activeSong.id == song.id,
+                                        onClick = { vm.playSongFromShelf(song, visibleSongs) },
+                                        vm = vm
+                                    )
+                                }
+                            } else {
+                                LazyRow(
+                                    contentPadding = PaddingValues(horizontal = 20.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                                ) {
+                                    itemsIndexed(
+                                        visibleSongs,
+                                        key = { songIndex, song -> "home_shelf_${song.videoId.ifBlank { song.id }}_$songIndex" },
+                                        contentType = { _, _ -> "song_card" }
+                                    ) { _, song ->
+                                        if (idx == 0) {
+                                            BitchordLargeQuickPickCard(
+                                                song = song,
+                                                onClick = { vm.playSongFromShelf(song, visibleSongs) }
+                                            )
+                                        } else {
+                                            BitchordSquareAlbumCard(
                                             song = song,
                                             onClick = { vm.playSongFromShelf(song, visibleSongs) }
                                         )
@@ -9700,6 +10105,73 @@ private fun PersonalizedHomeScreen(vm: MainViewModel) {
                 }
             }
         }
+        // Spotify New Releases
+        if (state.spotifyLoggedIn && state.spotifyNewReleases.isNotEmpty()) item(key = "home_spotify_new_releases") {
+            HomeSectionHeading("New Releases on Spotify", "Fresh music from artists you follow", SpotifyColors.GREEN)
+            HomeSongCarousel("New Releases", state.spotifyNewReleases, skin, vm, "Latest from Spotify")
+        }
+        if (state.spotifyLoggedIn && state.isLoadingSpotifyNewReleases) item(key = "home_spotify_new_releases_loading") {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(color = SpotifyColors.GREEN, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Loading new releases…", color = skin.foreground.copy(alpha = 0.7f), fontSize = 13.sp)
+            }
+        }
+        // Spotify Featured Playlists
+        if (state.spotifyLoggedIn && state.spotifyFeaturedPlaylists.isNotEmpty()) item(key = "home_spotify_featured_playlists") {
+            HomeSectionHeading("Featured Playlists", "Curated playlists from Spotify", SpotifyColors.GREEN)
+            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                items(state.spotifyFeaturedPlaylists, key = { "spotify_featured_${it.id}" }) { playlist ->
+                    PlaylistQuickCard(
+                        title = playlist.name,
+                        subtitle = "${playlist.trackCount} songs · Spotify",
+                        artwork = playlist.coverUrl,
+                        skin = skin,
+                        accent = SpotifyColors.GREEN,
+                        onClick = { vm.expandSpotifyPlaylist(playlist) }
+                    )
+                }
+            }
+        }
+        // Spotify Categories
+        if (state.spotifyLoggedIn && state.spotifyCategories.isNotEmpty() && state.selectedSpotifyCategory == null) {
+            item(key = "home_spotify_categories_heading") {
+                HomeSectionHeading("Browse Spotify", "Explore genres and moods", SpotifyColors.GREEN)
+            }
+            item(key = "home_spotify_categories_grid") {
+                SpotifyCategoriesGrid(
+                    categories = state.spotifyCategories,
+                    skin = skin,
+                    onCategoryClick = { vm.loadSpotifyCategoryPlaylists(it) }
+                )
+            }
+        }
+        // Spotify Category Playlists
+        if (state.spotifyLoggedIn && state.selectedSpotifyCategory != null && state.spotifyCategoryPlaylists.isNotEmpty()) item(key = "home_spotify_category_playlists") {
+            HomeSectionHeading("Playlists in ${state.selectedSpotifyCategory?.name}", "Browse ${state.selectedSpotifyCategory?.name} playlists", SpotifyColors.GREEN)
+            LazyRow(contentPadding = PaddingValues(horizontal = 18.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+                items(state.spotifyCategoryPlaylists, key = { "spotify_cat_playlist_${it.id}" }) { playlist ->
+                    PlaylistQuickCard(
+                        title = playlist.name,
+                        subtitle = "${playlist.trackCount} songs · Spotify",
+                        artwork = playlist.coverUrl,
+                        skin = skin,
+                        accent = SpotifyColors.GREEN,
+                        onClick = { vm.expandSpotifyPlaylist(playlist) }
+                    )
+                }
+            }
+            if (state.isLoadingSpotifyCategoryPlaylists) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(color = SpotifyColors.GREEN, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Loading playlists…", color = skin.foreground.copy(alpha = 0.7f), fontSize = 13.sp)
+                }
+            }
+            TextButton(onClick = { vm.clearSpotifyCategory() }, contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp)) {
+                Text("Back to categories", color = SpotifyColors.GREEN, fontSize = 13.sp)
+            }
+        }
         state.rediscoverPicks.forEach { pick ->
             if (pick.songs.isNotEmpty()) item(key = "home_rediscover_${pick.id}") {
                 HomeSongCarousel(pick.title, pick.songs, skin, vm, pick.subtitle)
@@ -10269,6 +10741,66 @@ private fun CompactHomeActionCard(
 }
 
 @Composable
+private fun CategoryCard(
+    title: String,
+    artwork: String,
+    skin: SkinTheme,
+    accent: Color,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    KiloCard(
+        modifier = modifier
+            .fillMaxWidth()
+            .aspectRatio(1f)
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(16.dp),
+        backgroundBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.15f), primaryPanelColor(skin))),
+        borderBrush = Brush.linearGradient(listOf(accent.copy(alpha = 0.2f), Color.White.copy(alpha = 0.05f))),
+        contentPadding = 12.dp
+    ) {
+        Column(
+            Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Box(Modifier.size(80.dp).clip(RoundedCornerShape(12.dp)).background(skin.foreground.copy(alpha = 0.06f))) {
+                if (artwork.isNotBlank()) AsyncImage(
+                    model = artwork, contentDescription = title, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize()
+                ) else Icon(Icons.Default.LibraryMusic, contentDescription = null, tint = accent, modifier = Modifier.align(Alignment.Center).size(32.dp))
+            }
+            Text(title, color = skin.foreground, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center)
+        }
+    }
+}
+
+@Composable
+private fun SpotifyCategoriesGrid(
+    categories: List<SpotifyCategorySummary>,
+    skin: SkinTheme,
+    onCategoryClick: (SpotifyCategorySummary) -> Unit
+) {
+    LazyVerticalGrid(
+        GridCells.Fixed(2),
+        Modifier.padding(horizontal = 18.dp, vertical = 4.dp).fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(9.dp),
+        verticalArrangement = Arrangement.spacedBy(9.dp)
+    ) {
+        items(categories.size, key = { index -> "spotify_category_${categories[index].id}" }) { index ->
+            val category = categories[index]
+            CategoryCard(
+                title = category.name,
+                artwork = category.coverUrl,
+                skin = skin,
+                accent = SpotifyColors.GREEN,
+                onClick = { onCategoryClick(category) }
+            )
+        }
+    }
+}
+
+@Composable
 private fun PlaylistQuickCard(
     title: String,
     subtitle: String,
@@ -10435,6 +10967,12 @@ private fun SourcesScreen(vm: MainViewModel) {
     var sourceUrl by remember(state.losslessSourceUrl) { mutableStateOf(state.losslessSourceUrl) }
     var sourceToken by remember { mutableStateOf("") }
 
+    // Check Spotify status on screen enter
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        vm.checkSpotifyStatus()
+    }
+
     Column(Modifier.fillMaxSize().background(primaryBackdrop(skin))) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { vm.handleSystemBack() }) {
@@ -10449,6 +10987,62 @@ private fun SourcesScreen(vm: MainViewModel) {
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // Spotify Section
+            item {
+                Text("SPOTIFY", color = skin.mutedForeground, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, modifier = Modifier.padding(start = 6.dp, bottom = 2.dp))
+                SettingsGroupCard {
+                    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                Text("Spotify", color = skin.foreground, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                                Text("Access your Spotify library, playlists, and liked songs. Audio plays via hybrid YouTube Music streams.", color = skin.mutedForeground, fontSize = 12.sp, lineHeight = 17.sp)
+                            }
+                            Switch(
+                                checked = state.spotifyEnabled,
+                                onCheckedChange = { vm.setSpotifyEnabled(it) },
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = Color(0xFF1DB954),
+                                    checkedTrackColor = Color(0xFF1DB954).copy(alpha = 0.5f)
+                                )
+                            )
+                        }
+                        if (state.spotifyEnabled) {
+                            HorizontalDivider(color = skin.foreground.copy(alpha = 0.1f), modifier = Modifier.padding(vertical = 4.dp))
+                            if (state.spotifyLoggedIn) {
+                                Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                                        Column {
+                                            Text("Connected", color = Color(0xFF1DB954), fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                            Text(state.spotifyStatus, color = skin.mutedForeground, fontSize = 11.sp)
+                                        }
+                                    }
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        TextButton(onClick = { vm.signOutSpotify() }) {
+                                            Text("Sign out", color = Color(0xFF1DB954), fontWeight = FontWeight.Bold)
+                                        }
+                                        TextButton(onClick = { vm.setSpotifyEnabled(false) }) {
+                                            Text("Disable source", color = skin.mutedForeground)
+                                        }
+                                    }
+                                }
+                            } else {
+                                Text(state.spotifyStatus, color = accent, fontSize = 12.sp)
+                                Button(
+                                    onClick = { vm.openSpotifyLogin() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1DB954))
+                                ) {
+                                    Text("Sign in to Spotify", color = Color.Black, fontWeight = FontWeight.Bold)
+                                }
+                                Text("Opens Spotify Web login. After signing in, your catalog will be available for hybrid playback.", color = skin.mutedForeground, fontSize = 11.sp, lineHeight = 15.sp)
+                            }
+                        } else {
+                            Text("Enable Spotify to access your library and use hybrid playback (Spotify metadata + YouTube Music audio).", color = skin.mutedForeground, fontSize = 11.sp, lineHeight = 15.sp)
+                        }
+                    }
+                }
+            }
+
+            // Lossless Source Section
             item {
                 Text("LOSSLESS SOURCE", color = skin.mutedForeground, fontSize = 12.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, modifier = Modifier.padding(start = 6.dp, bottom = 2.dp))
                 SettingsGroupCard {
@@ -10523,7 +11117,6 @@ private fun PlaybackSettingsScreen(vm: MainViewModel) {
     val accent = state.activeSkin.highlight
     var showDjGuide by remember { mutableStateOf(false) }
     var selectedSpeed by remember(state.playbackSpeed) { mutableFloatStateOf(state.playbackSpeed) }
-    var crossfadeMs by remember { mutableLongStateOf(CrossfadeSettings.duration(context)) }
     var smartCrossfade by remember { mutableStateOf(CrossfadeSettings.smartEnabled(context)) }
     var gapless by remember { mutableStateOf(CrossfadeSettings.gaplessEnabled(context)) }
     var genreAware by remember { mutableStateOf(CrossfadeSettings.genreAwareEnabled(context)) }
@@ -10592,6 +11185,41 @@ private fun PlaybackSettingsScreen(vm: MainViewModel) {
                     }
                     Switch(checked = state.repeatCurrentTrack, onCheckedChange = vm::setRepeatCurrentTrack)
                 }
+                HorizontalDivider(color = Color.White.copy(alpha = 0.10f), modifier = Modifier.padding(vertical = 5.dp))
+                // Crossfade / Automix settings
+                CustomizationToggleRow(
+                    title = "Automix crossfade",
+                    description = "Smoothly blend transitions between tracks (0-12s)",
+                    checked = state.autoMixEnabled,
+                    accent = accent,
+                    onCheckedChange = vm::setAutoMixEnabled
+                )
+                if (state.autoMixEnabled) {
+                    val crossfadeMs = state.crossfadeDurationMs
+                    Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Crossfade duration", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Medium)
+                            Spacer(Modifier.width(8.dp))
+                            Text(if (crossfadeMs == 0L) "Off" else "${crossfadeMs / 1000}s", color = accent, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                        }
+                        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                            CrossfadeSettings.choicesMs.forEach { duration ->
+                                val label = if (duration == 0L) "Off" else "${duration / 1000}s"
+                                FilterChip(
+                                    selected = crossfadeMs == duration,
+                                    onClick = {
+                                        vm.setCrossfadeDuration(duration)
+                                    },
+                                    label = { Text(label) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = accent.copy(alpha = 0.26f),
+                                        selectedLabelColor = Color.White
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
         Spacer(Modifier.height(14.dp))
@@ -10603,75 +11231,6 @@ private fun PlaybackSettingsScreen(vm: MainViewModel) {
                 Text("Last lyrics load: ${lyricMetrics.lastLoadDurationMs} ms (${lyricMetrics.lastSource})", color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp)
                 Text("Transition plans: ${transitionMetrics.plans} · completed: ${transitionMetrics.completed} · failed: ${transitionMetrics.failed}", color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp)
                 Text("Last transition: ${transitionMetrics.lastMode ?: "none"} · ${transitionMetrics.lastDurationMs} ms · ${transitionMetrics.lastReason}", color = Color.White.copy(alpha = 0.66f), fontSize = 12.sp)
-            }
-        }
-        Spacer(Modifier.height(14.dp))
-        SettingsSectionHeader("SMART TRANSITIONS")
-        SettingsGroupCard {
-            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Crossfade", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold)
-                        Text("Choose a transition length. The default is 5 seconds.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
-                    }
-                    Switch(
-                        checked = state.autoMixEnabled && crossfadeMs > 0L,
-                        onCheckedChange = { enabled ->
-                            if (enabled && crossfadeMs == 0L) {
-                                crossfadeMs = CrossfadeSettings.DEFAULT_DURATION_MS
-                                CrossfadeSettings.setDuration(context, crossfadeMs)
-                            }
-                            vm.setAutoMixEnabled(enabled)
-                        }
-                    )
-                }
-                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    CrossfadeSettings.choicesMs.forEach { duration ->
-                        val label = if (duration == 0L) "Off" else "${duration / 1000}s"
-                        FilterChip(
-                            selected = crossfadeMs == duration,
-                            onClick = {
-                                crossfadeMs = duration
-                                CrossfadeSettings.setDuration(context, duration)
-                                if (duration == 0L) vm.setAutoMixEnabled(false)
-                            },
-                            label = { Text(label) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = accent.copy(alpha = 0.26f),
-                                selectedLabelColor = Color.White
-                            )
-                        )
-                    }
-                }
-                HorizontalDivider(color = Color.White.copy(alpha = 0.10f))
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Smart crossfade", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Use track context to choose a natural fade length.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
-                    }
-                    Switch(checked = smartCrossfade, onCheckedChange = { smartCrossfade = it; CrossfadeSettings.setSmartEnabled(context, it) })
-                }
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Gapless for albums and live sets", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Keep related tracks together without a fade.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
-                    }
-                    Switch(checked = gapless, onCheckedChange = { gapless = it; CrossfadeSettings.setGaplessEnabled(context, it) })
-                }
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Genre-aware transitions", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Adjust fade length using genre clues in track details.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
-                    }
-                    Switch(checked = genreAware, onCheckedChange = { genreAware = it; CrossfadeSettings.setGenreAwareEnabled(context, it) })
-                }
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text("Transition intelligence", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Prefer album continuity when KILO can identify it.", color = Color.White.copy(alpha = 0.62f), fontSize = 12.sp)
-                    }
-                    Switch(checked = transitionIntelligence, onCheckedChange = { transitionIntelligence = it; CrossfadeSettings.setIntelligenceEnabled(context, it) })
-                }
             }
         }
         Spacer(Modifier.height(14.dp))
@@ -11633,6 +12192,7 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
     var losslessSourceUrl by remember(state.losslessSourceUrl) { mutableStateOf(state.losslessSourceUrl) }
     var losslessSourceToken by remember { mutableStateOf("") }
     var regionMenuExpanded by remember { mutableStateOf(false) }
+    var sourceModeMenuExpanded by remember { mutableStateOf(false) }
     var showVoiceControlGuide by remember { mutableStateOf(false) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         vm.setDownloadDirectory(uri)
@@ -11819,6 +12379,38 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
                 }
             }
             Text("Country changes YouTube Music recommendations and search results. Auto uses your device's locale; it does not access GPS.", color = Color.White.copy(alpha = 0.58f), fontSize = 12.sp, lineHeight = 17.sp, modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp))
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp))
+            // Source Mode Selection
+            Box {
+                SettingsRowItem(
+                    icon = Icons.Default.LibraryMusic,
+                    title = "Source Mode",
+                    subtitle = when (state.sourceMode) {
+                        "spotify_only" -> "Spotify catalog only (hybrid audio via YouTube/FLAC)"
+                        "youtube_only" -> "YouTube Music only"
+                        else -> "Both Spotify & YouTube Music (hybrid)"
+                    },
+                    trailingValue = when (state.sourceMode) {
+                        "spotify_only" -> "Spotify Only"
+                        "youtube_only" -> "YouTube Only"
+                        else -> "Both"
+                    },
+                    onClick = { sourceModeMenuExpanded = true }
+                )
+                DropdownMenu(expanded = sourceModeMenuExpanded, onDismissRequest = { sourceModeMenuExpanded = false }) {
+                    listOf(
+                        "both" to "Both (Hybrid)",
+                        "spotify_only" to "Spotify Only",
+                        "youtube_only" to "YouTube Only"
+                    ).forEach { (mode, label) ->
+                        DropdownMenuItem(
+                            text = { Text(label) },
+                            onClick = { sourceModeMenuExpanded = false; vm.setSourceMode(mode) },
+                            trailingIcon = if (state.sourceMode == mode) ({ Icon(Icons.Default.Check, contentDescription = null) }) else null
+                        )
+                    }
+                }
+            }
         }
 
         SettingsSectionHeader("LYRICS PROVIDERS")
@@ -11890,6 +12482,23 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
                 },
                 modifier = Modifier.align(Alignment.End).padding(horizontal = 16.dp, vertical = 8.dp)
             ) { Text("Save API address") }
+
+            HorizontalDivider(color = Color.White.copy(alpha = 0.06f), modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+            // Lyrics Translation Toggle
+            CustomizationToggleRow(
+                title = "Translate Lyrics to English",
+                description = "Auto-translate non-English lyrics to English using MyMemory API (free, no API key needed)",
+                checked = LyricsRepository.isTranslateEnabled(context),
+                accent = accent,
+                onCheckedChange = { enabled ->
+                    LyricsRepository.setTranslateEnabled(context, enabled)
+                    Toast.makeText(
+                        context,
+                        if (enabled) "Lyrics translation enabled" else "Lyrics translation disabled",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            )
         }
 
         SettingsSectionHeader("AUDIO QUALITY")
@@ -12003,13 +12612,6 @@ fun BitChordSettingsScreen(vm: MainViewModel) {
                 title = "System Equalizer",
                 subtitle = "Launch device DSP audio effects",
                 onClick = vm::openSystemEqualizer
-            )
-            CustomizationToggleRow(
-                title = "Automix crossfade",
-                description = "Smoothly blend transitions between tracks",
-                checked = state.autoMixEnabled,
-                accent = accent,
-                onCheckedChange = vm::setAutoMixEnabled
             )
         }
 
@@ -13266,16 +13868,25 @@ fun SearchScreen(vm: MainViewModel) {
                     2 -> if (hasPlaylistResults) "$title (${savedPlaylistResults.size + youtubePlaylistResults.size + youtubeSearchPlaylistResults.size + communityPlaylistResults.size})" else title
                     else -> title
                 }
+                val animatedBgColor = animateColorAsState(
+                    targetValue = if (selected) accent else primaryPanelColor(skin),
+                    animationSpec = tween(250, 0, LinearEasing)
+                )
+                val animatedTextColor = animateColorAsState(
+                    targetValue = if (selected) Color.Black else skin.foreground,
+                    animationSpec = tween(250, 0, LinearEasing)
+                )
                 Box(
                     modifier = Modifier
                         .clip(RoundedCornerShape(18.dp))
-                        .background(if (selected) accent else primaryPanelColor(skin))
+                        .background(animatedBgColor.value)
                         .clickable { selectedSearchTab = index }
                         .padding(horizontal = 15.dp, vertical = 9.dp)
+                        .animateContentSize(animationSpec = tween(200, 0, LinearEasing))
                 ) {
                     Text(
                         titleWithCount,
-                        color = if (selected) Color.Black else skin.foreground,
+                        color = animatedTextColor.value,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold
                     )
@@ -13839,6 +14450,82 @@ private fun SavedPlaylistSearchRow(
 }
 
 @Composable
+private fun SpotifyPlaylistRow(
+    playlist: SpotifyPlaylistSummary,
+    vm: MainViewModel,
+    skin: SkinTheme
+) {
+    val accent = SpotifyColors.GREEN
+    val state = vm.state.value
+    val isThisExpanded = state.expandedSpotifyPlaylist?.id == playlist.id
+    val isLoading = state.isLoadingSpotifyPlaylistTracks
+    val tracks = state.expandedSpotifyPlaylist?.tracks ?: emptyList()
+
+    Column(Modifier.fillMaxWidth()) {
+        KiloPlaylistCard(
+            title = playlist.name,
+            subtitle = "${playlist.trackCount} songs · Spotify",
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
+            artworkSize = 64.dp,
+            onClick = { vm.expandSpotifyPlaylist(playlist) },
+            trailingContent = {
+                IconButton(onClick = { vm.expandSpotifyPlaylist(playlist) }) {
+                    Icon(if (isThisExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (isThisExpanded) "Collapse" else "Expand",
+                        tint = accent)
+                }
+                IconButton(onClick = { tracks.firstOrNull()?.let { vm.playSongFromShelf(it, tracks, "phone_playlist") } }) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = "Play playlist", tint = Color.White)
+                }
+            }
+        ) {
+            if (!playlist.coverUrl.isNullOrBlank()) {
+                AsyncImage(model = playlist.coverUrl, contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+            } else {
+                Icon(Icons.Default.QueueMusic, contentDescription = null, tint = accent.copy(alpha = 0.78f), modifier = Modifier.align(Alignment.Center))
+            }
+        }
+
+        // Expanded tracks
+        if (isThisExpanded) {
+            AnimatedVisibility(visible = true, enter = expandVertically(), exit = shrinkVertically()) {
+                Column(Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) {
+                    if (isLoading) {
+                        Row(Modifier.fillMaxWidth().padding(vertical = 16.dp), verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center) {
+                            CircularProgressIndicator(color = accent, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(10.dp))
+                            Text("Loading tracks…", color = skin.mutedForeground, fontSize = 13.sp)
+                        }
+                    } else if (tracks.isNotEmpty()) {
+                        Text("${tracks.size} tracks", color = skin.mutedForeground, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
+                        LazyColumn(
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(0.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            itemsIndexed(tracks, key = { index, song -> "spotify_playlist_track_${playlist.id}_${song.videoId.ifBlank { song.id }}_$index" }) { index, song ->
+                                BitchordSongRowItem(
+                                    song = song,
+                                    isCurrent = state.activeSong.id == song.id,
+                                    onClick = { vm.playSongFromShelf(song, tracks, "phone_playlist") },
+                                    vm = vm,
+                                    playlistContextId = playlist.id,
+                                    playlistIndex = index,
+                                    playlistSize = tracks.size
+                                )
+                            }
+                        }
+                    } else {
+                        Text("No tracks found", color = skin.mutedForeground, fontSize = 13.sp, modifier = Modifier.padding(vertical = 16.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun CommunityPlaylistSearchRow(
     playlist: SongItemClean,
     vm: MainViewModel,
@@ -13960,14 +14647,23 @@ fun LibraryScreen(vm: MainViewModel) {
         LazyRow(contentPadding = PaddingValues(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             items(libTabs, key = { "library_tab_${it.second}" }, contentType = { "tab" }) { (tabIndex, tabName) ->
                 val active = activeLibraryTab == tabIndex
+                val animatedBgColor = animateColorAsState(
+                    targetValue = if (active) accent else primaryPanelColor(skin),
+                    animationSpec = tween(250, 0, LinearEasing)
+                )
+                val animatedTextColor = animateColorAsState(
+                    targetValue = if (active) skin.foreground else skin.foreground.copy(alpha = 0.7f),
+                    animationSpec = tween(250, 0, LinearEasing)
+                )
                 Box(
                     modifier = Modifier
                         .clip(primaryCardShape(skin))
-                        .background(if (active) accent else primaryPanelColor(skin))
+                        .background(animatedBgColor.value)
                         .clickable { vm.setLibraryTab(tabIndex) }
                         .padding(horizontal = 16.dp, vertical = 8.dp)
+                        .animateContentSize(animationSpec = tween(200, 0, LinearEasing))
                 ) {
-                    Text(tabName, color = if (active) Color.Black else skin.foreground, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Text(tabName, color = animatedTextColor.value, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
             }
         }
@@ -14072,6 +14768,24 @@ fun LibraryScreen(vm: MainViewModel) {
                     items(state.youtubeMusicPlaylists, key = { "youtube_playlist_${it.playlistId}" }, contentType = { "playlist" }) { remotePlaylist ->
                         CommunityPlaylistSearchRow(remotePlaylist, vm) {
                             vm.playSongFromShelf(remotePlaylist, state.youtubeMusicPlaylists, "phone_playlist")
+                        }
+                    }
+                }
+                // Spotify Playlists Section
+                if (state.spotifyPlaylists.isNotEmpty()) {
+                    item(key = "spotify_playlists_heading") {
+                        KiloSection("YOUR SPOTIFY PLAYLISTS", accent = SpotifyColors.GREEN)
+                    }
+                    items(state.spotifyPlaylists, key = { "spotify_playlist_${it.id}" }, contentType = { "playlist" }) { spotifyPlaylist ->
+                        SpotifyPlaylistRow(spotifyPlaylist, vm, skin)
+                    }
+                }
+                if (state.isLoadingSpotifyPlaylists) {
+                    item(key = "spotify_playlists_loading") {
+                        Row(Modifier.fillMaxWidth().padding(20.dp), verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            CircularProgressIndicator(color = SpotifyColors.GREEN, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Text("Loading your Spotify playlists…", color = skin.foreground.copy(alpha = 0.7f), fontSize = 13.sp)
                         }
                     }
                 }
