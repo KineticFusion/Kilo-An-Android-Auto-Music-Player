@@ -44,7 +44,7 @@ jobs:
 
       - name: Upload Lint Report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lint-report
           path: app/build/reports/lint-results-debug.html
@@ -73,7 +73,7 @@ jobs:
 
       - name: Upload Test Reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-reports
           path: '**/build/test-results/**/*.xml'
@@ -102,7 +102,7 @@ jobs:
         run: ./gradlew assembleDebug --no-daemon
 
       - name: Upload Debug APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kilo-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
@@ -138,7 +138,7 @@ jobs:
           SIGNING_STORE_FILE: ${{ secrets.SIGNING_STORE_FILE }}
 
       - name: Upload Release APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: kilo-release-apk
           path: app/build/outputs/apk/release/app-release.apk
