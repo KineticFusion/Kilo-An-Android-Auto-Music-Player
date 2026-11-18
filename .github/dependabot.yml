@@ -1,0 +1,58 @@
+version: 2
+updates:
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    labels:
+      - "dependencies"
+      - "gradle"
+    commit-message:
+      prefix: "chore(deps): "
+    groups:
+      kotlin:
+        patterns:
+          - "org.jetbrains.kotlin*"
+      compose:
+        patterns:
+          - "androidx.compose*"
+      media3:
+        patterns:
+          - "androidx.media3*"
+      ktor:
+        patterns:
+          - "io.ktor*"
+      serialization:
+        patterns:
+          - "org.jetbrains.kotlinx:kotlinx-serialization*"
+      coroutines:
+        patterns:
+          - "org.jetbrains.kotlinx:kotlinx-coroutines*"
+      lifecycle:
+        patterns:
+          - "androidx.lifecycle*"
+      room:
+        patterns:
+          - "androidx.room*"
+      material:
+        patterns:
+          - "com.google.android.material*"
+      oboe:
+        patterns:
+          - "com.google.oboe*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(deps): "

@@ -1,0 +1,193 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 37
+          ndk-version: r27
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Run Lint
+        run: ./gradlew lintDebug --no-daemon
+
+      - name: Upload Lint Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: app/build/reports/lint-results-debug.html
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 37
+          ndk-version: r27
+
+      - name: Run Unit Tests
+        run: ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Upload Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: '**/build/test-results/**/*.xml'
+
+  build:
+    name: Build Debug APK
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 37
+          ndk-version: r27
+
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kilo-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
+
+  build-release:
+    name: Build Release APK
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 37
+          ndk-version: r27
+
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --no-daemon
+        env:
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_STORE_FILE: ${{ secrets.SIGNING_STORE_FILE }}
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: kilo-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build-release]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Release APK
+        uses: actions/download-artifact@v4
+        with:
+          name: kilo-release-apk
+          path: artifacts/
+
+      - name: Extract Version from Tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Generate Release Notes
+        id: notes
+        run: |
+          if [ -f RELEASE_NOTES_${{ steps.version.outputs.VERSION }}.md ]; then
+            cat RELEASE_NOTES_${{ steps.version.outputs.VERSION }}.md
+          else
+            echo "Release notes file not found, using generic template"
+            echo "# ${{ steps.version.outputs.VERSION }}"
+            echo ""
+            echo "See [CHANGELOG](CHANGELOG.md) for details."
+          fi > release_notes.md
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          cat release_notes.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: ${{ steps.version.outputs.VERSION }}
+          body_path: release_notes.md
+          files: artifacts/app-release.apk
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
