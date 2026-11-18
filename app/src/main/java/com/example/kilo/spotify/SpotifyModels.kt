@@ -17,6 +17,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import kotlin.math.max
 import com.example.kilo.streaming.ResolvedStream
+import com.example.kilo.streaming.HybridTrack
+import com.example.kilo.SongItemClean
 
 // Type alias to reference SpotifyApiClient.SpotifyTrack
 typealias SpotifyApiTrack = com.example.kilo.spotify.SpotifyTrack
@@ -35,31 +37,6 @@ data class SpotifyAccount(
     val externalUrls: Map<String, String>
 )
 
-data class SpotifyImage(
-    val url: String,
-    val width: Int,
-    val height: Int
-) {
-    val bestUrl: String
-        get() = this.url
-}
-
-data class SpotifyDevice(
-    val id: String,
-    val name: String,
-    val type: String,
-    val volumePercent: Int?,
-    val isActive: Boolean,
-    val isRestricted: Boolean
-)
-
-data class SpotifyPlaybackContext(
-    val type: String, // "artist", "playlist", "album", "show", "episode"
-    val uri: String,
-    val href: String,
-    val externalUrls: Map<String, String>
-)
-
 data class SpotifyCurrentlyPlaying(
     val timestamp: Long,
     val context: SpotifyPlaybackContext?,
@@ -68,18 +45,6 @@ data class SpotifyCurrentlyPlaying(
     val currentlyPlayingType: String, // "track", "episode", "ad"
     val actions: SpotifyActions,
     val isPlaying: Boolean
-)
-
-data class SpotifyActions(
-    val disallows: SpotifyDisallows
-)
-
-data class SpotifyDisallows(
-    val pausing: Boolean,
-    val resuming: Boolean,
-    val seeking: Boolean,
-    val skippingNext: Boolean,
-    val skippingPrev: Boolean
 )
 
 /**
@@ -240,4 +205,136 @@ fun HybridSourceBadge(
             YouTubeMusicSourceBadge(badgeSize = badgeSize)
         }
     }
+}
+
+/**
+ * Spotify Library Models for Kilo's Library Tab
+ */
+data class SpotifyLibrary(
+    val likedSongs: List<SpotifySavedTrack> = emptyList(),
+    val playlists: List<SpotifyPlaylistSummary> = emptyList(),
+    val albums: List<SpotifySavedAlbum> = emptyList(),
+    val artists: List<SpotifyFollowedArtist> = emptyList(),
+    val lastSynced: Long = 0,
+    val isSyncing: Boolean = false
+)
+
+data class SpotifySavedTrack(
+    val addedAt: String,
+    val track: BridgeSpotifyTrack
+)
+
+data class SpotifySavedAlbum(
+    val addedAt: String,
+    val album: BridgeSpotifyAlbum,
+    val artists: List<BridgeSpotifyArtist>
+)
+
+data class SpotifyFollowedArtist(
+    val artist: BridgeSpotifyArtist
+)
+
+/**
+ * Extension to convert Spotify library items to Kilo's SongItemClean for unified UI
+ */
+fun SpotifySavedTrack.toSongItemClean(): SongItemClean {
+    val t = track
+    return SongItemClean(
+        id = "spotify_saved_${t.uri}",
+        title = t.name,
+        artist = t.artists.map { it.name }.joinToString(", "),
+        album = t.album?.name ?: "",
+        coverUrl = t.image ?: "",
+        durationMs = t.durationMs,
+        videoId = "",
+        source = "spotify",
+        uri = t.uri,
+        isDownloaded = false,
+        isExplicit = t.explicit,
+        spotifyUri = t.uri,
+        spotifyId = t.uid
+    )
+}
+
+fun SpotifySavedAlbum.toSongItemClean(): SongItemClean {
+    return SongItemClean(
+        id = "spotify_album_${album.uri}",
+        title = album.name,
+        artist = artists.map { it.name }.joinToString(", "),
+        album = album.name,
+        coverUrl = album.uri.let { "https://i.scdn.co/image/${it.removePrefix("spotify:album:")}" },
+        durationMs = 0,
+        videoId = "",
+        source = "spotify",
+        uri = album.uri,
+        isDownloaded = false,
+        isAlbum = true
+    )
+}
+
+fun SpotifyFollowedArtist.toSongItemClean(): SongItemClean {
+    return SongItemClean(
+        id = "spotify_artist_${artist.uri}",
+        title = artist.name,
+        artist = "Artist",
+        album = "",
+        coverUrl = artist.uri.let { "https://i.scdn.co/image/${it.removePrefix("spotify:artist:")}" },
+        durationMs = 0,
+        videoId = "",
+        source = "spotify",
+        uri = artist.uri,
+        isDownloaded = false,
+        isArtist = true
+    )
+}
+
+fun SpotifyPlaylistSummary.toSongItemClean(): SongItemClean {
+    return SongItemClean(
+        id = "spotify_playlist_${id}",
+        title = name,
+        artist = "${trackCount} songs",
+        album = owner,
+        coverUrl = coverUrl,
+        durationMs = 0,
+        videoId = "",
+        source = "spotify",
+        uri = id,
+        isDownloaded = false,
+        isPlaylist = true
+    )
+}
+
+fun SpotifyAlbumSummary.toSongItemClean(): SongItemClean {
+    return SongItemClean(
+        id = "spotify_album_${id}",
+        title = name,
+        artist = artist,
+        album = name,
+        coverUrl = coverUrl,
+        durationMs = 0,
+        videoId = "",
+        source = "spotify",
+        uri = id,
+        isDownloaded = false,
+        isAlbum = true
+    )
+}
+
+/**
+ * Extension to convert HybridTrack to SongItemClean for unified UI
+ */
+fun HybridTrack.toSongItemClean(): SongItemClean {
+    return SongItemClean(
+        id = canonicalId,
+        title = title,
+        artist = artist,
+        album = album,
+        coverUrl = coverUrl,
+        durationMs = durationMs,
+        videoId = rawId,
+        source = sourceId,
+        uri = canonicalId,
+        isDownloaded = false,
+        isExplicit = isExplicit
+    )
 }

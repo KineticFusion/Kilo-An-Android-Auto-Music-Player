@@ -28,8 +28,11 @@ class SpotifySourceProvider(
     override suspend fun search(query: String, limit: Int): List<HybridTrack> = withContext(Dispatchers.IO) {
         if (!config.enabled || query.isBlank()) return@withContext emptyList()
 
+        Log.d(TAG, "Spotify search query: $query, limit: $limit")
+
         runCatching {
             val result = SpotifyApiClient.search(appContext, query, limit = limit)
+            Log.d(TAG, "Spotify search result: tracks=${result?.tracks?.items?.size ?: 0}, artists=${result?.artists?.items?.size ?: 0}")
             result?.tracks?.items?.mapNotNull { track ->
                 val artists = track.artists.map { it.name }.joinToString(", ")
                 val albumName = track.album?.name ?: ""
@@ -52,7 +55,7 @@ class SpotifySourceProvider(
                 )
             } ?: emptyList()
         }.getOrElse { err ->
-            Log.w(TAG, "Spotify search failed: ${err.message}")
+            Log.w(TAG, "Spotify search failed: ${err.message}", err)
             emptyList()
         }
     }
@@ -202,6 +205,25 @@ class SpotifySourceProvider(
     }
 
     /**
+     * Search for playlists
+     */
+    suspend fun searchPlaylists(query: String, limit: Int = 20): List<SpotifyPlaylistSummary> = withContext(Dispatchers.IO) {
+        runCatching {
+            SpotifyApiClient.search(appContext, query, listOf("playlist"), limit)?.playlists?.items?.map { playlist ->
+                SpotifyPlaylistSummary(
+                    id = playlist.id,
+                    name = playlist.name,
+                    coverUrl = playlist.images.firstOrNull()?.url ?: "",
+                    trackCount = playlist.trackCount
+                )
+            } ?: emptyList()
+        }.getOrElse { err ->
+            Log.w(TAG, "Spotify playlist search failed: ${err.message}")
+            emptyList()
+        }
+    }
+
+    /**
      * Search and return as HybridTrack list for home shelves
      */
     suspend fun searchForHome(query: String, limit: Int = 20): List<HybridTrack> = withContext(Dispatchers.IO) {
@@ -330,6 +352,73 @@ class SpotifySourceProvider(
     }
 
     /**
+     * Fetch full Spotify library via API (liked tracks, playlists, albums, artists)
+     * Provides native Spotify browsing without requiring WebView
+     */
+    suspend fun fetchLibrary(limit: Int = 50): SpotifyLibrary = withContext(Dispatchers.IO) {
+        // Fetch liked tracks as SpotifySavedTrack
+        val likedTracks = runCatching {
+            SpotifyApiClient.getLikedTracks(appContext, limit)?.mapNotNull { track ->
+                val artists = track.artists.map { it.name }.joinToString(", ")
+                val albumName = track.album?.name ?: ""
+                val coverUrl = track.album?.images?.firstOrNull()?.url ?: ""
+                val albumImages = track.album?.images ?: emptyList()
+                val bestImage = albumImages.maxByOrNull { it.width * it.height }?.url ?: coverUrl
+
+                val bridgeTrack = BridgeSpotifyTrack(
+                    kind = "track",
+                    uri = "spotify:track:${track.id}",
+                    uid = track.uri,
+                    name = track.name,
+                    advertiser = null,
+                    durationMs = track.durationMs,
+                    artists = track.artists.map { BridgeSpotifyArtist(uri = it.uri, name = it.name) },
+                    album = track.album?.let { BridgeSpotifyAlbum(uri = it.uri, name = it.name) },
+                    image = bestImage,
+                    explicit = track.explicit,
+                    mediaType = "track",
+                    provider = null
+                )
+                SpotifySavedTrack(addedAt = track.album?.releaseDate ?: "", track = bridgeTrack)
+            } ?: emptyList()
+        }.getOrDefault(emptyList())
+
+        val playlists = runCatching { fetchUserPlaylists(limit) }.getOrDefault(emptyList())
+
+        // Fetch saved albums
+        val savedAlbums = runCatching {
+            SpotifyApiClient.getUserAlbums(appContext, limit)?.mapNotNull { album ->
+                val artists = album.artists.map { it.name }.joinToString(", ")
+                val coverUrl = album.images.firstOrNull()?.url ?: ""
+                val bestImage = album.images.maxByOrNull { it.width * it.height }?.url ?: coverUrl
+
+                SpotifySavedAlbum(
+                    addedAt = "", // Not available in this endpoint
+                    album = BridgeSpotifyAlbum(uri = "spotify:album:${album.id}", name = album.name),
+                    artists = album.artists.map { BridgeSpotifyArtist(uri = "spotify:artist:${it.id}", name = it.name) }
+                )
+            } ?: emptyList()
+        }.getOrDefault(emptyList())
+
+        // Fetch followed artists
+        val followedArtists = runCatching {
+            (SpotifyApiClient.getFollowedArtists(appContext, limit) as? SpotifyPage<SpotifyArtist>)?.items?.mapNotNull { artist ->
+                val bridgeArtist = BridgeSpotifyArtist(uri = "spotify:artist:${artist.id}", name = artist.name)
+                SpotifyFollowedArtist(artist = bridgeArtist)
+            } ?: emptyList()
+        }.getOrDefault(emptyList())
+
+        SpotifyLibrary(
+            likedSongs = likedTracks,
+            playlists = playlists,
+            albums = savedAlbums,
+            artists = followedArtists,
+            lastSynced = System.currentTimeMillis(),
+            isSyncing = false
+        )
+    }
+
+    /**
      * Get artist's albums
      */
     suspend fun fetchArtistAlbums(artistId: String, limit: Int = 20): List<SpotifyAlbumSummary> = withContext(Dispatchers.IO) {
@@ -349,6 +438,85 @@ class SpotifySourceProvider(
             Log.w(TAG, "Failed to fetch artist albums: ${err.message}")
             emptyList()
         }
+    }
+
+    /**
+     * Get album tracks
+     */
+    suspend fun fetchAlbumTracks(albumId: String, limit: Int = 100): List<HybridTrack> = withContext(Dispatchers.IO) {
+        if (!config.enabled) return@withContext emptyList()
+        runCatching {
+            SpotifyApiClient.getAlbumTracks(appContext, albumId, limit)?.items?.mapNotNull { track ->
+                val artists = track.artists.map { it.name }.joinToString(", ")
+                val albumName = track.album?.name ?: ""
+                val coverUrl = track.album?.images?.firstOrNull()?.url ?: ""
+                val albumImages = track.album?.images ?: emptyList()
+                val bestImage = albumImages.maxByOrNull { it.width * it.height }?.url ?: coverUrl
+
+                HybridTrack(
+                    canonicalId = "spotify:${track.id}",
+                    rawId = track.id,
+                    sourceId = config.id,
+                    title = track.name,
+                    artist = artists,
+                    album = albumName,
+                    coverUrl = bestImage,
+                    durationMs = track.durationMs,
+                    codecBadge = "Spotify • Hybrid",
+                    isLossless = false,
+                    isExplicit = track.explicit
+                )
+            } ?: emptyList()
+        }.getOrElse { err ->
+            Log.w(TAG, "Failed to fetch album tracks: ${err.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Get playlist details including owner and tracks
+     */
+    suspend fun fetchPlaylistDetails(playlistId: String, limit: Int = 100): Pair<SpotifyPlaylistSummary, List<HybridTrack>>? = withContext(Dispatchers.IO) {
+        if (!config.enabled) return@withContext null
+        val playlistResult: SpotifyPlaylist? = runCatching {
+            SpotifyApiClient.getPlaylist(appContext, playlistId)
+        }.getOrNull()
+
+        val tracksResult: List<HybridTrack> = runCatching {
+            SpotifyApiClient.getPlaylistTracks(appContext, playlistId, limit)?.mapNotNull { track ->
+                val artists = track.artists.map { it.name }.joinToString(", ")
+                val albumName = track.album?.name ?: ""
+                val coverUrl = track.album?.images?.firstOrNull()?.url ?: ""
+                val albumImages = track.album?.images ?: emptyList()
+                val bestImage = albumImages.maxByOrNull { it.width * it.height }?.url ?: coverUrl
+
+                HybridTrack(
+                    canonicalId = "spotify:${track.id}",
+                    rawId = track.id,
+                    sourceId = config.id,
+                    title = track.name,
+                    artist = artists,
+                    album = albumName,
+                    coverUrl = bestImage,
+                    durationMs = track.durationMs,
+                    codecBadge = "Spotify • Hybrid",
+                    isLossless = false,
+                    isExplicit = track.explicit
+                )
+            } ?: emptyList()
+        }.getOrNull() ?: emptyList()
+
+        val result = playlistResult?.let { playlist: SpotifyPlaylist ->
+            val summary = SpotifyPlaylistSummary(
+                id = playlist.id,
+                name = playlist.name,
+                coverUrl = playlist.images.firstOrNull()?.url ?: "",
+                trackCount = playlist.trackCount,
+                owner = playlist.owner?.displayName ?: "Unknown"
+            )
+            summary to tracksResult
+        }
+        result
     }
 
     /**
@@ -376,6 +544,33 @@ class SpotifySourceProvider(
             } ?: emptyList()
         }.getOrElse { err ->
             Log.w(TAG, "Failed to fetch artist top tracks: ${err.message}")
+            emptyList()
+        }
+    }
+
+    /**
+     * Get followed artists
+     */
+    suspend fun fetchFollowedArtists(limit: Int = 50): List<HybridTrack> = withContext(Dispatchers.IO) {
+        if (!config.enabled) return@withContext emptyList()
+        runCatching {
+            SpotifyApiClient.getFollowedArtists(appContext, limit)?.items?.mapNotNull { artist ->
+                HybridTrack(
+                    canonicalId = "spotify:${artist.id}",
+                    rawId = artist.id,
+                    sourceId = config.id,
+                    title = artist.name,
+                    artist = "Artist",
+                    album = "",
+                    coverUrl = artist.images.firstOrNull()?.url ?: "",
+                    durationMs = 0,
+                    codecBadge = "Spotify • Hybrid",
+                    isLossless = false,
+                    isExplicit = false
+                )
+            } ?: emptyList()
+        }.getOrElse { err ->
+            Log.w(TAG, "Failed to fetch followed artists: ${err.message}")
             emptyList()
         }
     }
@@ -409,7 +604,8 @@ data class SpotifyPlaylistSummary(
     val id: String,
     val name: String,
     val coverUrl: String,
-    val trackCount: Int
+    val trackCount: Int,
+    val owner: String = "Unknown"
 )
 
 /**

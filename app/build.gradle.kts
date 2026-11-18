@@ -1,6 +1,7 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.ksp)
 }
 
@@ -91,6 +92,7 @@ androidComponents {
         implementation(libs.androidx.compose.ui.graphics)
         implementation(libs.androidx.compose.ui.tooling.preview)
         implementation(libs.androidx.core.ktx)
+        implementation(libs.kotlinx.serialization.json)
         implementation("androidx.appcompat:appcompat:1.7.0")
         implementation(project(":core-streaming"))
         implementation(project(":core-profile"))
@@ -138,13 +140,13 @@ androidComponents {
         implementation("androidx.compose.material:material-icons-extended")
         implementation("androidx.webkit:webkit:1.14.0")
         implementation("androidx.browser:browser:1.7.0")
-        implementation("androidx.media3:media3-exoplayer:1.6.0")
-        implementation("androidx.media3:media3-exoplayer-hls:1.6.0")
-        implementation("androidx.media3:media3-exoplayer-dash:1.6.0")
-        implementation("androidx.media3:media3-common:1.6.0")
-        implementation("androidx.media3:media3-datasource:1.6.0")
-        implementation("androidx.media3:media3-session:1.6.0")
-        implementation("androidx.media3:media3-ui:1.6.0")
+        implementation("androidx.media3:media3-exoplayer:1.6.1")
+        implementation("androidx.media3:media3-exoplayer-hls:1.6.1")
+        implementation("androidx.media3:media3-exoplayer-dash:1.6.1")
+        implementation("androidx.media3:media3-common:1.6.1")
+        implementation("androidx.media3:media3-datasource:1.6.1")
+        implementation("androidx.media3:media3-session:1.6.1")
+        implementation("androidx.media3:media3-ui:1.11.1")
         implementation("io.coil-kt:coil-compose:2.7.0")
         implementation("com.github.TeamNewPipe:NewPipeExtractor:v0.26.5")
         // Oboe for low-latency audio output (native crossfade engine) - 1.9.0+ for 16KB page alignment

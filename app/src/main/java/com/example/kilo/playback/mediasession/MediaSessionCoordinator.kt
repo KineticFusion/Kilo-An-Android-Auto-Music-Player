@@ -24,8 +24,6 @@ class MediaSessionCoordinator(
     override fun seekToDefaultPosition(mediaItemIndex: Int) = commands.seekToDefaultPosition(mediaItemIndex)
     override fun seekToNextMediaItem() = commands.next()
     override fun seekToPreviousMediaItem() = commands.previous()
-    override fun seekToNextWindow() = commands.seekNextWindow()
-    override fun seekToPreviousWindow() = commands.seekPreviousWindow()
     override fun seekToNext() = commands.seekNext()
     override fun seekToPrevious() = commands.seekPrevious()
 

@@ -41,21 +41,25 @@ object SpotifyApiClient {
         limit: Int = 20,
         offset: Int = 0
     ): SpotifySearchResult? = withContext(Dispatchers.IO) {
-        val token = HybridSourceRegistry.getSpotifyWebSession(context).second
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
             ?: return@withContext null
 
         val typeParam = types.joinToString(",")
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
         val url = "$API_BASE/search?q=$encodedQuery&type=$typeParam&limit=$limit&offset=$offset"
 
-        return@withContext makeGetRequest(url, token)?.let { parseSearchResult(it) }
+        Log.d(TAG, "Spotify search request: $url")
+
+        val response = makeGetRequest(url, token)
+        Log.d(TAG, "Spotify search response: ${if (response != null) "OK" else "NULL"}")
+        return@withContext response?.let { parseSearchResult(it) }
     }
 
     /**
      * Get user's liked tracks
      */
     suspend fun getLikedTracks(context: Context, limit: Int = 50, offset: Int = 0): List<SpotifyTrack>? = withContext(Dispatchers.IO) {
-        val token = HybridSourceRegistry.getSpotifyWebSession(context).second
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
             ?: return@withContext null
 
         val url = "$API_BASE/me/tracks?limit=$limit&offset=$offset"
@@ -80,6 +84,35 @@ object SpotifyApiClient {
     }
 
     /**
+     * Get user's saved albums
+     */
+    suspend fun getUserAlbums(context: Context, limit: Int = 50, offset: Int = 0): List<SpotifyAlbum>? = withContext(Dispatchers.IO) {
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
+            ?: return@withContext null
+
+        val url = "$API_BASE/me/albums?limit=$limit&offset=$offset"
+        makeGetRequest(url, token)?.let { json ->
+            val items = json.optJSONArray("items")
+            return@withContext parseSavedAlbumArray(items)
+        }
+    }
+
+    /**
+     * Get user's followed artists
+     */
+    suspend fun getFollowedArtists(context: Context, limit: Int = 50, after: String? = null): SpotifyPage<SpotifyArtist>? = withContext(Dispatchers.IO) {
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
+            ?: return@withContext null
+
+        val afterParam = if (after != null && after.isNotBlank()) "&after=$after" else ""
+        val url = "$API_BASE/me/following?type=artist&limit=$limit$afterParam"
+        makeGetRequest(url, token)?.let { json ->
+            val artists = json.optJSONObject("artists")
+            return@withContext parseArtistPage(artists!!)
+        }
+    }
+
+    /**
      * Get playlist tracks
      */
     suspend fun getPlaylistTracks(context: Context, playlistId: String, limit: Int = 100, offset: Int = 0): List<SpotifyTrack>? = withContext(Dispatchers.IO) {
@@ -91,6 +124,17 @@ object SpotifyApiClient {
             val items = json.optJSONArray("items")
             return@withContext parsePlaylistTrackArray(items)
         }
+    }
+
+    /**
+     * Get playlist details
+     */
+    suspend fun getPlaylist(context: Context, playlistId: String): SpotifyPlaylist? = withContext(Dispatchers.IO) {
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
+            ?: return@withContext null
+
+        val url = "$API_BASE/playlists/$playlistId"
+        makeGetRequest(url, token)?.let { parsePlaylist(it) }
     }
 
     /**
@@ -113,6 +157,27 @@ object SpotifyApiClient {
 
         val url = "$API_BASE/albums/$albumId"
         makeGetRequest(url, token)?.let { parseAlbum(it) }
+    }
+
+    /**
+     * Get album tracks
+     */
+    suspend fun getAlbumTracks(context: Context, albumId: String, limit: Int = 50, offset: Int = 0): SpotifyPage<SpotifyTrack>? = withContext(Dispatchers.IO) {
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
+            ?: return@withContext null
+
+        val url = "$API_BASE/albums/$albumId/tracks?limit=$limit&offset=$offset"
+        makeGetRequest(url, token)?.let { json ->
+            val items = json.optJSONArray("items")
+            return@withContext SpotifyPage(
+                items = parseTrackArray(items) ?: emptyList(),
+                total = json.optInt("total"),
+                limit = json.optInt("limit"),
+                offset = json.optInt("offset"),
+                next = json.optString("next").takeIf { it.isNotBlank() },
+                previous = json.optString("previous").takeIf { it.isNotBlank() }
+            )
+        }
     }
 
     /**
@@ -169,7 +234,7 @@ object SpotifyApiClient {
      * Get featured playlists
      */
     suspend fun getFeaturedPlaylists(context: Context, limit: Int = 20, offset: Int = 0, country: String = "US", locale: String = "en_US"): SpotifyPage<SpotifyPlaylist>? = withContext(Dispatchers.IO) {
-        val token = HybridSourceRegistry.getSpotifyWebSession(context).second
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
             ?: return@withContext null
 
         val url = "$API_BASE/browse/featured-playlists?limit=$limit&offset=$offset&country=$country&locale=$locale"
@@ -183,7 +248,7 @@ object SpotifyApiClient {
      * Get browse categories
      */
     suspend fun getCategories(context: Context, limit: Int = 20, offset: Int = 0, country: String = "US", locale: String = "en_US"): SpotifyPage<SpotifyCategory>? = withContext(Dispatchers.IO) {
-        val token = HybridSourceRegistry.getSpotifyWebSession(context).second
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
             ?: return@withContext null
 
         val url = "$API_BASE/browse/categories?limit=$limit&offset=$offset&country=$country&locale=$locale"
@@ -197,7 +262,7 @@ object SpotifyApiClient {
      * Get category playlists
      */
     suspend fun getCategoryPlaylists(context: Context, categoryId: String, limit: Int = 20, offset: Int = 0, country: String = "US"): SpotifyPage<SpotifyPlaylist>? = withContext(Dispatchers.IO) {
-        val token = HybridSourceRegistry.getSpotifyWebSession(context).second
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
             ?: return@withContext null
 
         val url = "$API_BASE/browse/categories/$categoryId/playlists?limit=$limit&offset=$offset&country=$country"
@@ -211,7 +276,7 @@ object SpotifyApiClient {
      * Get artist's albums
      */
     suspend fun getArtistAlbums(context: Context, artistId: String, limit: Int = 20, offset: Int = 0, includeGroups: String = "album,single,appears_on,compilation"): SpotifyPage<SpotifyAlbum>? = withContext(Dispatchers.IO) {
-        val token = HybridSourceRegistry.getSpotifyWebSession(context).second
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
             ?: return@withContext null
 
         val url = "$API_BASE/artists/$artistId/albums?limit=$limit&offset=$offset&include_groups=$includeGroups"
@@ -231,7 +296,7 @@ object SpotifyApiClient {
         seedGenres: List<String> = emptyList(),
         limit: Int = 20
     ): List<SpotifyTrack>? = withContext(Dispatchers.IO) {
-        val token = HybridSourceRegistry.getSpotifyWebSession(context).second
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
             ?: return@withContext null
 
         val params = mutableMapOf<String, String>()
@@ -256,7 +321,7 @@ object SpotifyApiClient {
         variables: JSONObject,
         extensions: JSONObject? = null
     ): JSONObject? = withContext(Dispatchers.IO) {
-        val token = HybridSourceRegistry.getSpotifyWebSession(context).second
+        val token = HybridSourceRegistry.ensureValidSpotifyWebToken(context)
             ?: return@withContext null
 
         val body = JSONObject().apply {
@@ -323,6 +388,7 @@ object SpotifyApiClient {
                 conn.errorStream?.bufferedReader()?.readText() ?: ""
             }
 
+            Log.d(TAG, "Spotify API GET $url -> $responseCode")
             if (responseCode !in 200..299) {
                 Log.w(TAG, "GET $url failed: $responseCode - ${responseText.take(500)}")
                 return null
@@ -409,9 +475,7 @@ object SpotifyApiClient {
                 images = parseImages(it.optJSONArray("images")),
                 isPlayable = it.optBoolean("is_playable", true),
                 trackNumber = it.optInt("track_number"),
-                discNumber = it.optInt("disc_number"),
-                type = it.optString("type"),
-                href = it.optString("href")
+                discNumber = it.optInt("disc_number")
             )
         }
     }
@@ -419,6 +483,12 @@ object SpotifyApiClient {
     private fun parseSavedTrackArray(json: JSONArray?): List<SpotifyTrack>? {
         return json?.let { (0 until it.length()).mapNotNull { index ->
             it.optJSONObject(index)?.optJSONObject("track")?.let { parseTrack(it) }
+        } }
+    }
+
+    private fun parseSavedAlbumArray(json: JSONArray?): List<SpotifyAlbum>? {
+        return json?.let { (0 until it.length()).mapNotNull { index ->
+            it.optJSONObject(index)?.optJSONObject("album")?.let { parseAlbum(it) }
         } }
     }
 
@@ -444,13 +514,11 @@ object SpotifyApiClient {
                 id = it.optString("id"),
                 uri = it.optString("uri"),
                 name = it.optString("name"),
-                popularity = it.optInt("popularity"),
-                genres = genres,
-                externalUrls = parseExternalUrls(it.optJSONObject("external_urls")),
                 images = parseImages(it.optJSONArray("images")),
+                externalUrls = parseExternalUrls(it.optJSONObject("external_urls")),
                 followers = it.optJSONObject("followers")?.optLong("total", 0) ?: 0,
-                type = it.optString("type"),
-                href = it.optString("href")
+                genres = genres,
+                popularity = it.optInt("popularity")
             )
         }
     }
@@ -465,17 +533,13 @@ object SpotifyApiClient {
                 id = it.optString("id"),
                 uri = it.optString("uri"),
                 name = it.optString("name"),
-                albumType = it.optString("album_type"),
-                totalTracks = it.optInt("total_tracks"),
                 artists = parseArtistArray(it.optJSONArray("artists")) ?: emptyList(),
+                images = parseImages(it.optJSONArray("images")),
+                externalUrls = parseExternalUrls(it.optJSONObject("external_urls")),
                 releaseDate = it.optString("release_date"),
                 releaseDatePrecision = it.optString("release_date_precision"),
-                externalUrls = parseExternalUrls(it.optJSONObject("external_urls")),
-                images = parseImages(it.optJSONArray("images")),
-                label = it.optString("label"),
-                popularity = it.optInt("popularity"),
-                type = it.optString("type"),
-                href = it.optString("href")
+                totalTracks = it.optInt("total_tracks"),
+                albumType = it.optString("album_type")
             )
         }
     }
@@ -491,15 +555,12 @@ object SpotifyApiClient {
                 uri = it.optString("uri"),
                 name = it.optString("name"),
                 description = it.optString("description"),
-                owner = parseUser(it.optJSONObject("owner")),
-                public = it.optBoolean("public"),
-                collaborative = it.optBoolean("collaborative"),
-                trackCount = it.optJSONObject("tracks")?.optInt("total", 0) ?: 0,
                 images = parseImages(it.optJSONArray("images")),
                 externalUrls = parseExternalUrls(it.optJSONObject("external_urls")),
-                snapshotId = it.optString("snapshot_id"),
-                type = it.optString("type"),
-                href = it.optString("href")
+                trackCount = it.optJSONObject("tracks")?.optInt("total", 0) ?: 0,
+                owner = parseUser(it.optJSONObject("owner")),
+                isPublic = it.optBoolean("public"),
+                isCollaborative = it.optBoolean("collaborative")
             )
         }
     }
@@ -510,10 +571,9 @@ object SpotifyApiClient {
                 id = it.optString("id"),
                 uri = it.optString("uri"),
                 displayName = it.optString("display_name"),
-                externalUrls = parseExternalUrls(it.optJSONObject("external_urls")),
                 images = parseImages(it.optJSONArray("images")),
-                type = it.optString("type"),
-                href = it.optString("href")
+                externalUrls = parseExternalUrls(it.optJSONObject("external_urls")),
+                followers = it.optJSONObject("followers")?.optLong("total", 0) ?: 0
             )
         }
     }
@@ -565,113 +625,10 @@ object SpotifyApiClient {
     }
 }
 
-// Data models
+// REST API response models
 data class SpotifySearchResult(
     val tracks: SpotifyPage<SpotifyTrack>? = null,
     val artists: SpotifyPage<SpotifyArtist>? = null,
     val albums: SpotifyPage<SpotifyAlbum>? = null,
     val playlists: SpotifyPage<SpotifyPlaylist>? = null
-)
-
-data class SpotifyPage<T>(
-    val items: List<T>,
-    val total: Int,
-    val limit: Int,
-    val offset: Int,
-    val next: String?,
-    val previous: String?
-)
-
-data class SpotifyTrack(
-    val id: String,
-    val uri: String,
-    val name: String,
-    val artists: List<SpotifyArtist>,
-    val album: SpotifyAlbum?,
-    val durationMs: Long,
-    val explicit: Boolean,
-    val popularity: Int,
-    val previewUrl: String?,
-    val externalUrls: Map<String, String>,
-    val images: List<SpotifyImage>,
-    val isPlayable: Boolean,
-    val trackNumber: Int,
-    val discNumber: Int,
-    val type: String,
-    val href: String
-)
-
-data class SpotifyArtist(
-    val id: String,
-    val uri: String,
-    val name: String,
-    val popularity: Int,
-    val genres: List<String>,
-    val externalUrls: Map<String, String>,
-    val images: List<SpotifyImage>,
-    val followers: Long,
-    val type: String,
-    val href: String
-)
-
-data class SpotifyAlbum(
-    val id: String,
-    val uri: String,
-    val name: String,
-    val albumType: String,
-    val totalTracks: Int,
-    val artists: List<SpotifyArtist>,
-    val releaseDate: String,
-    val releaseDatePrecision: String,
-    val externalUrls: Map<String, String>,
-    val images: List<SpotifyImage>,
-    val label: String,
-    val popularity: Int,
-    val type: String,
-    val href: String
-)
-
-data class SpotifyPlaylist(
-    val id: String,
-    val uri: String,
-    val name: String,
-    val description: String,
-    val owner: SpotifyUser?,
-    val public: Boolean,
-    val collaborative: Boolean,
-    val trackCount: Int,
-    val images: List<SpotifyImage>,
-    val externalUrls: Map<String, String>,
-    val snapshotId: String,
-    val type: String,
-    val href: String
-)
-
-data class SpotifyUser(
-    val id: String,
-    val uri: String,
-    val displayName: String,
-    val externalUrls: Map<String, String>,
-    val images: List<SpotifyImage>,
-    val type: String,
-    val href: String
-)
-
-data class SpotifyCategory(
-    val id: String,
-    val name: String,
-    val icons: List<SpotifyImage>,
-    val href: String
-)
-
-data class SpotifyShow(
-    val id: String,
-    val uri: String,
-    val name: String,
-    val description: String,
-    val publisher: String,
-    val externalUrls: Map<String, String>,
-    val images: List<SpotifyImage>,
-    val type: String,
-    val href: String
 )

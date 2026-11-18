@@ -28,10 +28,14 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -43,6 +47,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -132,6 +138,7 @@ object SpotifyAuthManager {
  * Spotify Login Dialog - MIRRORS BitChordWebViewLoginDialog exactly
  * Loads Spotify login page in WebView, captures sp_dc cookie on redirect to open.spotify.com
  * Responsive: fills remaining height, dynamic User-Agent, loading indicator
+ * Includes manual sp_dc input field (YumaPlayer-style) for debug/backup
  */
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -139,7 +146,11 @@ fun SpotifyLoginDialog(
     onLoginSuccess: () -> Unit,
     onDismiss: () -> Unit
 ) {
+    val context = LocalContext.current
     var loading by remember { mutableStateOf(true) }
+    var showManualInput by remember { mutableStateOf(false) }
+    var manualSpDc by remember { mutableStateOf("") }
+    var manualError by remember { mutableStateOf<String?>(null) }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -171,7 +182,7 @@ fun SpotifyLoginDialog(
                 }
 
                 // Loading indicator
-                if (loading) {
+                if (loading && !showManualInput) {
                     LinearProgressIndicator(
                         modifier = Modifier.fillMaxWidth(),
                         color = Color(0xFF1DB954),
@@ -180,95 +191,165 @@ fun SpotifyLoginDialog(
                     )
                 }
 
-                // WebView fills remaining height dynamically (responsive on phone/tablet/foldable)
-                AndroidView(
-                    modifier = Modifier.fillMaxWidth().weight(1f),
-                    factory = { context ->
-                        WebView(context).apply {
-                            // Fix 1: Explicit MATCH_PARENT layout params
-                            layoutParams = ViewGroup.LayoutParams(
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                                ViewGroup.LayoutParams.MATCH_PARENT
+                if (showManualInput) {
+                    // Manual sp_dc input (YumaPlayer-style debug field)
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        Text("Manual sp_dc Cookie", color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                        Text(
+                            "Paste your sp_dc cookie from open.spotify.com (F12 → Application → Cookies)",
+                            color = Color.White.copy(alpha = 0.6f),
+                            fontSize = 11.sp
+                        )
+                        OutlinedTextField(
+                            value = manualSpDc,
+                            onValueChange = { manualSpDc = it; manualError = null },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color(0xFF141419),
+                                unfocusedContainerColor = Color(0xFF141419),
+                                focusedIndicatorColor = Color(0xFF1DB954),
+                                unfocusedIndicatorColor = Color.White.copy(alpha = 0.3f),
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                cursorColor = Color(0xFF1DB954)
                             )
-                            // Fix 4: White background (not black)
-                            setBackgroundColor(AndroidColor.WHITE)
-                            // Hardware acceleration
-                            setLayerType(View.LAYER_TYPE_HARDWARE, null)
-
-                            val settings = this.settings.apply {
-                                // Fix 3: Required WebSettings
-                                javaScriptEnabled = true
-                                domStorageEnabled = true
-                                databaseEnabled = true
-                                useWideViewPort = true
-                                loadWithOverviewMode = true
-                                // Disable algorithmic darkening (API 33+)
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                    isAlgorithmicDarkeningAllowed = false
-                                }
-                                // Fix 2: Dynamic Device-Adaptive User-Agent (NO hardcoded device)
-                                val defaultUa = userAgentString
-                                userAgentString = defaultUa
-                                    .replace("; wv", "")
-                                    .replace(Regex("Version/\\d+\\.\\d+\\s*"), "")
-                            }
-
-                            val cookieManager = CookieManager.getInstance()
-                            cookieManager.setAcceptCookie(true)
-                            cookieManager.setAcceptThirdPartyCookies(this, true)
-
-                            // Fix 5: WebChromeClient for console logging + loading state
-                            webChromeClient = object : WebChromeClient() {
-                                override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
-                                    android.util.Log.d("KiloSpotifyAuth", "[JS Console] ${consoleMessage.message()} (line ${consoleMessage.lineNumber()})")
-                                    return super.onConsoleMessage(consoleMessage)
-                                }
-                                override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                                    super.onProgressChanged(view, newProgress)
-                                    android.util.Log.d("KiloSpotifyAuth", "Progress: $newProgress%")
-                                }
-                            }
-
-                            webViewClient = object : WebViewClient() {
-                                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                                    super.onPageStarted(view, url, favicon)
-                                    android.util.Log.d("KiloSpotifyAuth", "Page started: $url")
-                                    // Keep loading indicator visible
-                                    loading = true
-                                }
-                                override fun onPageFinished(view: WebView?, url: String?) {
-                                    super.onPageFinished(view, url)
-                                    android.util.Log.d("KiloSpotifyAuth", "Page finished: $url")
-                                    loading = false
-                                    // Check for sp_dc cookie on open.spotify.com
-                                    val cookies = cookieManager.getCookie("https://open.spotify.com") ?: ""
-                                    if (cookies.contains("sp_dc")) {
-                                        cookieManager.flush()
+                        )
+                        manualError?.let { error ->
+                            Text(error, color = Color(0xFFE22134), fontSize = 11.sp)
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    if (manualSpDc.isNotBlank()) {
+                                        // Validate and save manual sp_dc
+                                        val cookies = "sp_dc=${manualSpDc.trim()}"
                                         SpotifyAuthManager.saveWebSession(context, cookies)
                                         onLoginSuccess()
+                                    } else {
+                                        manualError = "Please enter sp_dc cookie"
                                     }
-                                }
-                                // Keep ALL navigation inside WebView
-                                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                                    return false
-                                }
-                                // Fix 5: Error logging
-                                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: android.webkit.WebResourceError?) {
-                                    super.onReceivedError(view, request, error)
-                                    android.util.Log.e("KiloSpotifyAuth", "WebView error: ${error?.description} for URL: ${request?.url}")
-                                    loading = false
-                                }
-                                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                                    android.util.Log.e("KiloSpotifyAuth", "SSL error: ${error?.primaryError} for URL: ${error?.url}")
-                                    handler?.proceed() // Allow proceeding for testing
-                                    loading = false
-                                }
+                                },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF1DB954),
+                                    contentColor = Color.Black
+                                )
+                            ) {
+                                Text("Save & Connect", fontWeight = FontWeight.Bold)
                             }
-                            // Load Spotify login page (redirects to open.spotify.com after login)
-                            loadUrl("https://accounts.spotify.com/login")
+                            TextButton(onClick = { showManualInput = false }) {
+                                Text("Back to WebView", color = Color.White.copy(alpha = 0.8f))
+                            }
                         }
                     }
-                )
+                } else {
+                    // WebView fills remaining height dynamically (responsive on phone/tablet/foldable)
+                    AndroidView(
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        factory = { context ->
+                            WebView(context).apply {
+                                // Fix 1: Explicit MATCH_PARENT layout params
+                                layoutParams = ViewGroup.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT
+                                )
+                                // Fix 4: White background (not black)
+                                setBackgroundColor(AndroidColor.WHITE)
+                                // Hardware acceleration
+                                setLayerType(View.LAYER_TYPE_HARDWARE, null)
+
+                                val settings = this.settings.apply {
+                                    // Fix 3: Required WebSettings
+                                    javaScriptEnabled = true
+                                    domStorageEnabled = true
+                                    databaseEnabled = true
+                                    useWideViewPort = true
+                                    loadWithOverviewMode = true
+                                    // Disable algorithmic darkening (API 33+)
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        isAlgorithmicDarkeningAllowed = false
+                                    }
+                                    // Fix 2: Dynamic Device-Adaptive User-Agent (NO hardcoded device)
+                                    val defaultUa = userAgentString
+                                    userAgentString = defaultUa
+                                        .replace("; wv", "")
+                                        .replace(Regex("Version/\\d+\\.\\d+\\s*"), "")
+                                }
+
+                                val cookieManager = CookieManager.getInstance()
+                                cookieManager.setAcceptCookie(true)
+                                cookieManager.setAcceptThirdPartyCookies(this, true)
+
+                                // Fix 5: WebChromeClient for console logging + loading state
+                                webChromeClient = object : WebChromeClient() {
+                                    override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
+                                        android.util.Log.d("KiloSpotifyAuth", "[JS Console] ${consoleMessage.message()} (line ${consoleMessage.lineNumber()})")
+                                        return super.onConsoleMessage(consoleMessage)
+                                    }
+                                    override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                                        super.onProgressChanged(view, newProgress)
+                                        android.util.Log.d("KiloSpotifyAuth", "Progress: $newProgress%")
+                                    }
+                                }
+
+                                webViewClient = object : WebViewClient() {
+                                    override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                                        super.onPageStarted(view, url, favicon)
+                                        android.util.Log.d("KiloSpotifyAuth", "Page started: $url")
+                                        // Keep loading indicator visible
+                                        loading = true
+                                    }
+                                    override fun onPageFinished(view: WebView?, url: String?) {
+                                        super.onPageFinished(view, url)
+                                        android.util.Log.d("KiloSpotifyAuth", "Page finished: $url")
+                                        loading = false
+                                        // Check for sp_dc cookie on open.spotify.com
+                                        val cookies = cookieManager.getCookie("https://open.spotify.com") ?: ""
+                                        if (cookies.contains("sp_dc")) {
+                                            cookieManager.flush()
+                                            SpotifyAuthManager.saveWebSession(context, cookies)
+                                            onLoginSuccess()
+                                        }
+                                    }
+                                    // Keep ALL navigation inside WebView
+                                    override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                                        return false
+                                    }
+                                    // Fix 5: Error logging
+                                    override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: android.webkit.WebResourceError?) {
+                                        super.onReceivedError(view, request, error)
+                                        android.util.Log.e("KiloSpotifyAuth", "WebView error: ${error?.description} for URL: ${request?.url}")
+                                        loading = false
+                                    }
+                                    override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                                        android.util.Log.e("KiloSpotifyAuth", "SSL error: ${error?.primaryError} for URL: ${error?.url}")
+                                        handler?.proceed() // Allow proceeding for testing
+                                        loading = false
+                                    }
+                                }
+                                // Load Spotify login page (redirects to open.spotify.com after login)
+                                loadUrl("https://accounts.spotify.com/login")
+                            }
+                        }
+                    )
+                }
+
+                // Toggle to manual input
+                if (!showManualInput) {
+                    TextButton(
+                        onClick = { showManualInput = true },
+                        modifier = Modifier.padding(16.dp).fillMaxWidth()
+                    ) {
+                        Text("Enter sp_dc manually (debug)", color = Color(0xFF1DB954), fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                    }
+                }
             }
         }
     }

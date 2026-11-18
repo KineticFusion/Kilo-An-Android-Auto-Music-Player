@@ -122,12 +122,12 @@ class BackgroundPlaybackCoordinator(
     }
 
     fun seekNextWindow(playAfter: Boolean = false) = command("next_window", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
-        player.seekToNextWindow()
+        player.seekToNextMediaItem()
         if (playAfter) player.play()
     }
 
     fun seekPreviousWindow(playAfter: Boolean = false) = command("previous_window", intent = if (playAfter) PlaybackCommandLedger.Intent.PLAY else null) {
-        player.seekToPreviousWindow()
+        player.seekToPreviousMediaItem()
         if (playAfter) player.play()
     }
 

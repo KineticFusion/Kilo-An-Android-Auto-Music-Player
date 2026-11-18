@@ -33,6 +33,11 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import com.example.kilo.spotify.SpotifyLibrary
+import com.example.kilo.spotify.SpotifySavedTrack
+import com.example.kilo.spotify.SpotifySavedAlbum
+import com.example.kilo.spotify.SpotifyFollowedArtist
+import com.example.kilo.spotify.SpotifyPlaylistSummary
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -57,6 +62,7 @@ fun SpotifyWebViewBridge(
     onReady: (SpotifyBridgeController) -> Unit = {},
     onStateChange: (BridgeSpotifyPlaybackState?) -> Unit = {},
     onQueueChange: (BridgeSpotifyQueue?) -> Unit = {},
+    onLibraryChange: (SpotifyLibrary?) -> Unit = {},
     onError: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
@@ -72,7 +78,7 @@ fun SpotifyWebViewBridge(
                 settings.apply {
                     javaScriptEnabled = true
                     domStorageEnabled = true
-                    databaseEnabled = true
+                    // databaseEnabled deprecated - removed to prevent crashes
                     cacheMode = WebSettings.LOAD_DEFAULT
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     userAgentString = "Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
@@ -126,6 +132,7 @@ fun SpotifyWebViewBridge(
 
     LaunchedEffect(Unit) {
         onReady(bridgeController)
+        bridgeController.setLibraryListener(onLibraryChange)
     }
 
     DisposableEffect(Unit) {
@@ -174,6 +181,8 @@ interface SpotifyBridgeController {
     fun libraryContains(uris: List<String>): List<Boolean>
     fun libraryAdd(uris: List<String>)
     fun libraryRemove(uris: List<String>)
+    fun getLibrary(): SpotifyLibrary?
+    fun setLibraryListener(listener: (SpotifyLibrary?) -> Unit)
     fun getState(): BridgeSpotifyPlaybackState?
     fun getQueue(): BridgeSpotifyQueue?
     fun shutdown()
@@ -252,6 +261,8 @@ private class SpotifyBridgeControllerImpl : SpotifyBridgeController {
     private var stateListener: ((BridgeSpotifyPlaybackState?) -> Unit)? = null
     private var queueListener: ((BridgeSpotifyQueue?) -> Unit)? = null
     private var errorListener: ((String) -> Unit)? = null
+    private var libraryListener: ((SpotifyLibrary?) -> Unit)? = null
+    private var currentLibrary: SpotifyLibrary? = null
 
     init {
         // Could initialize WebView reference here if needed
@@ -271,6 +282,10 @@ private class SpotifyBridgeControllerImpl : SpotifyBridgeController {
 
     fun setErrorListener(listener: (String) -> Unit) {
         errorListener = listener
+    }
+
+    override fun setLibraryListener(listener: (SpotifyLibrary?) -> Unit) {
+        libraryListener = listener
     }
 
     override fun play(contextUri: String, trackUri: String?, trackUid: String?, index: Int?, positionMs: Long?) {
@@ -352,6 +367,8 @@ private class SpotifyBridgeControllerImpl : SpotifyBridgeController {
         call("library.remove", arrayOf(uris))
     }
 
+    override fun getLibrary(): SpotifyLibrary? = currentLibrary
+
     override fun getState(): BridgeSpotifyPlaybackState? = currentState
 
     override fun getQueue(): BridgeSpotifyQueue? = currentQueue
@@ -390,6 +407,11 @@ private class SpotifyBridgeControllerImpl : SpotifyBridgeController {
                         val queueJson = msg.optJSONObject("queue")
                         currentQueue = parseQueue(queueJson)
                         queueListener?.invoke(currentQueue)
+                    }
+                    "library" -> {
+                        val libraryJson = msg.optJSONObject("library")
+                        currentLibrary = parseLibrary(libraryJson)
+                        libraryListener?.invoke(currentLibrary)
                     }
                     "result" -> {
                         val id = msg.optLong("id")
@@ -475,6 +497,108 @@ private class SpotifyBridgeControllerImpl : SpotifyBridgeController {
     private fun parseTrackArray(json: org.json.JSONArray?): List<BridgeSpotifyTrack> {
         if (json == null) return emptyList()
         return (0 until json.length()).mapNotNull { parseTrack(json.optJSONObject(it)) }
+    }
+
+    private fun parseLibrary(json: JSONObject?): SpotifyLibrary? {
+        if (json == null) return null
+        val savedTracksJson = json.optJSONArray("savedTracks")
+        val savedAlbumsJson = json.optJSONArray("savedAlbums")
+        val followedArtistsJson = json.optJSONArray("followedArtists")
+        val playlistsJson = json.optJSONArray("playlists")
+
+        val savedTracks = parseSavedTracks(savedTracksJson)
+        val savedAlbums = parseSavedAlbums(savedAlbumsJson)
+        val followedArtists = parseFollowedArtists(followedArtistsJson)
+        val playlists = parsePlaylists(playlistsJson)
+
+        return SpotifyLibrary(savedTracks, playlists, savedAlbums, followedArtists)
+    }
+
+    private fun parseSavedTracks(json: org.json.JSONArray?): List<SpotifySavedTrack> {
+        if (json == null) return emptyList()
+        return (0 until json.length()).mapNotNull { i ->
+            val item = json.optJSONObject(i) ?: return@mapNotNull null
+            val track = item.optJSONObject("track") ?: return@mapNotNull null
+            val trackId = track.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val name = track.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val artistsArr = track.optJSONArray("artists")
+            val artists = if (artistsArr != null && artistsArr.length() > 0) {
+                (0 until artistsArr.length()).mapNotNull { artistsArr.optJSONObject(it)?.let { BridgeSpotifyArtist(it.optString("uri"), it.optString("name")) } }
+            } else emptyList()
+            val albumObj = track.optJSONObject("album")
+            val album = albumObj?.let { BridgeSpotifyAlbum(it.optString("uri"), it.optString("name")) }
+            val image = track.optString("image").takeIf { it.isNotBlank() }
+            val explicit = track.optBoolean("explicit")
+            val durationMs = track.optLong("duration_ms")
+            val uid = track.optString("uid")
+            val kind = track.optString("kind")
+            val mediaType = track.optString("mediaType").takeIf { it.isNotBlank() }
+            val provider = track.optString("provider").takeIf { it.isNotBlank() }
+            val addedAt = item.optString("added_at").takeIf { it.isNotBlank() } ?: ""
+            val bridgeTrack = BridgeSpotifyTrack(
+                kind = kind,
+                uri = "spotify:track:$trackId",
+                uid = uid,
+                name = name,
+                advertiser = null,
+                durationMs = durationMs,
+                artists = artists,
+                album = album,
+                image = image,
+                explicit = explicit,
+                mediaType = mediaType,
+                provider = provider
+            )
+            SpotifySavedTrack(addedAt = addedAt, track = bridgeTrack)
+        }
+    }
+
+    private fun parseSavedAlbums(json: org.json.JSONArray?): List<SpotifySavedAlbum> {
+        if (json == null) return emptyList()
+        return (0 until json.length()).mapNotNull { i ->
+            val item = json.optJSONObject(i) ?: return@mapNotNull null
+            val album = item.optJSONObject("album") ?: return@mapNotNull null
+            val albumId = album.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val name = album.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val artistsArr = album.optJSONArray("artists")
+            val artists = if (artistsArr != null && artistsArr.length() > 0) {
+                (0 until artistsArr.length()).mapNotNull { artistsArr.optJSONObject(it)?.let { BridgeSpotifyArtist(it.optString("uri"), it.optString("name")) } }
+            } else emptyList()
+            val bridgeAlbum = BridgeSpotifyAlbum(uri = "spotify:album:$albumId", name = name)
+            val addedAt = item.optString("added_at").takeIf { it.isNotBlank() } ?: ""
+            SpotifySavedAlbum(addedAt = addedAt, album = bridgeAlbum, artists = artists)
+        }
+    }
+
+    private fun parseFollowedArtists(json: org.json.JSONArray?): List<SpotifyFollowedArtist> {
+        if (json == null) return emptyList()
+        return (0 until json.length()).mapNotNull { i ->
+            val artist = json.optJSONObject(i) ?: return@mapNotNull null
+            val artistId = artist.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val name = artist.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val bridgeArtist = BridgeSpotifyArtist(uri = "spotify:artist:$artistId", name = name)
+            SpotifyFollowedArtist(artist = bridgeArtist)
+        }
+    }
+
+    private fun parsePlaylists(json: org.json.JSONArray?): List<SpotifyPlaylistSummary> {
+        if (json == null) return emptyList()
+        return (0 until json.length()).mapNotNull { i ->
+            val pl = json.optJSONObject(i) ?: return@mapNotNull null
+            val id = pl.optString("id").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val name = pl.optString("name").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val cover = pl.optJSONArray("images")?.optJSONObject(0)?.optString("url").orEmpty()
+            val total = pl.optJSONObject("tracks")?.optInt("total", 0) ?: 0
+            val ownerObj = pl.optJSONObject("owner")
+            val ownerName = ownerObj?.optString("display_name").orEmpty()
+            SpotifyPlaylistSummary(
+                id = id,
+                name = name,
+                coverUrl = cover,
+                trackCount = total,
+                owner = ownerName
+            )
+        }
     }
 }
 

@@ -58,6 +58,7 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.ForwardingPlayer
+import androidx.media3.common.Timeline
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSpec
 import androidx.media3.datasource.DefaultDataSource
@@ -184,6 +185,8 @@ private val LIKE_COMMAND = SessionCommand("vybe_like", Bundle.EMPTY)
 private val QUEUE_NEXT_COMMAND = SessionCommand("vybe_queue_next", Bundle.EMPTY)
 private val CLOSE_APP_COMMAND = SessionCommand("vybe_close_app", Bundle.EMPTY)
 private val MOOD_FOR_ME_COMMAND = SessionCommand("vybe_mood_for_me", Bundle.EMPTY)
+// Spotify WebView external metadata update command
+private val SPOTIFY_METADATA_COMMAND = SessionCommand("vybe_spotify_metadata", Bundle.EMPTY)
 
 const val ACTION_TOGGLE_PLAY = "com.example.kilo.ACTION_TOGGLE_PLAY"
 const val ACTION_NEXT_TRACK = "com.example.kilo.ACTION_NEXT_TRACK"
@@ -224,6 +227,100 @@ private class AndroidAutoLyricsSessionPlayer(delegate: Player) : ForwardingPlaye
         val metadata = mediaMetadata
         sessionListeners.forEach { listener ->
             listener.onMediaMetadataChanged(metadata)
+        }
+    }
+}
+
+/** Holds Spotify WebView playback state for MediaSession metadata/playback state. */
+private class SpotifyMetadataHolder {
+    @Volatile var isActive = false
+    @Volatile var title = ""
+    @Volatile var artist = ""
+    @Volatile var album = ""
+    @Volatile var coverUrl = ""
+    @Volatile var durationMs = 0L
+    @Volatile var positionMs = 0L
+    @Volatile var isPlaying = false
+    @Volatile var isBuffering = false
+    @Volatile var canSeek = false
+    @Volatile var canSkipNext = false
+    @Volatile var canSkipPrev = false
+    @Volatile var shuffle = false
+    @Volatile var repeatMode = 0
+
+    private val listeners = CopyOnWriteArrayList<() -> Unit>()
+
+    fun addListener(listener: () -> Unit) { listeners.add(listener) }
+    fun removeListener(listener: () -> Unit) { listeners.remove(listener) }
+
+    fun notifyChanged() { listeners.forEach { it() } }
+}
+
+/** Wraps the session player to provide Spotify metadata when Spotify is active. */
+private class SpotifySessionPlayer(
+    private val delegate: Player,
+    private val spotifyHolder: SpotifyMetadataHolder
+) : Player by delegate {
+    private val listeners = CopyOnWriteArrayList<Player.Listener>()
+
+    override fun addListener(listener: Player.Listener) {
+        listeners.addIfAbsent(listener)
+        delegate.addListener(listener)
+    }
+
+    override fun removeListener(listener: Player.Listener) {
+        listeners.remove(listener)
+        delegate.removeListener(listener)
+    }
+
+    override fun getMediaMetadata(): MediaMetadata {
+        if (spotifyHolder.isActive) {
+            val builder = MediaMetadata.Builder()
+                .setTitle(spotifyHolder.title)
+                .setArtist(spotifyHolder.artist)
+                .setAlbumTitle(spotifyHolder.album)
+                .setDurationMs(spotifyHolder.durationMs)
+                .setMediaType(MediaMetadata.MEDIA_TYPE_MUSIC)
+                .setIsPlayable(true)
+            if (spotifyHolder.coverUrl.isNotBlank()) {
+                runCatching { Uri.parse(spotifyHolder.coverUrl) }.getOrNull()?.let { builder.setArtworkUri(it) }
+            }
+            return builder.build()
+        }
+        return delegate.mediaMetadata
+    }
+
+    override fun getPlayWhenReady(): Boolean = if (spotifyHolder.isActive) spotifyHolder.isPlaying else delegate.playWhenReady
+    override fun getPlaybackState(): Int = if (spotifyHolder.isActive) {
+        if (spotifyHolder.isBuffering) Player.STATE_BUFFERING
+        else if (spotifyHolder.isPlaying) Player.STATE_READY
+        else Player.STATE_READY
+    } else delegate.playbackState
+    override fun isPlaying(): Boolean = if (spotifyHolder.isActive) spotifyHolder.isPlaying else delegate.isPlaying
+    override fun getCurrentPosition(): Long = if (spotifyHolder.isActive) spotifyHolder.positionMs else delegate.currentPosition
+    override fun getBufferedPosition(): Long = if (spotifyHolder.isActive) spotifyHolder.positionMs + 30_000 else delegate.bufferedPosition
+    override fun getDuration(): Long = if (spotifyHolder.isActive) spotifyHolder.durationMs else delegate.duration
+
+    // Delegate additional methods using Java-style names
+    override fun getMediaItemCount(): Int = delegate.mediaItemCount
+    override fun getCurrentMediaItemIndex(): Int = delegate.currentMediaItemIndex
+    override fun getCurrentMediaItem(): MediaItem? = delegate.currentMediaItem
+    override fun getCurrentTimeline(): Timeline = delegate.currentTimeline ?: Timeline.EMPTY
+
+    fun notifySpotifyStateChanged() {
+        listeners.forEach { listener ->
+            listener.onMediaMetadataChanged(mediaMetadata)
+            listener.onPlaybackStateChanged(playbackState)
+            listener.onIsPlayingChanged(isPlaying)
+            // Use a simple position discontinuity to trigger UI update - use currentMediaItemIndex as position
+            // PositionInfo constructor: (mediaItem, mediaItemIndex, mediaId, periodIndex, positionMs, contentPositionMs, windowIndex, adGroupIndex)
+            val oldInfo = Player.PositionInfo(delegate.currentMediaItem, delegate.currentMediaItemIndex, null, -1, delegate.currentPosition, delegate.currentPosition, 0, 0)
+            val newInfo = Player.PositionInfo(delegate.currentMediaItem, delegate.currentMediaItemIndex, null, -1, delegate.currentPosition, delegate.currentPosition, 0, 0)
+            listener.onPositionDiscontinuity(
+                oldInfo,
+                newInfo,
+                Player.DISCONTINUITY_REASON_SKIP
+            )
         }
     }
 }
@@ -1808,6 +1905,8 @@ object PlayerHolder {
 class VybeMediaService : MediaLibraryService() {
     private var session: MediaLibrarySession? = null
     private var lyricsSessionPlayer: AndroidAutoLyricsSessionPlayer? = null
+    private var spotifySessionPlayer: SpotifySessionPlayer? = null
+    private val spotifyMetadataHolder = SpotifyMetadataHolder()
     private var lyricMediaId: String? = null
     private var lyricLines: List<LyricLine> = emptyList()
     private val io = Executors.newCachedThreadPool()
@@ -2026,13 +2125,18 @@ class VybeMediaService : MediaLibraryService() {
         lyricsSessionPlayer = AndroidAutoLyricsSessionPlayer(
             MediaSessionCoordinator(player, requireNotNull(backgroundPlaybackCoordinator))
         )
+        // Wrap with SpotifySessionPlayer to support Spotify WebView metadata
+        spotifySessionPlayer = SpotifySessionPlayer(
+            requireNotNull(lyricsSessionPlayer),
+            spotifyMetadataHolder
+        )
         val open = PendingIntent.getActivity(
             this,
             0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        session = MediaLibrarySession.Builder(this, requireNotNull(lyricsSessionPlayer), AutoCallback())
+        session = MediaLibrarySession.Builder(this, requireNotNull(spotifySessionPlayer), AutoCallback())
             .setSessionActivity(open)
             .build()
         updateAndroidAutoLyricLine(player.currentMediaItem, player.currentPosition)
@@ -3837,6 +3941,56 @@ class VybeMediaService : MediaLibraryService() {
                     return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
                 }
                 MOOD_FOR_ME_COMMAND.customAction -> return chooseMoodForAndroidAuto(session)
+                SPOTIFY_METADATA_COMMAND.customAction -> {
+                    // Handle Spotify WebView metadata update from client
+                    val title = args.getString("title") ?: ""
+                    val artist = args.getString("artist") ?: ""
+                    val album = args.getString("album") ?: ""
+                    val coverUrl = args.getString("coverUrl") ?: ""
+                    val durationMs = args.getLong("durationMs", 0L)
+                    val positionMs = args.getLong("positionMs", 0L)
+                    val isPlaying = args.getBoolean("isPlaying", false)
+                    val isBuffering = args.getBoolean("isBuffering", false)
+                    val canSeek = args.getBoolean("canSeek", false)
+                    val canSkipNext = args.getBoolean("canSkipNext", false)
+                    val canSkipPrev = args.getBoolean("canSkipPrev", false)
+                    val shuffle = args.getBoolean("shuffle", false)
+                    val repeatMode = args.getInt("repeatMode", 0)
+
+                    // Update Spotify metadata holder - this will be reflected in the session player
+                    val wasActive = spotifyMetadataHolder.isActive
+                    val isActive = title != "KILO Music" || artist != "Ready to stream"
+
+                    spotifyMetadataHolder.isActive = isActive
+                    spotifyMetadataHolder.title = title
+                    spotifyMetadataHolder.artist = artist
+                    spotifyMetadataHolder.album = album
+                    spotifyMetadataHolder.coverUrl = coverUrl
+                    spotifyMetadataHolder.durationMs = durationMs
+                    spotifyMetadataHolder.positionMs = positionMs
+                    spotifyMetadataHolder.isPlaying = isPlaying
+                    spotifyMetadataHolder.isBuffering = isBuffering
+                    spotifyMetadataHolder.canSeek = canSeek
+                    spotifyMetadataHolder.canSkipNext = canSkipNext
+                    spotifyMetadataHolder.canSkipPrev = canSkipPrev
+                    spotifyMetadataHolder.shuffle = shuffle
+                    spotifyMetadataHolder.repeatMode = repeatMode
+
+                    // Notify the session player of the change
+                    spotifyMetadataHolder.notifyChanged()
+                    spotifySessionPlayer?.notifySpotifyStateChanged()
+
+                    // If Spotify became inactive, clear the notification artwork cache
+                    if (wasActive && !isActive) {
+                        notificationArtworkId = null
+                        notificationArtwork = null
+                    }
+
+                    // Update notification
+                    main.post(::postPlaybackNotification)
+
+                    return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+                }
             }
             super.onCustomCommand(session, controller, customCommand, args)
         }

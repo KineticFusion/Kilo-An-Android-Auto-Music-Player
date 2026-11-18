@@ -5,6 +5,11 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import android.util.Log
+import com.google.crypto.tink.Aead
+import com.google.crypto.tink.KeysetHandle
+import com.google.crypto.tink.aead.AeadConfig
+import com.google.crypto.tink.aead.AeadKeyTemplates
+import com.google.crypto.tink.integration.android.AndroidKeysetManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,10 +22,8 @@ import java.net.URL
 import java.net.URLEncoder
 import java.security.KeyStore
 import java.util.concurrent.ConcurrentHashMap
-import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
 import kotlin.math.abs
 
 /**
@@ -57,6 +60,7 @@ object HybridSourceRegistry {
         synchronized(this) {
             if (initialized) return
             val appCtx = context.applicationContext
+            initTink(appCtx)
             val loaded = loadOrMigrateSources(appCtx)
             _sources.value = loaded.sortedBy { it.priority }
             rebuildProviders(appCtx, _sources.value)
@@ -163,36 +167,138 @@ object HybridSourceRegistry {
 
         // Return cached token if still valid (with 15s buffer)
         if (savedToken.isNotBlank() && System.currentTimeMillis() < savedExpiry - 15_000L) {
+            Log.d("KiloHybridRegistry", "Using cached Spotify token (expires in ${(savedExpiry - System.currentTimeMillis()) / 1000}s)")
             return@withContext savedToken
         }
 
         // Refresh token using cookie
         if (cookie.isBlank()) {
+            Log.w("KiloHybridRegistry", "No Spotify cookie available for token refresh")
             return@withContext null
         }
 
+        Log.d("KiloHybridRegistry", "Refreshing Spotify token... cookie length: ${cookie.length}, starts with sp_dc: ${cookie.startsWith("sp_dc=")}")
+
         runCatching {
-            val conn = (URL("https://open.spotify.com/get_access_token?reason=transport&productType=web_player")
+            val url = "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
+            Log.d("KiloHybridRegistry", "Token refresh URL: $url")
+            val conn = (URL(url)
                 .openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 3500
-                readTimeout = 3500
-                setRequestProperty("Accept", "application/json")
-                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36")
+                connectTimeout = 10000
+                readTimeout = 10000
+                setRequestProperty("Accept", "application/json, text/plain, */*")
+                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                setRequestProperty("Accept-Encoding", "gzip, deflate, br")
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
                 setRequestProperty("Cookie", cookie)
+                setRequestProperty("Referer", "https://open.spotify.com/")
+                setRequestProperty("Origin", "https://open.spotify.com")
+                setRequestProperty("Sec-Fetch-Dest", "empty")
+                setRequestProperty("Sec-Fetch-Mode", "cors")
+                setRequestProperty("Sec-Fetch-Site", "same-origin")
+                setRequestProperty("Sec-Ch-Ua", "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
+                setRequestProperty("Sec-Ch-Ua-Mobile", "?1")
+                setRequestProperty("Sec-Ch-Ua-Platform", "\"Android\"")
+                setRequestProperty("DNT", "1")
+                setRequestProperty("Connection", "keep-alive")
             }
-            if (conn.responseCode !in 200..299) {
-                Log.w("KiloHybridRegistry", "Failed to refresh Spotify token: HTTP ${conn.responseCode}")
+
+            val responseCode = conn.responseCode
+            val responseBody = if (responseCode in 200..299) {
+                conn.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                conn.errorStream?.bufferedReader()?.readText() ?: ""
+            }
+
+            Log.d("KiloHybridRegistry", "Token refresh response: $responseCode - ${responseBody.take(500)}")
+
+            if (responseCode !in 200..299) {
+                Log.w("KiloHybridRegistry", "Failed to refresh Spotify token: HTTP $responseCode - $responseBody")
                 return@runCatching null
             }
-            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+
+            val json = JSONObject(responseBody)
             val token = json.optString("accessToken")
             val expiry = json.optLong("accessTokenExpirationTimestampMs", System.currentTimeMillis() + 1800_000L)
+
+            Log.d("KiloHybridRegistry", "Token refresh success: token length=${token.length}, expiry=${expiry}")
+
             if (token.isNotBlank()) {
                 saveSpotifyWebSession(appCtx, cookie, token, expiry)
                 token
-            } else null
+            } else {
+                Log.w("KiloHybridRegistry", "Token refresh returned empty accessToken")
+                null
+            }
         }.getOrNull()
+    }
+
+    /**
+     * Validates the stored Spotify cookie by attempting to get a fresh access token.
+     * Returns true if the cookie is valid and can obtain a token, false if re-login is needed.
+     */
+    suspend fun validateSpotifyCookie(context: Context): Boolean = withContext(Dispatchers.IO) {
+        val appCtx = context.applicationContext
+        val prefs = appCtx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val cookie = prefs.getString(KEY_SPOTIFY_COOKIE, null)?.let(::decrypt).orEmpty()
+
+        if (cookie.isBlank()) {
+            Log.d("KiloHybridRegistry", "validateSpotifyCookie: No cookie stored")
+            return@withContext false
+        }
+
+        Log.d("KiloHybridRegistry", "Validating Spotify cookie... length: ${cookie.length}, starts with sp_dc: ${cookie.startsWith("sp_dc=")}")
+
+        runCatching {
+            val url = "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
+            val conn = (URL(url)
+                .openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 10000
+                readTimeout = 10000
+                setRequestProperty("Accept", "application/json, text/plain, */*")
+                setRequestProperty("Accept-Language", "en-US,en;q=0.9")
+                setRequestProperty("Accept-Encoding", "gzip, deflate, br")
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36")
+                setRequestProperty("Cookie", cookie)
+                setRequestProperty("Referer", "https://open.spotify.com/")
+                setRequestProperty("Origin", "https://open.spotify.com")
+                setRequestProperty("Sec-Fetch-Dest", "empty")
+                setRequestProperty("Sec-Fetch-Mode", "cors")
+                setRequestProperty("Sec-Fetch-Site", "same-origin")
+                setRequestProperty("Sec-Ch-Ua", "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
+                setRequestProperty("Sec-Ch-Ua-Mobile", "?1")
+                setRequestProperty("Sec-Ch-Ua-Platform", "\"Android\"")
+                setRequestProperty("DNT", "1")
+                setRequestProperty("Connection", "keep-alive")
+            }
+
+            val responseCode = conn.responseCode
+            val responseBody = if (responseCode in 200..299) {
+                conn.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                conn.errorStream?.bufferedReader()?.readText() ?: ""
+            }
+
+            Log.d("KiloHybridRegistry", "Cookie validation response: $responseCode - ${responseBody.take(500)}")
+
+            if (responseCode in 200..299) {
+                val json = JSONObject(responseBody)
+                val token = json.optString("accessToken")
+                val isValid = token.isNotBlank()
+                if (!isValid) {
+                    Log.w("KiloHybridRegistry", "Cookie validation: HTTP 200 but empty accessToken")
+                }
+                isValid
+            } else {
+                Log.w("KiloHybridRegistry", "Cookie validation failed: HTTP $responseCode")
+                false
+            }
+        }.getOrElse { err ->
+            Log.e("KiloHybridRegistry", "Cookie validation error", err)
+            false
+        }
     }
 
     fun clearSpotifyWebSession(context: Context) {
@@ -454,36 +560,31 @@ object HybridSourceRegistry {
         )
     )
 
-    private fun secretKey(): SecretKey {
-        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        (store.getKey(KEYSTORE_ALIAS, null) as? SecretKey)?.let { return it }
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
-            init(
-                KeyGenParameterSpec.Builder(
-                    KEYSTORE_ALIAS,
-                    KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
-                )
-                    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                    .build()
-            )
-            generateKey()
+    private var aead: Aead? = null
+
+    private fun initTink(context: Context) {
+        if (aead != null) return
+        synchronized(this) {
+            if (aead != null) return
+            AeadConfig.register()
+            val manager = AndroidKeysetManager.Builder()
+                .withSharedPref(context.applicationContext, PREFS, "hybrid_tink_keyset")
+                .withKeyTemplate(AeadKeyTemplates.AES256_GCM)
+                .withMasterKeyUri("android-keystore://$KEYSTORE_ALIAS")
+                .build()
+            aead = manager.keysetHandle.getPrimitive(Aead::class.java)
         }
     }
 
-    private fun encrypt(value: String): String {
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, secretKey())
-        val payload = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
-        return Base64.encodeToString(payload, Base64.NO_WRAP)
-    }
+    private fun encrypt(value: String): String = runCatching {
+        if (aead == null) throw IllegalStateException("Tink not initialized")
+        aead!!.encrypt(value.toByteArray(), "hybrid-source".toByteArray())
+    }.getOrDefault(throw IllegalStateException("Encryption failed")).let { Base64.encodeToString(it, Base64.NO_WRAP) }
 
     private fun decrypt(value: String): String? = runCatching {
-        val payload = Base64.decode(value, Base64.NO_WRAP)
-        val iv = payload.copyOfRange(0, 12)
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, secretKey(), GCMParameterSpec(128, iv))
-        String(cipher.doFinal(payload.copyOfRange(12, payload.size)), Charsets.UTF_8)
+        if (aead == null) throw IllegalStateException("Tink not initialized")
+        val ciphertext = Base64.decode(value, Base64.NO_WRAP)
+        String(aead!!.decrypt(ciphertext, "hybrid-source".toByteArray()), Charsets.UTF_8)
     }.getOrNull()
 }
 
@@ -639,16 +740,24 @@ class SpotifyCatalogBridgeProvider(
     }
 
     private fun spotifyGet(url: String, token: String): JSONObject? {
+        Log.d("KiloSpotifyBridge", "API request: $url")
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
-            connectTimeout = 3500
-            readTimeout = 3500
+            connectTimeout = 5000
+            readTimeout = 10000
             setRequestProperty("Authorization", "Bearer $token")
             setRequestProperty("Accept", "application/json")
         }
         return try {
-            if (conn.responseCode !in 200..299) null
-            else JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+            val responseCode = conn.responseCode
+            val responseBody = if (responseCode in 200..299) {
+                conn.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                conn.errorStream?.bufferedReader()?.readText() ?: ""
+            }
+            Log.d("KiloSpotifyBridge", "API response: $responseCode - ${responseBody.take(500)}")
+            if (responseCode !in 200..299) null
+            else JSONObject(responseBody)
         } finally {
             conn.disconnect()
         }
@@ -657,31 +766,51 @@ class SpotifyCatalogBridgeProvider(
     private fun getAccessToken(): String? {
         val (cookie, savedToken, savedExpiry) = HybridSourceRegistry.getSpotifyWebSession(appContext)
         if (savedToken.isNotBlank() && System.currentTimeMillis() < savedExpiry - 15_000L) {
+            Log.d("KiloSpotifyBridge", "Using cached Spotify token (expires in ${(savedExpiry - System.currentTimeMillis()) / 1000}s)")
             return savedToken
         }
         if (cachedAccessToken.isNotBlank() && System.currentTimeMillis() < tokenExpiresAtMs - 15_000L) {
             return cachedAccessToken
         }
+        Log.d("KiloSpotifyBridge", "Refreshing Spotify token... cookie length: ${cookie.length}, starts with sp_dc: ${cookie.startsWith("sp_dc=")}")
         return runCatching {
             val conn = (URL("https://open.spotify.com/get_access_token?reason=transport&productType=web_player")
                 .openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 3500
-                readTimeout = 3500
+                connectTimeout = 5000
+                readTimeout = 5000
                 setRequestProperty("Accept", "application/json")
                 setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36")
+                setRequestProperty("Referer", "https://open.spotify.com/")
+                setRequestProperty("Origin", "https://open.spotify.com")
                 if (cookie.isNotBlank()) setRequestProperty("Cookie", cookie)
             }
-            if (conn.responseCode !in 200..299) return@runCatching null
-            val json = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+
+            val responseCode = conn.responseCode
+            val responseBody = if (responseCode in 200..299) {
+                conn.inputStream.bufferedReader().use { it.readText() }
+            } else {
+                conn.errorStream?.bufferedReader()?.readText() ?: ""
+            }
+
+            Log.d("KiloSpotifyBridge", "Token refresh response: $responseCode - ${responseBody.take(500)}")
+
+            if (responseCode !in 200..299) return@runCatching null
+            val json = JSONObject(responseBody)
             val token = json.optString("accessToken")
             val expiry = json.optLong("accessTokenExpirationTimestampMs", System.currentTimeMillis() + 1800_000L)
+
+            Log.d("KiloSpotifyBridge", "Token refresh success: token length=${token.length}, expiry=${expiry}")
+
             if (token.isNotBlank()) {
                 cachedAccessToken = token
                 tokenExpiresAtMs = expiry
                 HybridSourceRegistry.saveSpotifyWebSession(appContext, cookie, token, expiry)
                 token
-            } else null
+            } else {
+                Log.w("KiloSpotifyBridge", "Token refresh returned empty accessToken")
+                null
+            }
         }.getOrNull()
     }
 }

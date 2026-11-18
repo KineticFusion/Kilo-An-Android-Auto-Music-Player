@@ -143,12 +143,30 @@ class NativeCrossfadeIntegration(
         standbyPlayer?.seekTo(0)
         standbyPlayer?.playWhenReady = true
 
-        // Start native crossfade
-        NativeAudioEngine.startCrossfade(crossfadeDurationMs, automixEqEnabled)
+        // Start native crossfade after a brief delay to allow standby to buffer audio
+        // This prevents "fades out but doesn't fade in" when standby's buffer is empty
+        scope.launch {
+            // Wait for standby to start playing and fill some buffer
+            var waitCount = 0
+            while (waitCount < 10) { // Max ~100ms wait
+                val fillRatioB = NativeAudioEngine.getFillRatio(NativeAudioEngine.DECK_B)
+                if (fillRatioB > 0.1f) { // At least 10% buffered
+                    break
+                }
+                kotlinx.coroutines.delay(10)
+                waitCount++
+            }
 
-        crossfadeActive = true
+            // Check if crossfade was cancelled while waiting
+            if (!crossfadeActive && pendingNextMediaItem == null) return@launch
 
-        Log.i(TAG, "Crossfade started: ${mainPlayer?.currentMediaItem?.mediaId} -> ${pendingNextMediaItem?.mediaId}")
+            // Start native crossfade
+            NativeAudioEngine.startCrossfade(crossfadeDurationMs, automixEqEnabled)
+
+            crossfadeActive = true
+
+            Log.i(TAG, "Crossfade started: ${mainPlayer?.currentMediaItem?.mediaId} -> ${pendingNextMediaItem?.mediaId}")
+        }
     }
 
     /** Monitor crossfade progress and complete when done. */

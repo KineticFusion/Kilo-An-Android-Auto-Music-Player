@@ -281,20 +281,38 @@ class NativeCrossfadeController(
             return
         }
 
-        // Ensure deck B is at start and playing (at volume 0 - native mixer handles volume)
+        // Ensure deck B is at start and playing
         deckBPlayer?.seekTo(0)
         deckBPlayer?.playWhenReady = true
 
         // Capture base volume
         baseVolume = deckAPlayer?.volume?.coerceIn(0f, 1f) ?: 1f
 
-        // Start native crossfade
-        NativeAudioEngine.startCrossfade(crossfadeDurationMs, automixEqEnabled)
+        // Start native crossfade after a brief delay to allow Deck B to buffer audio
+        // This prevents "fades out but doesn't fade in" when Deck B's buffer is empty
+        scope.launch {
+            // Wait for Deck B to start playing and fill some buffer
+            var waitCount = 0
+            while (waitCount < 10) { // Max ~100ms wait
+                val fillRatioB = NativeAudioEngine.getFillRatio(NativeAudioEngine.DECK_B)
+                if (fillRatioB > 0.1f) { // At least 10% buffered
+                    break
+                }
+                kotlinx.coroutines.delay(10)
+                waitCount++
+            }
 
-        crossfadeActive = true
-        crossfadeStartMs = System.currentTimeMillis()
+            // Check if crossfade was cancelled while waiting
+            if (!crossfadeActive && nextMediaItem == null) return@launch
 
-        Log.i(TAG, "Crossfade started: ${currentMediaId} -> ${nextMediaId}, duration=${crossfadeDurationMs}ms, automixEQ=$automixEqEnabled")
+            // Start native crossfade
+            NativeAudioEngine.startCrossfade(crossfadeDurationMs, automixEqEnabled)
+
+            crossfadeActive = true
+            crossfadeStartMs = System.currentTimeMillis()
+
+            Log.i(TAG, "Crossfade started: ${currentMediaId} -> ${nextMediaId}, duration=${crossfadeDurationMs}ms, automixEQ=$automixEqEnabled")
+        }
     }
 
     /**
