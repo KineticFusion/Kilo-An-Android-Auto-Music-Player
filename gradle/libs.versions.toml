@@ -12,7 +12,7 @@ room = "2.8.5"
 ksp = "2.3.6"
 webkit = "1.14.0"
 oboe = "1.9.3"
-kotlinxSerialization = "1.7.3"
+kotlinxSerialization = "1.13.0"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
